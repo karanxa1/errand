@@ -63,6 +63,13 @@ def resolve_merchant(merchant: Merchant) -> tuple[Merchant, str | None]:
     host = (urlparse(merchant.url).hostname or "").lower()
     if host not in settings.unroutable_hosts:
         return merchant, None
+    if settings.prava_shop_ready:
+        # The wallet shopper buys from REAL merchants in Prava's catalog, so the
+        # demonstration storefront is not a substitute for anything — its host is
+        # not indexed and never will be. Leave the policy's URL alone and let
+        # build_cart fail saying the approved merchant is not shoppable, rather
+        # than silently pointing a live card at a fake store.
+        return merchant, None
     return (
         Merchant(name=merchant.name, url=settings.demo_store_url),
         merchant.url,

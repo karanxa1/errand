@@ -41,8 +41,84 @@ Auth: secret key. Response `{ status, transactions: [...] }`.
 
 ### POST /v1/sessions/{session_id}/report-status  → REQUIRED after use
 Auth: secret key. Body: `{ txn_ref_id, txn_status: "APPROVED"|"DECLINED" }`
+Optional: `txn_type` (default `"PURCHASE"`), `authorization_code` (≤128), `response_code` (≤2),
+`amount_paid`, `product_statuses[] = { product_ref_id, status }`.
+
+### POST /v1/sessions/{session_id}/revoke  → drop an abandoned session
+Auth: secret key. **Send `{}` as the body** — with `Content-Type: application/json`
+and no body the server answers `FST_ERR_CTP_EMPTY_JSON_BODY`. Verified live.
+Response: `{ success: true }`.
+
+### GET /v1/listCards?customer_id=…&status=active  → cards already on file
+Auth: secret key. `customer_id` is the same `user_id` used on sessions.
+Response: `{ cards: [{ card_id, card_last4, card_brand, card_exp_month, card_exp_year, status }], count }`.
+A `card_id` from here can be passed as `card.card_id` on a new session to skip card entry.
+
+### Optional session fields (all verified accepted)
+`user_phone`, `user_country_code_iso2` (2 upper), `external_order_ref` (≤255),
+`callback_url` (**HTTPS only**, ≤2048), `card: { card_id | vault_ref_id }`,
+`merchant_details.category_code` (MCC, ≤10), `merchant_details.category` (≤100).
+
+### Error envelope
+`{ "error": { "code", "message", "details": { "fieldErrors": { … } } } }`.
+Codes seen: `AUTH_1001` (invalid API key), `AUTH_1002` (missing/invalid header),
+`VAL_2001` (invalid body — read `fieldErrors`), `SESSION_CREATE_ERROR`.
+Keys and hosts must match: an `sk_test_` key against production is `AUTH_1001`.
 
 ### GET /health → `{ status: "ok" }`
+
+Walkthrough: `cd backend && uv run python -m scripts.verify_prava_sandbox`
+(add `--wait 300` to hold the session open and poll after entering a test card).
+
+---
+
+## Prava WALLET / AGENT API (real-merchant shopping) — PRODUCTION ONLY
+- Base: `https://pay-api.prava.space` (health verified: `{status:"ok",service:"wallet"}`).
+- **There is no sandbox host.** `sandbox.pay-api`, `pay-api.sandbox` and
+  `sandbox.pay` do not resolve. A linked agent shops REAL merchants with a REAL
+  card, which is why `USE_PRAVA_SHOP` defaults to false.
+- This is a *different product* from the merchant API above: there, we are the
+  merchant; here, we are an **agent** acting on a user's own Prava wallet.
+
+### Auth — Ed25519 request signing (not a bearer key)
+Headers on every `/v1/wallet/*` call:
+`X-Agent-Id`, `X-Timestamp` (Unix **seconds**), `X-Signature` =
+base64( Ed25519( `timestamp + rawBody` ) ), plus `X-Skill-Name: prava-shopping`.
+The signed bytes must be the **exact** body sent — re-serializing breaks it.
+Keys: private = base64(DER PKCS8), public = base64(DER SPKI).
+Implemented in `app/prava/signing.py`, cross-checked byte-for-byte against
+`@prava-sdk/cli` v3.1.0 (`tests/test_prava_wallet.py`).
+
+### Linking an agent (on `https://api.prava.space`, unsigned)
+- `POST /v1/agents/link/create` → `{ public_key, name, platform, description, iat, sig }` → `{ lid, expires_at }`
+  `sig` = base64url( Ed25519( `d=<desc>&iat=<n>&n=<name>&p=<platform>&pk=<pubkey>` ) ),
+  each value percent-encoded as JS `encodeURIComponent`, padding stripped.
+- User approves at `https://pay.prava.space/link-agent?lid=<lid>` (15 min TTL).
+- `GET /v1/agents/link/status?lid=<lid>` → `{ status: pending|approved|denied|expired, agent_id? }`
+- Run it: `cd backend && uv run python scripts/prava_link.py --name "Errand"`
+
+### Shop endpoints (all POST, envelope `{ success, data }` / `{ success:false, error }`)
+| Endpoint | Body | Returns |
+|---|---|---|
+| `/v1/wallet/shop/search` | `{ query, intent?, limit?, cursor?, merchantDomain?, shipsTo? }` | `{ results[{product_id, merchant, title, price_estimate}], next_cursor, has_more }` |
+| `/v1/wallet/shop/product` | `{ product_id, merchantDomain? }` | `{ product: { id, merchant, description, variants[{id, label, priceAmount (CENTS), currency, available, options, merchantDomain}] } }` |
+| `/v1/wallet/shop/quote` | `{ variant_id, merchantDomain, quantity, address_id? }` | `{ checkout_session_id, merchant, final_price{amount,currency}, price_breakdown{subtotal_cents,shipping_cents,tax_cents}, selected_shipping, expires_at }` |
+| `/v1/wallet/shop/checkout` | `{ checkout_session_id, credentials{token, cryptogram, expiry_month, expiry_year} }` | `{ status: "paid", order_id, amount }` |
+| `/v1/wallet/shop/addresses/list` | `{}` | `{ addresses[{id,label,summary,isDefault}], has_phone }` (MASKED only) |
+
+Notes that cost money if ignored:
+- `quote`/`checkout` drive a real browser — 20-40s; use a 45s client timeout.
+- Quotes expire in ~5 min (`SHOP_SESSION_EXPIRED`). Re-quoting is safe; the new
+  total must equal the approved one or the scoped card declines.
+- `checkout` is **not** retried on timeout — the charge may have landed. A
+  `replayed: true` envelope is a prior terminal result, not a new charge.
+- `product` returns offers from **several sellers**; keep only the pinned domain.
+- Delivery address/phone live in the wallet and are injected server-side.
+
+### Coverage (from Prava's own agent reference)
+US only. Visa cards, **excluding Chase and Ramp** (MC/Discover/Amex in progress).
+Any merchant with **guest checkout** works; **authenticated checkouts (Amazon
+etc.) are not supported yet**. Checkout success rate >90%, varies by merchant.
 
 ---
 

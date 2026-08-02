@@ -258,6 +258,182 @@ def test_404_after_a_seen_session_stays_pending() -> None:
     assert isinstance(results[1], PollPending), results[1]
 
 
+# ── Prava merchant API: session creation, errors, saved cards ────────────────
+
+class _RecordingClient:
+    """Records the request and returns one queued response, for POST or GET."""
+
+    queue: list[_StubResponse] = []
+    sent: list[dict] = []
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    async def __aenter__(self) -> "_RecordingClient":
+        return self
+
+    async def __aexit__(self, *args: object) -> bool:
+        return False
+
+    async def post(self, url: str, **kwargs: object) -> _StubResponse:
+        _RecordingClient.sent.append({"url": url, **kwargs})
+        return _RecordingClient.queue.pop(0)
+
+    async def get(self, url: str, **kwargs: object) -> _StubResponse:
+        _RecordingClient.sent.append({"url": url, **kwargs})
+        return _RecordingClient.queue.pop(0)
+
+
+def _with_recorder(responses: list[_StubResponse], fn):
+    original = prava_module.httpx.AsyncClient
+    _RecordingClient.queue = list(responses)
+    _RecordingClient.sent = []
+    prava_module.httpx.AsyncClient = _RecordingClient  # type: ignore[assignment]
+    try:
+        return fn(), list(_RecordingClient.sent)
+    finally:
+        prava_module.httpx.AsyncClient = original  # type: ignore[assignment]
+        _RecordingClient.queue = []
+
+
+_SESSION_OK = {
+    "session_id": "ses_1",
+    "session_token": "eyJhbGciOi",
+    "iframe_url": "https://sandbox.collect.prava.space?session=ses_1",
+    "order_id": "ord_1",
+    "expires_at": "2026-08-02T18:05:07.664Z",
+}
+
+
+def test_create_session_keeps_the_ids_prava_returns() -> None:
+    """order_id and expires_at were being dropped on the floor.
+
+    Both are live sandbox values (verified via scripts/verify_prava_sandbox.py);
+    order_id is the only handle for reconciling a Prava session against our run,
+    and expires_at is how long the card page stays open."""
+    from app.contracts import CartItem, CreateSessionInput, Merchant
+
+    broker = PravaPaymentBroker(_FAKE_SECRET, "https://sandbox.api.prava.space")
+    payload = CreateSessionInput(
+        merchant=Merchant(name="Demo Pantry Co", url="https://demo-pantry.example.com"),
+        total_cents=6300,
+        user_id="u1",
+        user_email="a@b.test",
+        items=[CartItem(name="Beans", qty=2, price_cents=2100)],
+        external_order_ref="errand-run-1",
+    )
+    result, sent = _with_recorder(
+        [_StubResponse(201, _SESSION_OK)],
+        lambda: asyncio.run(broker.create_session(payload)),
+    )
+    assert result.session_id == "ses_1"
+    assert result.order_id == "ord_1"
+    assert result.expires_at == "2026-08-02T18:05:07.664Z"
+    assert result.session_token == "eyJhbGciOi"
+
+    body = sent[0]["json"]
+    assert body["total_amount"] == "63.00"
+    assert body["external_order_ref"] == "errand-run-1"
+    assert body["purchase_context"][0]["product_details"][0]["quantity"] == 2
+
+
+def test_create_session_omits_an_unusable_callback_url() -> None:
+    """callback_url must be HTTPS. Sending a dev http:// one fails the whole
+    session on an OPTIONAL field — so it is dropped rather than passed on."""
+    from app.contracts import CartItem, CreateSessionInput, Merchant
+
+    broker = PravaPaymentBroker(
+        _FAKE_SECRET, "https://sandbox.api.prava.space", callback_url="http://localhost:3000/done"
+    )
+    _, sent = _with_recorder(
+        [_StubResponse(201, _SESSION_OK)],
+        lambda: asyncio.run(
+            broker.create_session(
+                CreateSessionInput(
+                    merchant=Merchant(name="M", url="https://m.test"),
+                    total_cents=100,
+                    user_id="u",
+                    user_email="a@b.test",
+                    items=[CartItem(name="x", qty=1, price_cents=100)],
+                )
+            )
+        ),
+    )
+    assert "callback_url" not in sent[0]["json"]
+
+
+def test_api_errors_carry_pravas_own_code_and_field_detail() -> None:
+    """`raise_for_status()` renders a URL and a number. AUTH_1001 (bad key) and
+    VAL_2001 (bad body, with the offending field) are different problems with
+    different fixes, and the operator should not have to guess which."""
+    from app.contracts import CartItem, CreateSessionInput, Merchant
+
+    broker = PravaPaymentBroker(_FAKE_SECRET, "https://sandbox.api.prava.space")
+    error_body = {
+        "error": {
+            "code": "VAL_2001",
+            "message": "Invalid request body",
+            "details": {"fieldErrors": {"currency": ["Must be 3 uppercase letters"]}},
+        }
+    }
+    try:
+        _with_recorder(
+            [_StubResponse(400, error_body)],
+            lambda: asyncio.run(
+                broker.create_session(
+                    CreateSessionInput(
+                        merchant=Merchant(name="M", url="https://m.test"),
+                        total_cents=100,
+                        user_id="u",
+                        user_email="a@b.test",
+                        items=[CartItem(name="x", qty=1, price_cents=100)],
+                    )
+                )
+            ),
+        )
+    except prava_module.PravaApiError as exc:
+        assert exc.code == "VAL_2001"
+        assert exc.status == 400
+        assert "currency" in str(exc)
+    else:
+        raise AssertionError("expected PravaApiError")
+
+
+def test_list_cards_parses_the_documented_shape() -> None:
+    broker = PravaPaymentBroker(_FAKE_SECRET, "https://sandbox.api.prava.space")
+    body = {
+        "cards": [
+            {
+                "card_id": "card_1",
+                "card_last4": "1111",
+                "card_brand": "VISA",
+                "card_exp_month": 12,
+                "card_exp_year": 26,
+                "status": "active",
+            },
+            {"card_last4": "9999"},  # no card_id — unusable, must be dropped
+        ],
+        "count": 2,
+    }
+    cards, sent = _with_recorder(
+        [_StubResponse(200, body)], lambda: asyncio.run(broker.list_cards("u1"))
+    )
+    assert [c.card_id for c in cards] == ["card_1"]
+    assert cards[0].card_brand == "VISA"
+    assert sent[0]["params"] == {"customer_id": "u1", "status": "active"}
+
+
+def test_revoke_sends_a_body_because_the_server_rejects_an_empty_one() -> None:
+    """Verified live: with Content-Type: application/json and no body the
+    sandbox answers FST_ERR_CTP_EMPTY_JSON_BODY."""
+    broker = PravaPaymentBroker(_FAKE_SECRET, "https://sandbox.api.prava.space")
+    _, sent = _with_recorder(
+        [_StubResponse(200, {"success": True})],
+        lambda: asyncio.run(broker.revoke_session("ses_1")),
+    )
+    assert sent[0]["json"] == {}
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):

@@ -76,11 +76,32 @@ class CreateSessionInput(BaseModel):
     user_id: str
     user_email: str
     items: list[CartItem]
+    # Our own reference for the order, echoed back on the session. Optional per
+    # the API; useful for reconciling a Prava session against our run.
+    external_order_ref: str | None = None
 
 
 class CreateSessionResult(BaseModel):
     session_id: str
     iframe_url: str
+    # Also returned by POST /v1/sessions. `session_token` is the JWT the frontend
+    # SDK wants; `order_id` and `expires_at` are for reconciliation and for
+    # telling the operator how long the card page stays open. Optional so a mock
+    # broker (and any older caller) still constructs a valid result.
+    session_token: str | None = None
+    order_id: str | None = None
+    expires_at: str | None = None
+
+
+class SavedCard(BaseModel):
+    """A card already on file for a customer (GET /v1/listCards)."""
+
+    card_id: str
+    card_last4: str
+    card_brand: str
+    card_exp_month: int | None = None
+    card_exp_year: int | None = None
+    status: str = "active"
 
 
 class PollPending(BaseModel):

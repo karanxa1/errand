@@ -24,10 +24,80 @@ MIN_JWT_SECRET_LEN = 32
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=_ENV_PATH, extra="ignore")
 
-    # Prava
+    # ── Prava, part 1: the MERCHANT API (we are the merchant) ────────────────
+    # sandbox.api.prava.space with sk_test_ / pk_test_; api.prava.space with
+    # sk_live_ / pk_live_. Keys and host must match — an sk_test_ key against
+    # production is rejected, and vice versa. This side issues the scoped Visa
+    # network token after the user enters a card in Prava's PCI iframe. It has no
+    # catalog: there is nothing to BUY through it.
     prava_publishable_key: str = ""
     prava_secret_key: str = ""
     prava_api_base: str = "https://sandbox.api.prava.space"
+
+    # Optional session fields the merchant API accepts (all documented optional).
+    # A callback URL must be HTTPS; empty means Prava shows its own completion
+    # screen instead of returning the user to us.
+    prava_callback_url: str = ""
+    prava_user_country: str = "US"
+    # MCC + human category for the destination merchant. Sent when set; Visa uses
+    # the MCC to scope the token, so a wrong code is worse than none.
+    prava_merchant_category_code: str = ""
+    prava_merchant_category: str = ""
+
+    @property
+    def prava_is_sandbox(self) -> bool:
+        return "sandbox" in self.prava_api_base or self.prava_secret_key.startswith(
+            "sk_test_"
+        )
+
+    @property
+    def prava_key_environment_problem(self) -> str | None:
+        """Why the configured key and host disagree, or None if they match.
+
+        A test key against production (or a live key against sandbox) fails at
+        session creation with AUTH_1001 and nothing else to go on. Catching it
+        here turns a confusing 401 mid-errand into a startup-time sentence.
+        """
+        key, base = self.prava_secret_key, self.prava_api_base
+        if not key:
+            return None
+        host_is_sandbox = "sandbox" in base
+        if key.startswith("sk_test_") and not host_is_sandbox:
+            return (
+                f"PRAVA_SECRET_KEY is a sandbox key (sk_test_) but PRAVA_API_BASE "
+                f"is {base}. Point it at https://sandbox.api.prava.space."
+            )
+        if key.startswith("sk_live_") and host_is_sandbox:
+            return (
+                f"PRAVA_SECRET_KEY is a live key (sk_live_) but PRAVA_API_BASE is "
+                f"{base}. Point it at https://api.prava.space."
+            )
+        return None
+
+    # ── Prava, part 2: the WALLET / AGENT API (the user's own card) ───────────
+    # pay-api.prava.space, authenticated by an Ed25519 keypair the USER approved
+    # in their Prava wallet (see scripts/prava_link.py). This is the only Prava
+    # surface with a real catalog: /v1/wallet/shop/{search,product,quote,checkout}
+    # reaches UCP-indexed merchants and drives their checkout.
+    #
+    # IT IS PRODUCTION-ONLY. There is no sandbox wallet host — sandbox.pay-api,
+    # pay-api.sandbox and sandbox.pay do not resolve. So a linked agent shops a
+    # REAL merchant with a REAL card, which is why `use_prava_shop` defaults to
+    # false and the sandbox demo runs the storefront shopper below instead.
+    prava_wallet_api_base: str = "https://pay-api.prava.space"
+    prava_link_api_base: str = "https://api.prava.space"
+    prava_dashboard_base: str = "https://pay.prava.space"
+    prava_agent_id: str = ""
+    prava_agent_private_key: str = ""
+    prava_ships_to: str = "US"
+    use_prava_shop: bool = False
+
+    @property
+    def prava_shop_ready(self) -> bool:
+        """True when the wallet shopper has an approved agent identity to use."""
+        return bool(
+            self.use_prava_shop and self.prava_agent_id and self.prava_agent_private_key
+        )
 
     # Senso
     senso_api_key: str = ""
@@ -39,9 +109,13 @@ class Settings(BaseSettings):
     # https://demo-pantry.example.com. `example.com` is RESERVED by IANA
     # (RFC 2606 / RFC 6761) for documentation and can never host a real store, so
     # handing it to the shopper meant build_cart found no products and NO errand
-    # could complete. Prava does not offer a substitute: its REST API has no
-    # storefront, and its UCP/Browser Harness reach REAL Shopify merchants over
-    # the LIVE API with real cards.
+    # could complete.
+    #
+    # Prava DOES have a real catalog — the wallet API's UCP endpoints, wired up in
+    # app/brokers/prava_shop.py — but it is production-only and spends a real
+    # card, so it cannot stand in for a sandbox storefront. When that path is
+    # live (`prava_shop_ready`) this substitution is skipped entirely and an
+    # unroutable policy vendor aborts the run instead: see resolve_merchant.
     #
     # So a policy host listed here is resolved to `demo_store_url` — the
     # demonstration storefront served from the frontend Worker, whose DOM matches
