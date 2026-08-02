@@ -19,6 +19,7 @@ import {
   type ReactNode,
 } from "react";
 import { api } from "./config";
+import { mirrorSessionToken } from "./sessionMirror";
 
 const TOKEN_KEY = "errand_token";
 
@@ -96,6 +97,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       return;
     }
     setToken(stored);
+    void mirrorSessionToken(stored);
 
     let alive = true;
     (async () => {
@@ -136,6 +138,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
     const data = (await res.json()) as { token: string; user: AuthUser };
     writeStoredToken(data.token);
+    void mirrorSessionToken(data.token);
     setToken(data.token);
     setUser(data.user);
   }, []);
@@ -163,6 +166,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       }
       const data = (await res.json()) as { token: string; user: AuthUser };
       writeStoredToken(data.token);
+      void mirrorSessionToken(data.token);
       setToken(data.token);
       setUser(data.user);
     },
@@ -171,6 +175,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const logout = useCallback(() => {
     writeStoredToken(null);
+    void mirrorSessionToken(null);
     setToken(null);
     setUser(null);
   }, []);
