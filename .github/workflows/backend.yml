@@ -40,6 +40,18 @@ jobs:
             ./errand/backend
           echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
 
+      - name: Run database migrations (Alembic)
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          set -euo pipefail
+          # Install uv and apply migrations against prod Postgres before rolling
+          # the app, so the new image never starts against an older schema.
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          export PATH="$HOME/.local/bin:$PATH"
+          cd errand/backend
+          uv run alembic upgrade head
+
       - name: Update Container App to new image
         run: |
           set -euo pipefail
