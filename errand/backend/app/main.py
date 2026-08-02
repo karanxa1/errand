@@ -34,6 +34,7 @@ from app.orchestrator.stream import EventStream
 from app.routers import auth as auth_router
 from app.routers import chat as chat_router
 from app.routers import conversations as conversations_router
+from app.routers import voice as voice_router
 from app.voice.relay import voice_ws
 
 
@@ -72,6 +73,7 @@ app.add_middleware(
 app.include_router(auth_router.router)
 app.include_router(conversations_router.router)
 app.include_router(chat_router.router)
+app.include_router(voice_router.router)
 
 # In-memory approval gates keyed by run id. Each run awaits its Future until the
 # frontend POSTs /approve (after the operator confirms + passkey). The Future
@@ -117,15 +119,14 @@ async def voice_ws_route(websocket: WebSocket) -> None:
     # Deepgram Voice Agent relay + tool bridge. The backend holds the Deepgram
     # WS (browser tokens are FORBIDDEN on our key) and relays audio/events.
     #
-    # ⚠️ KNOWN GAP — this endpoint is UNAUTHENTICATED. It consumes Deepgram +
-    # OpenAI credits and can reach run_errand (real spend, gated on the browser
-    # confirming approval). It is not fixed here because the browser WebSocket API
-    # cannot set an Authorization header, so auth would have to move to a query
-    # param or a first-message handshake — and the frontend (lib/useVoiceAgent.ts)
-    # currently opens this socket with no credential at all, so adding a check
-    # would break live voice. Closing this properly needs a coordinated
-    # frontend+backend change (mint a short-lived ticket over authenticated HTTP,
-    # then pass it as ?ticket=... and validate on accept). Tracked, not silent.
+    # AUTH REQUIRED, via ?ticket=... rather than a bearer header: the browser
+    # WebSocket API cannot set headers, so the client POSTs the authenticated
+    # /api/voice/ticket (routers/voice.py) and presents the one-shot ticket here.
+    # voice_ws redeems it before opening anything, so an anonymous socket can no
+    # longer burn Deepgram + OpenAI credits or reach run_errand (real spend); an
+    # invalid or replayed ticket is closed 4401. The redeemed ticket also carries
+    # the spender's identity into the relay, replacing the old hardcoded demo
+    # user. Single-process constraint: see app/voice/tickets.py.
     await voice_ws(websocket)
 
 

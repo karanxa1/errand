@@ -216,11 +216,26 @@ differs per model), and add a test asserting pass-through plus the exact down-ma
 
 ## CSS Rules
 
-- **This project does NOT use Tailwind.** It uses CSS Modules. Do not add Tailwind, a
-  Tailwind config, or Tailwind classes — a stale root Tailwind config already broke a
-  build once, which is why `errand/frontend/postcss.config.*` is deliberately empty.
-- Component libraries whose distribution format is Tailwind classes cannot be dropped in
-  here. Take their structure and accessible behavior, and re-style in CSS Modules.
+- **This project uses Tailwind v4, and only Tailwind** (user directive, 2026-08-02). It
+  was CSS Modules until then; all 16 `.module.css` files were converted and deleted. Do
+  not reintroduce a `.module.css` file. The only hand-written CSS that remains is
+  `app/globals.css` (the `@theme` token block and base layer) plus small `*.anim.css`
+  files holding `@keyframes` and nothing else, because keyframes cannot be expressed as
+  utilities.
+- **`errand/frontend/postcss.config.mjs` is load-bearing in two ways.** It must exist
+  locally, or Next walks UP the tree and picks up the stale root scaffold's config, which
+  broke the CI build once already (`4a17db7`). And it must NOT pass a `base` option to
+  `@tailwindcss/postcss` — that resolves in dev and then breaks the Cloudflare Workers
+  production build, which is where this app actually ships.
+- The brand lives in the `@theme` block in `app/globals.css`, so it is expressed as
+  utilities: `bg-ink-000…250`, `border-edge`, `text-hi|body|mid|low`,
+  `text-green|green-soft|green-dim`, `bg-brass`, `font-display|body|mono`,
+  `rounded-chip|card|panel`. Add a token there rather than hard-coding a hex anywhere.
+- Never build a class name by concatenating fragments (`` `bg-${tone}` ``) — Tailwind
+  cannot see those and the style silently vanishes in production. Use a lookup object
+  whose values are complete literal class strings.
+- Tailwind is min-width-first. A `max-width` breakpoint must be inverted (base = narrow)
+  or written as an arbitrary variant, not guessed at.
 - Brand: **Gambarino** display (self-hosted `public/fonts/Gambarino-Regular.woff2`),
   system body font, green-black palette, `#13EF93` as a **tonal** accent, bespoke inline
   SVG marks only.
@@ -262,5 +277,6 @@ ever added, port the rule verbatim from
 - **Public legal & trust page opsec** — no legal pages exist yet. If they are added, the
   substance of that rule (no sub-processor names, no implementation fingerprints, no
   wrong hosting region) applies.
-- **Tailwind v4 / shadcn build rules** — superseded by "this project does not use
-  Tailwind" above.
+- **Tailwind v4 / shadcn build rules** — the two that transfer are now recorded under
+  "CSS Rules" above (local postcss config, no `base` option). The shadcn-specific ones
+  do not apply: this repo has no shadcn dependency.

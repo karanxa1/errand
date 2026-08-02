@@ -5,7 +5,11 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "agentmail>=0.5.8",
+    # Pinned, not floating. `messages.reply` takes the body as flattened keyword
+    # args in 0.5.8 and a required positional ReplyToMessageRequest in the
+    # current published reference, so `>=` would let a routine resolve break the
+    # merchant reply path with a TypeError. See app/brokers/mail.py reply().
+    "agentmail==0.5.8",
     "aiosqlite>=0.22.1",
     "alembic>=1.18.5",
     "asyncpg>=0.30",

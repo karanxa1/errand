@@ -12,6 +12,7 @@ SDK surface used (confirmed in .venv/.../agentmail):
                     .preview .timestamp (datetime) .labels .attachments
   client.inboxes.messages.get(inbox_id, message_id)       → Message(.text/.extracted_text)
   client.inboxes.messages.reply(inbox_id, message_id, text=...)
+       ^ 0.5.8-specific keyword form; see the pin note at AgentMailBroker.reply.
 
 The SDK is synchronous; every call is offloaded with `asyncio.to_thread` so the
 broker methods stay non-blocking.
@@ -59,7 +60,12 @@ class AgentMailBroker:
                 display_name="Errand Agent",
             ),
         )
-        # Per AgentMail, inbox_id IS the address; .email is the same string.
+        # inbox_id, email and pod_id are three separate fields on the SDK's Inbox
+        # and no reference states they hold the same value, so the two uses stay
+        # separate: .email is what a merchant replies to and is what we hand out,
+        # inbox_id is the API handle and is what every later call takes. The
+        # fallback to inbox_id only covers an SDK build that omits .email; it is
+        # a last resort for display, not a claim that the two are equal.
         self._inbox_id = inbox.inbox_id
         self._address = getattr(inbox, "email", None) or inbox.inbox_id
         return self._address
@@ -116,6 +122,17 @@ class AgentMailBroker:
 
     async def reply(self, message_id: str, text: str) -> None:
         inbox_id = await self._require_inbox()
+        # VERSION-COUPLED CALL — read before bumping `agentmail`.
+        # Installed 0.5.8 declares reply(inbox_id, message_id, *, text=..., ...),
+        # i.e. the body flattened into keyword-only args, which is what this call
+        # passes. The SDK's current published reference declares
+        # reply(inbox_id, message_id, request: ReplyToMessageRequest, ...) — a
+        # REQUIRED positional — so crossing that boundary turns this into a
+        # TypeError at the one moment the agent tries to answer a merchant, and
+        # the signature change is silent at install time. pyproject pins
+        # agentmail to 0.5.8 for this reason; moving the pin means rewriting this
+        # call to build and pass the request object.
+        # https://raw.githubusercontent.com/agentmail-to/agentmail-python/main/reference.md
         await asyncio.to_thread(
             self._client.inboxes.messages.reply,
             inbox_id,

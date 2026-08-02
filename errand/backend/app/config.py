@@ -45,6 +45,13 @@ class Settings(BaseSettings):
 
     # OpenAI
     openai_api_key: str = ""
+    # Override for the OpenAI-compatible endpoint the chat path talks to. None
+    # keeps the SDK's own default (api.openai.com), which is what this deployment
+    # resolves to today, so an unset value moves nothing. Note the client does
+    # NOT pick this up implicitly — AsyncOpenAI(api_key=...) ignores it, and a
+    # caller that should honour the override has to pass
+    # base_url=settings.openai_api_base itself.
+    openai_api_base: str | None = None
 
     # Linkup (web search)
     linkup_api_key: str = ""

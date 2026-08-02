@@ -136,6 +136,15 @@ def _settings_get(name: str) -> str:
         return ""
 
 
+# The CDP WebSocket endpoint, copied from the current doc's own template. The
+# path still reads `browser-rendering` after the product was renamed to Browser
+# Run — that is what the doc prints, so it is a live path and not a leftover to
+# tidy; rewriting it to `browser-run` would dial an endpoint that does not exist.
+# keep_alive is milliseconds, and 600000 is the ceiling rather than a taste:
+# a browser times out after 60s of inactivity by default and keep_alive raises
+# that to at most 10 minutes, so a larger number buys nothing.
+# https://developers.cloudflare.com/browser-run/cdp/playwright/
+# https://developers.cloudflare.com/browser-run/limits/
 _CF_WS_TEMPLATE = (
     "wss://api.cloudflare.com/client/v4/accounts/{account_id}"
     "/browser-rendering/devtools/browser?keep_alive=600000"

@@ -7,6 +7,10 @@ to Deepgram directly.
 
 Wire contract (docs/api-reference.md — "Errand Voice Relay + Tool Bridge"):
 
+  Handshake: /api/voice/ws?ticket=... — the browser first POSTs the
+  authenticated /api/voice/ticket and presents the one-shot ticket here. No
+  ticket, no Deepgram connection (close 4401). See app/voice/tickets.py.
+
   Browser -> backend:
     - binary: mic PCM (linear16, 48 kHz mono), forwarded verbatim to Deepgram.
     - JSON:   {type:"start"} | {type:"stop"} |
@@ -50,8 +54,15 @@ from app.config import settings
 from app.contracts import AuditEvent
 from app.orchestrator.guards import ApprovalDecision
 from app.orchestrator.run_errand import run_errand
+from app.voice.tickets import redeem_ticket
 
 DEEPGRAM_AGENT_URL = "wss://agent.deepgram.com/v1/agent/converse"
+
+# Application-level "unauthorized" close code (the 4000-4999 range is reserved
+# for the application). Deliberately NOT 1008/policy-violation: the browser must
+# be able to tell "your ticket was missing/stale, sign in again" apart from any
+# other policy close, and 1008 is indistinguishable from a generic refusal.
+WS_UNAUTHORIZED = 4401
 
 # ?model=sol|terra|luna -> the BYO OpenAI think model id.
 _MODEL_MAP = {
@@ -64,12 +75,35 @@ _DEFAULT_MODEL = "sol"
 # Human-in-the-loop gate timeout (seconds) for a voice-driven errand.
 APPROVAL_TIMEOUT_S = 300
 
-# Deepgram closes an idle Voice Agent WS after ~10s of no audio (1011/NET-0002).
-# Per docs/agent-keep-alive, send {"type":"KeepAlive"} at least every 8s during
-# any audio gap. We poll every second and fire a KeepAlive once the mic has been
-# silent for KEEPALIVE_AFTER_SILENCE_S — well under the 8s / 10s ceilings.
+# Deepgram closes the socket at 1011 when it has received no Binary or Text
+# frame from us for 10s. That close is NET-0001 ("The service has not received a
+# Binary or Text frame from the client within the timeout window"); NET-0002 is a
+# different one — no AUDIO inside the no-audio window — which a KeepAlive, being a
+# text frame, does not answer, so the code cited here before named a failure this
+# loop has no effect on. The Voice Agent surface reports the same condition as
+# CLIENT_MESSAGE_TIMEOUT rather than a NET code.
+# https://developers.deepgram.com/docs/stt-troubleshooting-websocket-data-and-net-errors
+# https://developers.deepgram.com/docs/voice-agent-errors-warnings
+#
+# Deepgram asks for one {"type":"KeepAlive"} every 8s while idle. We poll every
+# second and fire once the mic has been quiet for KEEPALIVE_AFTER_SILENCE_S,
+# which leaves margin under both the 8s cadence and the 10s close.
+# https://developers.deepgram.com/docs/agent-keep-alive
 KEEPALIVE_POLL_S = 1.0
 KEEPALIVE_AFTER_SILENCE_S = 5.0
+
+# Deepgram retires every Voice Agent session at two hours and KeepAlive does not
+# move it: "KeepAlive does not extend the maximum session length of 2 hours. The
+# server closes every session at the 2-hour mark, however much traffic it has
+# seen." It announces the ceiling itself — Warning/
+# MAXIMUM_SESSION_LENGTH_APPROACHING at 1h55m, then Error/
+# MAXIMUM_SESSION_LENGTH_REACHED at 2h — and both are forwarded to the browser
+# below. This local ceiling is the backstop for when neither announcement lands:
+# the alternative is a bare socket drop the browser can only render as an
+# unexplained hiccup two hours into a conversation.
+# https://developers.deepgram.com/docs/agent-keep-alive
+# https://developers.deepgram.com/docs/voice-agent-errors-warnings
+MAX_SESSION_S = 2 * 60 * 60
 
 SYSTEM_PROMPT = (
     "You are Errand, a warm, concise voice concierge that runs real purchasing "
@@ -143,10 +177,12 @@ def _think_functions() -> list[dict]:
                     "depth": {
                         "type": "string",
                         "description": (
-                            "'standard' for a fast answer, 'deep' for a "
-                            "multi-iteration search. Default 'standard'."
+                            "'fast' for a sub-second answer to a simple, focused "
+                            "question, 'standard' for agentic search, 'deep' for "
+                            "several agentic iterations. Default 'standard'."
                         ),
-                        "enum": ["standard", "deep"],
+                        # Mirrors LinkupSearchBroker.DEPTHS; see the citation there.
+                        "enum": list(LinkupSearchBroker.DEPTHS),
                     },
                 },
                 "required": ["query"],
@@ -168,9 +204,30 @@ def _settings_message(model_id: str) -> dict:
             "language": "en",
             "listen": {"provider": {"type": "deepgram", "model": "nova-3"}},
             "think": {
-                "provider": {"type": "open_ai", "model": model_id},
+                "provider": {
+                    "type": "open_ai",
+                    "model": model_id,
+                    # Deepgram forwards this to the BYO endpoint as OpenAI's
+                    # `reasoning_effort`. gpt-5.6 defaults to "medium", and
+                    # OpenAI documents medium-with-function-tools on
+                    # /v1/chat/completions as unsupported for this family — the
+                    # same incompatibility the text path already handles. Without
+                    # it the agent's tool calls fail at the LLM hop, which is
+                    # exactly the surface that can spend money.
+                    # Deepgram's enum for this field is none|minimal|low|medium|
+                    # high; gpt-5.6 accepts none|low|medium|high|xhigh|max, so
+                    # the reachable intersection is none|low|medium|high.
+                    # https://developers.deepgram.com/reference/voice-agent/voice-agent
+                    # https://developers.openai.com/api/docs/guides/upgrading-to-gpt-5p6-sol
+                    "reasoning_mode": "none",
+                },
                 "endpoint": {
-                    "url": "https://api.openai.com/v1",
+                    # The full request path, not the API base. Deepgram POSTs
+                    # this URL directly; its own OpenAI bring-your-own example is
+                    # ".../v1/chat/completions", and every other BYO example on
+                    # that page is likewise a complete path.
+                    # https://developers.deepgram.com/docs/voice-agent-llm-models
+                    "url": "https://api.openai.com/v1/chat/completions",
                     "headers": {"Authorization": f"Bearer {settings.openai_api_key}"},
                 },
                 "prompt": SYSTEM_PROMPT,
@@ -185,10 +242,21 @@ def _settings_message(model_id: str) -> dict:
 class VoiceSession:
     """One browser <-> backend <-> Deepgram bridge for a single connection."""
 
-    def __init__(self, browser: WebSocket, model_key: str, profile: str) -> None:
+    def __init__(
+        self,
+        browser: WebSocket,
+        model_key: str,
+        profile: str,
+        user_id: str,
+        user_email: str,
+    ) -> None:
         self._browser = browser
         self._model_id = _MODEL_MAP.get(model_key, _MODEL_MAP[_DEFAULT_MODEL])
         self._profile = profile if profile in ("business", "personal") else "business"
+        # Who is spending. Taken from the redeemed ticket, never from the query
+        # string, so a caller cannot attribute a purchase to someone else.
+        self._user_id = user_id
+        self._user_email = user_email
         self._dg: websockets.WebSocketClientProtocol | None = None  # type: ignore[name-defined]
         # Starlette/FastAPI WS sends are not concurrency-safe; serialize them.
         self._browser_lock = asyncio.Lock()
@@ -203,6 +271,11 @@ class VoiceSession:
         # Monotonic time of the last mic frame forwarded to Deepgram; the
         # keepalive loop uses this to detect audio gaps.
         self._last_audio_ts = time.monotonic()
+        # When this bridge started, measured against MAX_SESSION_S. Set here
+        # rather than at connect so the clock covers the dial too — Deepgram's
+        # two hours run from its side of the socket, and starting ours later
+        # would let the local backstop trail the real ceiling.
+        self._started_at = time.monotonic()
 
     # ── browser I/O (serialized) ─────────────────────────────────────────────
 
@@ -291,14 +364,31 @@ class VoiceSession:
             await self._shutdown()
 
     async def _keepalive_loop(self) -> None:
-        """Send Deepgram a KeepAlive during audio gaps so its ~10s no-audio
-        timeout (1011/NET-0002) never fires. Runs until the session closes."""
+        """Hold the socket open across audio gaps with a KeepAlive, and retire the
+        session at Deepgram's two-hour ceiling with a stated cause. Runs until the
+        session closes."""
         while not self._closed.is_set():
             try:
                 await asyncio.sleep(KEEPALIVE_POLL_S)
             except asyncio.CancelledError:
                 break
             if self._closed.is_set() or self._dg is None:
+                break
+            if time.monotonic() - self._started_at >= MAX_SESSION_S:
+                # Emit BEFORE closing: _to_browser drops anything sent after
+                # _closed is set, so the order here is what makes the cause
+                # reach the user instead of a silent teardown.
+                await self._to_browser(
+                    {
+                        "type": "voice.error",
+                        "code": "MAXIMUM_SESSION_LENGTH_REACHED",
+                        "message": (
+                            "This voice session hit Deepgram's two-hour limit and "
+                            "has ended. Start a new session to keep going."
+                        ),
+                    }
+                )
+                self._closed.set()
                 break
             gap = time.monotonic() - self._last_audio_ts
             if gap < KEEPALIVE_AFTER_SILENCE_S:
@@ -437,10 +527,30 @@ class VoiceSession:
                 task = asyncio.create_task(self._run_tool(call))
                 self._tool_tasks.add(task)
                 task.add_done_callback(self._tool_tasks.discard)
-        # Welcome / Error / other events: ignored (audio still flows).
-        elif etype == "Error":
+        elif etype == "Warning":
+            # Deepgram's advance notice, carrying MAXIMUM_SESSION_LENGTH_APPROACHING
+            # at 1h55m. Forwarded so a long conversation can be told it is about to
+            # be retired while it can still act on that, rather than narrating the
+            # drop five minutes later.
+            # https://developers.deepgram.com/docs/voice-agent-errors-warnings
             await self._to_browser(
-                {"type": "voice.error", "message": event.get("description") or "Deepgram error"}
+                {
+                    "type": "voice.warning",
+                    "code": event.get("code") or "",
+                    "message": event.get("description") or "Deepgram warning",
+                }
+            )
+        # Welcome / other events: ignored (audio still flows).
+        elif etype == "Error":
+            # `code` rides along so MAXIMUM_SESSION_LENGTH_REACHED is separable
+            # from a generic failure by the browser and by our own logs — the
+            # description alone reads like every other error.
+            await self._to_browser(
+                {
+                    "type": "voice.error",
+                    "code": event.get("code") or "",
+                    "message": event.get("description") or "Deepgram error",
+                }
             )
 
     # ── tool bridge ─────────────────────────────────────────────────────────────
@@ -558,8 +668,8 @@ class VoiceSession:
                 brokers,
                 profile=profile,  # type: ignore[arg-type]
                 intent=intent,
-                user_id="u_demo",
-                user_email_fallback="operator@example.com",
+                user_id=self._user_id,
+                user_email_fallback=self._user_email,
                 emit=emit,
                 approve=approve,
             )
@@ -596,11 +706,35 @@ def _summarize_outcome(outcome: dict) -> str:
 
 
 async def voice_ws(websocket: WebSocket) -> None:
-    """FastAPI WebSocket handler for `/api/voice/ws?model=sol&profile=business`."""
+    """FastAPI WebSocket handler for
+    `/api/voice/ws?model=sol&profile=business&ticket=...`.
+
+    AUTH REQUIRED. The ticket is redeemed BEFORE anything expensive happens: no
+    Deepgram socket is opened and run_errand is unreachable unless a live,
+    unspent ticket names a real user. The handshake is accepted only to hand the
+    browser a close CODE — a close sent before accept is turned into an opaque
+    HTTP 403 by the ASGI server, which the browser reports as a generic 1006 and
+    the hook cannot tell from a network blip. Accepting costs one socket for a
+    few milliseconds and buys a diagnosable "sign in again".
+    """
+    ticket = redeem_ticket(websocket.query_params.get("ticket"))
+    if ticket is None:
+        await websocket.accept()
+        await websocket.close(code=WS_UNAUTHORIZED, reason="voice ticket missing or expired")
+        return
+
     model_key = websocket.query_params.get("model", _DEFAULT_MODEL)
     profile = websocket.query_params.get("profile", "business")
     await websocket.accept()
-    session = VoiceSession(websocket, model_key, profile)
+    session = VoiceSession(
+        websocket,
+        model_key,
+        profile,
+        # Same derivation as main.py's errand_stream, so a voice-driven errand
+        # and a typed one attribute spend to the same identity.
+        user_id=f"u_{ticket.user_id[:12]}",
+        user_email=ticket.user_email,
+    )
     try:
         await session.run()
     finally:

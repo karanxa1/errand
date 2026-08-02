@@ -20,3 +20,7 @@ Newest at the bottom.
 - 2026-08-02 (user): read the provider's upstream doc before touching any provider call; never extrapolate from a sibling model, the SDK source, our own call sites, or memory.
 - 2026-08-02 (user): every new user message mid-task → re-plan and update the todo list immediately; do not absorb it silently.
 - 2026-08-02 (user): never send real email to any `*@anyfeast.com` address, including `dev@anyfeast.com`.
+- 2026-08-02 (user): this project is Tailwind v4 only now — no CSS Modules; keep postcss.config.mjs local and never pass it a `base` option (breaks the Cloudflare Workers build).
+- 2026-08-02 (user): when told to go faster, fan out subagents with strict non-overlapping file ownership and forbid them from running `next build` concurrently (they collide in .next).
+- Prava's card credential appears at status `awaiting_result`, not `completed` — keying on `completed` alone silently times the errand out with no 4xx anywhere.
+- Deepgram's BYO think endpoint needs the FULL /v1/chat/completions path and `reasoning_mode` (its name for OpenAI's reasoning_effort).
