@@ -3,14 +3,17 @@
 /* The front door.
  *
  * Composition note, because the default was deliberately avoided: this is not a
- * text column with a product panel beside it. The fold is a headline and then
- * ONE horizontal band — an open hold, laid out as page-scale type rather than
- * inside a card — running the full width beneath it. The band is the product's
- * whole thesis in one object: a real cart, a real total, and a stop.
+ * text column with a product panel beside it. The fold is a headline sitting
+ * WITH one page-scale signature object — the transaction path in
+ * <TransactionGate/> — as a single composition, the statement above and the
+ * route beneath it. The path is the product's whole thesis in one object: a real
+ * cart, a real total, four labelled stages, and a gate that stays shut until a
+ * human opens it.
  *
- * The Approve / Decline controls are live. They are a demonstration, labelled as
- * one, and they actually resolve — nothing on this page looks interactive
- * without being interactive.
+ * The Approve / Decline / Replay controls are live. They are a demonstration,
+ * labelled as one, and they resolve through a pure reducer that cannot reach any
+ * purchasing code — nothing on this page looks interactive without being
+ * interactive, and nothing here can move real money.
  *
  * Signed-in visitors never see any of it; they go straight to their chats.
  *
@@ -23,30 +26,18 @@
  *
  * Deliberate absences: no pills, no gradient fills, no glow behind anything, no
  * icon-in-a-tile, no decorative hairlines, no card that lifts on hover, no
- * growing underline, no button that jumps when you point at it. Emphasis is a
- * tonal step, never a saturated pop. */
+ * growing underline, no button that jumps when you point at it, no filled +
+ * outlined button pair. Emphasis is a tonal step, never a saturated pop. */
 
 import type { CSSProperties } from "react";
-import { useCallback, useEffect, useState } from "react";
+import { useEffect } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 
+import "@/app/landing.anim.css";
 import { useAuth } from "@/lib/auth";
 import { ErrandMark } from "@/components/Marks";
-
-// The demonstration cart. Fixed, small, and honest: a plausible office restock,
-// not a claim about anyone's actual order.
-const DEMO_LINES = [
-  { label: "Oat milk", detail: "6 × 1L", amount: 23.4 },
-  { label: "Dark roast beans", detail: "1kg", amount: 28.0 },
-  { label: "Sparkling water", detail: "24 × 330ml", amount: 19.6 },
-];
-const DEMO_TOTAL = DEMO_LINES.reduce((sum, line) => sum + line.amount, 0);
-
-const money = (n: number) =>
-  n.toLocaleString("en-US", { style: "currency", currency: "USD" });
-
-type HoldState = "held" | "approved" | "declined";
+import TransactionGate from "@/components/landing/TransactionGate";
 
 // The responsive gutter every section reads from, kept as one custom property on
 // the page root exactly as before.
@@ -70,6 +61,17 @@ const NAV_ACTION =
 const FOOTER_LINK =
   "text-[13.5px] text-mid no-underline transition-[color] duration-[160ms] ease-[ease] hover:text-hi";
 
+// The audit trail, in the real backend event names. Set as data (font-mono) —
+// the one place a mono belongs. Rows are separated by tone + the self-coloured
+// lip, never a rail. The last row is the point of the section.
+const AUDIT_EVENTS: readonly (readonly [string, string])[] = [
+  ["run.started", "Intent accepted, profile resolved"],
+  ["context.loaded", "Spend policy and approved merchants read"],
+  ["cart.built", "Lines priced and totalled inside the ceiling"],
+  ["payment.session", "Card session pinned to this merchant and total"],
+  ["approval.request", "Stopped. Waiting on a human."],
+];
+
 export default function Landing() {
   const router = useRouter();
   const { user, loading } = useAuth();
@@ -78,9 +80,6 @@ export default function Landing() {
   useEffect(() => {
     if (!loading && user) router.replace("/c");
   }, [loading, user, router]);
-
-  const [hold, setHold] = useState<HoldState>("held");
-  const resetHold = useCallback(() => setHold("held"), []);
 
   return (
     <main className="relative z-[1]" style={PAGE_VARS}>
@@ -109,117 +108,32 @@ export default function Landing() {
       </header>
 
       {/* ── The fold ─────────────────────────────────────────────────────────
-          One composition: the statement, then a single horizontal band that
-          runs the full content width beneath it. */}
-      <section className="max-w-page mx-auto pt-[clamp(56px,11vh,108px)] px-[var(--gutter)] pb-[clamp(64px,12vh,120px)] min-h-[calc(100dvh-72px)] flex flex-col justify-center gap-[clamp(44px,7vh,76px)] [@media(max-width:560px)]:min-h-[auto] [@media(max-width:560px)]:pt-[clamp(40px,8vh,64px)]">
+          One composition that owns the first screen: the statement, then the
+          page-scale transaction path running the full content width beneath it.
+          No half-section peeks in — the fold is sized to the viewport and
+          balanced around its two elements. */}
+      <section className="max-w-page mx-auto pt-[clamp(48px,9vh,92px)] px-[var(--gutter)] pb-[clamp(56px,10vh,104px)] min-h-[calc(100dvh-72px)] flex flex-col justify-center gap-[clamp(40px,6.5vh,68px)] [@media(max-width:560px)]:min-h-[auto] [@media(max-width:560px)]:pt-[clamp(36px,7vh,56px)]">
         <div>
           {/* Held to two lines at every width. A display line that stacks into
-              three or four short rows is a staircase, not a composition. */}
-          <h1 className="font-display font-normal text-[clamp(40px,6.4vw,82px)] leading-[1.03] tracking-[-0.015em] text-hi m-0">
-            {/* Each line is its own block, so the display line is TWO lines at
-                every width instead of wrapping into a three- or four-row
-                staircase — and the tonal emphasis owns a whole line rather than
-                straddling a break, which is what made it read as a stray
-                coloured word. */}
+              three or four short rows is a staircase, not a composition; the
+              tonal emphasis owns a whole line rather than straddling a break. */}
+          <h1 className="font-display font-normal text-[clamp(38px,6vw,78px)] leading-[1.04] tracking-[-0.015em] text-hi m-0">
             <span className="block">Nothing moves</span>
             <span className="block text-mid">until you say so.</span>
           </h1>
-          <p className="mt-[clamp(18px,2.6vh,26px)] mb-0 mx-0 text-[clamp(15px,1.25vw,17px)] leading-[1.62] text-mid max-w-[54ch]">
-            Errand takes a purchase in plain words, shops an approved merchant,
-            builds the cart against your policy and pins a payment session. Then
-            it stops — and waits for a human.
+          <p className="mt-[clamp(16px,2.4vh,24px)] mb-0 mx-0 text-[clamp(15px,1.25vw,17px)] leading-[1.6] text-mid max-w-[48ch]">
+            Errand shops an approved merchant in plain words, builds the cart
+            against your policy, and stops at a human gate before anything is
+            charged.
           </p>
+          <Link className={`inline-block mt-[clamp(22px,3vh,30px)] ${ACTION}`} href="/register">
+            Start an errand
+          </Link>
         </div>
 
-        {/* The hold, as page-scale type rather than a card: no panel fill, no
-            drawn border, no shadow. The only rule on the page is structural
-            rather than ornamental — the self-coloured lip that separates the
-            statement from the ledger under it. */}
-        <div
-          className="group grid grid-cols-[minmax(210px,1fr)_minmax(280px,1.35fr)_minmax(230px,0.95fr)] gap-[clamp(28px,4vw,56px)] items-start pt-[clamp(26px,4vh,40px)] shadow-[inset_0_1px_0_0_var(--color-edge)] [@media(max-width:900px)]:grid-cols-[1fr] [@media(max-width:900px)]:gap-[30px]"
-          data-state={hold}
-        >
-          <div className="flex flex-col gap-[9px]">
-            <span className="font-mono text-[11.5px] tracking-[0.08em] uppercase text-green-dim transition-[color] duration-[220ms] ease-[ease] group-data-[state=approved]:text-green-soft group-data-[state=declined]:text-danger">
-              {hold === "held"
-                ? "Hold open"
-                : hold === "approved"
-                  ? "Settled"
-                  : "Declined"}
-            </span>
-            <span className="font-display text-[clamp(22px,2.3vw,29px)] leading-[1.15] text-hi">
-              Northwind Provisions
-            </span>
-            <span className="text-[13px] leading-[1.5] text-low max-w-[30ch]">
-              A demonstration of the gate. No real order, no real card.
-            </span>
-          </div>
-
-          <ul className="list-none m-0 p-0 flex flex-col gap-3">
-            {DEMO_LINES.map((line) => (
-              <li
-                key={line.label}
-                className="grid grid-cols-[1fr_auto] gap-x-[18px] items-baseline"
-              >
-                <span className="col-start-1 row-start-1 text-body text-[15px]">
-                  {line.label}
-                </span>
-                <span className="col-start-1 row-start-2 text-low text-[12.5px]">
-                  {line.detail}
-                </span>
-                <span className="col-start-2 row-start-1 row-span-2 self-center font-mono text-[14px] text-mid tabular-nums">
-                  {money(line.amount)}
-                </span>
-              </li>
-            ))}
-          </ul>
-
-          <div className="flex flex-col items-start gap-1.5 [@media(max-width:900px)]:pt-1.5 [@media(max-width:900px)]:shadow-[inset_0_1px_0_0_var(--color-edge)]">
-            {/* Big type needs air. The total is the loudest thing on the page,
-                so it gets room rather than tight tracking. */}
-            <span className="font-display text-[clamp(42px,5.2vw,66px)] leading-[1.02] tracking-[-0.01em] text-hi tabular-nums transition-[color] duration-[260ms] ease-[ease] group-data-[state=declined]:text-low [@media(max-width:900px)]:pt-[18px]">
-              {money(DEMO_TOTAL)}
-            </span>
-            <span className="text-[13.5px] text-mid min-h-[20px]">
-              {hold === "held"
-                ? "held until you approve"
-                : hold === "approved"
-                  ? "approved by you, then charged"
-                  : "released — nothing was charged"}
-            </span>
-
-            {hold === "held" ? (
-              <div className="flex items-center gap-4 mt-4 flex-wrap">
-                <button
-                  type="button"
-                  className={`border-none ${ACTION}`}
-                  onClick={() => setHold("approved")}
-                >
-                  Approve with passkey
-                </button>
-                {/* Not an outlined twin of the primary — a quiet text control,
-                    which is what declining actually is. */}
-                <button
-                  type="button"
-                  className="border-none bg-transparent px-0.5 py-[11px] text-mid text-[14.5px] transition-[color] duration-[160ms] ease-[ease] hover:text-hi"
-                  onClick={() => setHold("declined")}
-                >
-                  Decline
-                </button>
-              </div>
-            ) : (
-              <div className="flex items-center gap-4 mt-4 flex-wrap">
-                <button
-                  type="button"
-                  className="border-none bg-transparent px-0.5 py-[11px] text-mid text-[14.5px] transition-[color] duration-[160ms] ease-[ease] hover:text-hi"
-                  onClick={resetHold}
-                >
-                  Run it again
-                </button>
-              </div>
-            )}
-          </div>
-        </div>
+        {/* The signature object — one responsive SVG transaction path with its
+            live cart, total, and gate. This is what the headline sits with. */}
+        <TransactionGate />
       </section>
 
       {/* ── The record ───────────────────────────────────────────────────── */}
@@ -234,24 +148,14 @@ export default function Landing() {
           nowhere.
         </p>
 
-        {/* Real event names, set as data — the one place a mono belongs. Rows
-            are separated by tone and rhythm, not by rules running down a rail.
-            The last row is the point of the section, so it carries the page's
-            live tone rather than the dimmed one. */}
         <ol className="list-none mt-[clamp(30px,5vh,46px)] mb-0 mx-0 p-0 grid gap-0.5 max-w-[720px]">
-          {[
-            ["run.started", "Intent accepted, profile resolved"],
-            ["context.loaded", "Spend policy and approved merchants read"],
-            ["cart.built", "Three lines, priced, inside the ceiling"],
-            ["payment.session", "Card session pinned to this merchant and total"],
-            ["approval.request", "Stopped. Waiting on a human."],
-          ].map(([step, detail]) => (
+          {AUDIT_EVENTS.map(([event, detail]) => (
             <li
-              key={step}
-              className="group grid grid-cols-[minmax(150px,210px)_1fr] gap-[clamp(14px,2.4vw,30px)] items-baseline py-[13px] shadow-[inset_0_1px_0_0_var(--color-edge)] [@media(max-width:900px)]:grid-cols-[1fr] [@media(max-width:900px)]:gap-[5px]"
+              key={event}
+              className="group grid grid-cols-[minmax(150px,210px)_1fr] gap-[clamp(14px,2.4vw,30px)] items-baseline py-[13px] shadow-[inset_0_1px_0_0_var(--color-edge)] [@media(max-width:640px)]:grid-cols-[1fr] [@media(max-width:640px)]:gap-[5px]"
             >
               <span className="font-mono text-[13px] text-green-dim group-last:text-green-soft">
-                {step}
+                {event}
               </span>
               <span className="text-[14.5px] text-mid group-last:text-body">
                 {detail}
@@ -261,16 +165,32 @@ export default function Landing() {
         </ol>
       </section>
 
-      {/* ── Voice ────────────────────────────────────────────────────────── */}
+      {/* ── Voice ────────────────────────────────────────────────────────────
+          Errand is voice-first, so this section speaks in the same transaction
+          language: a spoken request, a live transcript line, and ONE bespoke SVG
+          waveform — not an icon tile, not a fake app window. */}
       <section className={SECTION}>
         <h2 className={SECTION_TITLE}>You can also just say it.</h2>
         <p className={SECTION_BODY}>
-          Errand is voice-first. Speak the errand, hear it think, and answer the
-          approval the same way you started it. The transcript and the tool
-          record land in the same thread as a typed conversation, so nothing
-          about the run is only in the air.
+          Speak the errand, hear it think, and answer the approval the same way
+          you started it. The transcript and the tool record land in the same
+          thread as a typed conversation, so nothing about the run is only in the
+          air.
         </p>
-        <Link className={`inline-block mt-7 ${ACTION}`} href="/register">
+
+        <div className="mt-[clamp(30px,5vh,46px)] max-w-[720px] flex flex-col gap-[18px]">
+          <VoiceWave />
+          <p className="m-0 flex items-baseline gap-[10px] flex-wrap">
+            <span className="font-mono text-[11px] tracking-[0.14em] uppercase text-green-dim shrink-0">
+              You
+            </span>
+            <span className="text-[clamp(16px,1.7vw,20px)] leading-[1.5] text-body font-display">
+              “Restock the office pantry under $100, approved brands only.”
+            </span>
+          </p>
+        </div>
+
+        <Link className={`inline-block mt-8 ${ACTION}`} href="/register">
           Start an errand
         </Link>
       </section>
@@ -308,5 +228,66 @@ export default function Landing() {
         </span>
       </footer>
     </main>
+  );
+}
+
+/* The voice waveform — one bespoke SVG, drawn in the brand's tonal green. Not an
+   icon and not a fake app chrome: a real spoken utterance rendered as amplitude
+   bars with rounded caps, quieter at the edges (silence into speech into
+   silence). A single tracer dot rides across it, animating its x position — a
+   decorative motion on an element that is already fully drawn, and it stops
+   under prefers-reduced-motion. */
+function VoiceWave() {
+  // Deterministic amplitudes shaped like a real phrase: a rise, a couple of
+  // stressed peaks, and a fall. Fixed data, not random, so the mark is stable.
+  const amps = [
+    0.18, 0.3, 0.52, 0.74, 0.62, 0.9, 0.68, 0.44, 0.58, 0.82, 0.96, 0.7, 0.5,
+    0.66, 0.86, 0.6, 0.4, 0.55, 0.72, 0.48, 0.32, 0.5, 0.66, 0.42, 0.26, 0.36,
+    0.22, 0.14,
+  ];
+  const w = 720;
+  const h = 96;
+  const mid = h / 2;
+  const gap = w / amps.length;
+  const barW = 3;
+  const maxBar = mid - 8;
+
+  return (
+    <svg
+      viewBox={`0 0 ${w} ${h}`}
+      className="w-full h-auto overflow-visible text-green-dim"
+      role="img"
+      aria-label="Waveform of a spoken request"
+    >
+      {amps.map((a, i) => {
+        const x = i * gap + gap / 2;
+        const barH = Math.max(barW, a * maxBar);
+        // The two loudest bars carry the live accent; the rest are the dim tone.
+        const loud = a > 0.85;
+        return (
+          <line
+            key={i}
+            x1={x}
+            y1={mid - barH}
+            x2={x}
+            y2={mid + barH}
+            stroke="currentColor"
+            strokeWidth={barW}
+            strokeLinecap="round"
+            className={loud ? "text-green-soft" : undefined}
+          />
+        );
+      })}
+      {/* the tracer dot rides left→right along the utterance. Driven by a CSS
+          transform keyframe (not SMIL) so prefers-reduced-motion actually stops
+          it; it rests at the start of the phrase when motion is reduced. */}
+      <circle
+        cx={0}
+        cy={mid}
+        r="3.4"
+        fill="currentColor"
+        className="text-green-soft [transform-box:view-box] animate-[voice-scan_3200ms_ease-in-out_infinite] motion-reduce:animate-none"
+      />
+    </svg>
   );
 }

@@ -1,0 +1,48 @@
+/* Landing keyframes only. No selectors, no rules — every assignment (timing,
+   fill mode, reduced-motion opt-out) lives as Tailwind utilities on the element.
+   Keyframes cannot be expressed as utilities, which is the one reason this file
+   exists.
+
+   Never animate opacity from 0 here: content is visible by default, and these
+   only animate things already on screen. */
+
+/* The tracer draws itself along the transaction path. It animates
+   stroke-dashoffset from the full length (1, on a pathLength=1 path) down to 0,
+   so the stroke fills the FULL route with stable round caps — no scaleY on a
+   rounded shape, no half-fill. */
+@keyframes transaction-trace {
+  from {
+    stroke-dashoffset: 1;
+  }
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+
+/* The gate settling as it opens — a small, tight ease used if a leaf needs a
+   keyed settle rather than a transition. Kept minimal and honest. */
+@keyframes gate-settle {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(34deg);
+  }
+}
+
+/* The voice tracer dot riding across the waveform. Translates in SVG user units
+   (the viewBox is 720 wide) out and back, so it reads as a scan over an
+   utterance that is already fully drawn. Transform, never opacity. Stopped under
+   prefers-reduced-motion via a utility on the element, where it simply rests at
+   the start of the phrase. */
+@keyframes voice-scan {
+  0% {
+    transform: translateX(0);
+  }
+  50% {
+    transform: translateX(720px);
+  }
+  100% {
+    transform: translateX(0);
+  }
+}
