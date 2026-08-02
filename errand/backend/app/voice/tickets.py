@@ -33,11 +33,13 @@ scaling out or restarting:
   - a deploy / crash between mint and redeem invalidates outstanding tickets;
     the user simply taps the orb again and a new one is minted, so this is the
     benign case.
-The deployment is pinned to min=max=1 replica precisely to satisfy this (the
-same constraint main.py's `_approvals` already documents), so it is correct as
-deployed. Making this horizontally scalable needs a shared store (Redis with a
-60s TTL and an atomic GETDEL, or a signed self-contained ticket plus a shared
-replay set) — deliberately NOT done here.
+The deployment is pinned to min=max=1 replica precisely to satisfy this. (The
+approval gate, which used to share this exact in-memory constraint, is now
+DB-backed and no longer does — see app.main; this ticket store is still
+in-process and so this constraint still applies to it.) Making this
+horizontally scalable needs a shared store (Redis with a 60s TTL and an atomic
+GETDEL, or a signed self-contained ticket plus a shared replay set) —
+deliberately NOT done here.
 """
 
 from __future__ import annotations

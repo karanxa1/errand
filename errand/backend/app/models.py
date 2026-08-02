@@ -11,7 +11,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, ForeignKey, Index, String, Text
+from sqlalchemy import DateTime, ForeignKey, Index, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.types import JSON
 
@@ -79,6 +79,41 @@ class Message(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
     conversation: Mapped["Conversation"] = relationship(back_populates="messages")
+
+
+class Approval(Base):
+    """A single human-in-the-loop spend gate, made durable so the SSE stream that
+    AWAITS the gate and the POST /approve that RESOLVES it no longer have to share
+    one process. The stream inserts a `pending` row, then polls it; /approve
+    flips the row to approved/declined in a separate request (any process). This
+    replaces the old in-process `asyncio.Future` rendezvous that pinned the
+    approval hand-off to a single worker.
+
+    `scope` is a generic, caller-supplied ownership key — its MEANING and the
+    authorization live entirely in the routers: it is the owner's user id on the
+    app.main `/api/errand/*` path, and the conversation id on the
+    app.routers.chat `/{id}/*` path. The table stays deliberately unaware of what
+    a scope is; a resolve is only ever issued under a scope the caller has already
+    been proven to own, so a leaked run_id is inert in anyone else's hands.
+
+    The UNIQUE (scope, run_id) constraint makes a gate addressable by exactly that
+    pair and stops a second pending row from ever shadowing a run's gate.
+    """
+
+    __tablename__ = "approvals"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    scope: Mapped[str] = mapped_column(String(64), index=True)
+    run_id: Mapped[str] = mapped_column(String(32))
+    # 'pending' | 'approved' | 'declined' | 'timeout'
+    status: Mapped[str] = mapped_column(String(16), default="pending")
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    resolved_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    __table_args__ = (UniqueConstraint("scope", "run_id", name="uq_approvals_scope_run"),)
 
 
 Index("ix_messages_conv_created", Message.conversation_id, Message.created_at)

@@ -36,11 +36,13 @@ import uuid
 from datetime import datetime, timezone
 from typing import Literal
 
+import time
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
 from openai import AsyncOpenAI
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -50,8 +52,8 @@ from app.brokers.linkup import LinkupSearchBroker
 from app.config import settings
 from app.contracts import AuditEvent
 from app.db import SessionLocal, get_session
-from app.models import Conversation, Message, User
-from app.orchestrator.guards import ApprovalDecision
+from app.models import Approval, Conversation, Message, User
+from app.orchestrator.guards import ApprovalDecision, cancellable_sleep
 from app.orchestrator.run_errand import run_errand
 from app.orchestrator.stream import EventStream
 
@@ -82,25 +84,28 @@ TOOL_REASONING_EFFORT = "none"
 # https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create
 MAX_COMPLETION_TOKENS = 4096
 
-# In-memory approval gates for chat-driven errands, keyed by (conversation_id,
-# run_id). The conversation id is part of the key so resolving a gate is scoped
-# to a conversation the caller provably owns: _owned() authorizes the
-# conversation, and the key then makes it impossible to reach a run belonging to
-# a DIFFERENT conversation (i.e. another user's spend) by supplying its run_id.
+# Approval gates for chat-driven errands are DB-backed (table `approvals`, see
+# app/models.py), scoped by conversation_id. The stream INSERTs a `pending` row,
+# then polls it; POST /{id}/approve UPDATEs it in a separate request. Resolving a
+# gate is scoped to a conversation the caller provably owns: /{id}/approve calls
+# _owned() FIRST (authorizing the conversation), and only then UPDATEs
+# WHERE scope=conversation_id — so a run_id from a DIFFERENT conversation (i.e.
+# another user's spend) matches zero rows even if its run_id was learned.
 #
-# ⚠️ SCALING CONSTRAINT — THIS REQUIRES EXACTLY ONE PROCESS.
-# Same constraint as app.main._approvals, for the same reason: the Future lives
-# in THIS process's heap, but the SSE stream that awaits it and the
-# POST /{id}/approve that resolves it are separate HTTP requests. If they land on
-# different replicas or different uvicorn workers, /approve finds no Future,
-# returns ok:false, and the errand hangs until APPROVAL_TIMEOUT_S then aborts the
-# spend — the user's approval appears to do nothing. A restart mid-gate likewise
-# loses the Future and the run aborts on timeout, unresumable.
-# The deployment is pinned to min=max=1 replica (and a single worker) precisely
-# to satisfy this, so it is correct as deployed. Horizontal scaling would need a
-# shared rendezvous (Redis pub/sub, Postgres LISTEN/NOTIFY, or a DB approvals
-# table the stream polls) — deliberately NOT done here.
-_approvals: dict[tuple[str, str], asyncio.Future[ApprovalDecision]] = {}
+# ⚠️ SCALING: the RENDEZVOUS is now shared, but the RUN is not.
+# Same story as app.main: the (conversation_id, run_id) hand-off is durable in
+# Postgres, so /approve landing on a different replica or uvicorn worker than the
+# SSE stream is now correct — the stream's next poll (≤ ~1s) sees the write. That
+# removes the old single-worker footgun for the approval hand-off. BUT the
+# run_errand coroutine, its brokers, the cancel token and the streaming queue all
+# still live in THIS process's heap, so a restart mid-run still loses that state
+# and the in-flight run is NOT resumable. The deployment stays pinned to
+# min=max=1 replica / single worker for that reason; this change makes the
+# approval rendezvous horizontally correct, not the run itself.
+
+# How often the SSE stream re-reads its pending approval row (~1s; a human gate
+# does not need tighter). Mirrors app.main._APPROVAL_POLL_INTERVAL_S.
+_APPROVAL_POLL_INTERVAL_S = 1.0
 
 SYSTEM_PROMPT = (
     "You are Errand, a warm, concise assistant that chats naturally and can run "
@@ -250,16 +255,28 @@ async def approve_chat(
     user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
+    # _owned() FIRST: it raises 404 unless the caller owns THIS conversation.
+    # Only then do we UPDATE WHERE scope=conversation_id — that ordering is the
+    # authorization, so a run_id from someone else's conversation matches zero
+    # rows even if the attacker learned it. The "no pending" response is
+    # identical to "not resolvable", so it cannot be used to probe run ids.
     await _owned(session, user, conversation_id)
-    # Keyed by (conversation_id, run_id): _owned() proved the caller owns THIS
-    # conversation, so a run_id from someone else's conversation cannot be
-    # resolved here even if the attacker learned it.
-    fut = _approvals.get((conversation_id, req.run_id))
-    if fut is None or fut.done():
-        return {"ok": False, "reason": "no pending approval for this run"}
-    fut.set_result(
-        ApprovalDecision(approved=req.approved, approval_id=req.run_id, reason=req.reason)
+    result = await session.execute(
+        update(Approval)
+        .where(
+            Approval.scope == conversation_id,
+            Approval.run_id == req.run_id,
+            Approval.status == "pending",
+        )
+        .values(
+            status="approved" if req.approved else "declined",
+            reason=req.reason,
+            resolved_at=datetime.now(timezone.utc),
+        )
     )
+    await session.commit()
+    if result.rowcount == 0:
+        return {"ok": False, "reason": "no pending approval for this run"}
     return {"ok": True, "approved": req.approved}
 
 
@@ -320,29 +337,63 @@ async def chat(
         await stream.emit_raw(ev.step, payload)
 
     async def approve(run_id: str, approval_id: str, payload: dict) -> ApprovalDecision:
-        fut: asyncio.Future[ApprovalDecision] = asyncio.get_running_loop().create_future()
-        key = (convo_id, run_id)
-        _approvals[key] = fut
+        # Insert a pending gate row scoped to this conversation, emit the request,
+        # then poll the row from a FRESH session (the request session is closed
+        # once the body streams) until /approve resolves it, the client
+        # disconnects, or APPROVAL_TIMEOUT_S elapses.
+        async with SessionLocal() as s:
+            s.add(Approval(scope=convo_id, run_id=run_id, status="pending"))
+            await s.commit()
         await stream.emit_raw(
             "approval.request", {"run_id": run_id, "approval_id": approval_id, **payload}
         )
+        deadline = time.monotonic() + APPROVAL_TIMEOUT_S
         try:
-            decision = await asyncio.wait_for(fut, timeout=APPROVAL_TIMEOUT_S)
-        except asyncio.TimeoutError:
-            await stream.emit_raw(
-                "approval.timeout", {"run_id": run_id, "timeout_s": APPROVAL_TIMEOUT_S}
-            )
-            return ApprovalDecision(approved=False, approval_id=approval_id, timed_out=True)
+            while True:
+                if cancel.is_set():
+                    return ApprovalDecision(
+                        approved=False, approval_id=approval_id, reason="stream closed"
+                    )
+                if time.monotonic() >= deadline:
+                    await stream.emit_raw(
+                        "approval.timeout", {"run_id": run_id, "timeout_s": APPROVAL_TIMEOUT_S}
+                    )
+                    return ApprovalDecision(
+                        approved=False, approval_id=approval_id, timed_out=True
+                    )
+                async with SessionLocal() as s:
+                    row = (
+                        await s.scalars(
+                            select(Approval).where(
+                                Approval.scope == convo_id, Approval.run_id == run_id
+                            )
+                        )
+                    ).first()
+                    row_status = row.status if row is not None else None
+                    row_reason = row.reason if row is not None else None
+                if row is None:
+                    # Deleted by teardown: reads as a closed stream, not a decline.
+                    return ApprovalDecision(
+                        approved=False, approval_id=approval_id, reason="stream closed"
+                    )
+                if row_status != "pending":
+                    return ApprovalDecision(
+                        approved=(row_status == "approved"),
+                        approval_id=approval_id,
+                        reason=row_reason,
+                        timed_out=(row_status == "timeout"),
+                    )
+                await cancellable_sleep(_APPROVAL_POLL_INTERVAL_S, cancel)
         finally:
-            # Always drop the gate, including on cancellation (client
-            # disconnect), so the map can't accumulate dead Futures.
-            _approvals.pop(key, None)
-        return ApprovalDecision(
-            approved=decision.approved,
-            approval_id=approval_id,
-            reason=decision.reason,
-            timed_out=decision.timed_out,
-        )
+            # Always drop this run's gate, including on cancellation (client
+            # disconnect), so the table can't accumulate dead rows.
+            async with SessionLocal() as s:
+                await s.execute(
+                    delete(Approval).where(
+                        Approval.scope == convo_id, Approval.run_id == run_id
+                    )
+                )
+                await s.commit()
 
     async def do_web_search(args: dict) -> str:
         query = (args.get("query") or "").strip()
@@ -570,19 +621,20 @@ async def chat(
                 yield frame
         finally:
             # Always tear down so the background task can never outlive the
-            # request: signal cooperative cancel, unblock any pending approval
-            # gate for this conversation (otherwise the run sits on its Future
-            # until APPROVAL_TIMEOUT_S even though nobody is listening), then
+            # request: signal cooperative cancel (which the poll loop observes
+            # and returns from) and delete any of this conversation's approval
+            # rows (otherwise a torn-down turn could leave a row behind), then
             # hard-cancel and await the task so it is fully finished before the
             # response ends.
             cancel.set()
-            for (c_id, r_id), pending in list(_approvals.items()):
-                if c_id == convo_id and not pending.done():
-                    pending.set_result(
-                        ApprovalDecision(
-                            approved=False, approval_id=r_id, reason="stream closed"
-                        )
+            try:
+                async with SessionLocal() as s:
+                    await s.execute(
+                        delete(Approval).where(Approval.scope == convo_id)
                     )
+                    await s.commit()
+            except Exception:  # noqa: BLE001 — teardown must never raise
+                pass
             if not task.done():
                 task.cancel()
             try:

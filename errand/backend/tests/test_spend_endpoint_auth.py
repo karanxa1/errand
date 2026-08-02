@@ -16,7 +16,6 @@ tests/test_spend_endpoint_auth.py`) if not.
 
 from __future__ import annotations
 
-import asyncio
 import os
 import sys
 import uuid
@@ -29,10 +28,13 @@ from conftest import (  # noqa: E402
     register_user,
     run_async,
     run_standalone,
+    session_scope,
 )
 
 from app import main as main_module  # noqa: E402
 from app.main import ErrandRequest  # noqa: E402
+from app.models import Approval  # noqa: E402
+from sqlalchemy import select  # noqa: E402
 
 ensure_schema()
 
@@ -198,17 +200,30 @@ def test_valid_token_passes_auth_on_approve() -> None:
     run_async(scenario())
 
 
+async def _approval_status(scope: str, run_id: str) -> str | None:
+    """The stored status of a gate row, or None if it does not exist."""
+    async with session_scope() as s:
+        row = (
+            await s.scalars(
+                select(Approval).where(
+                    Approval.scope == scope, Approval.run_id == run_id
+                )
+            )
+        ).first()
+        return row.status if row is not None else None
+
+
 def test_approve_is_scoped_to_the_run_owner() -> None:
     """A stranger with a valid token must not be able to resolve someone else's
     spend gate, and the owner must still be able to resolve their own.
 
-    Authenticating /approve is necessary but not sufficient — the gate is keyed
-    (user_id, run_id) precisely so that a leaked run_id is inert in anyone else's
-    hands. Both halves are asserted here: without the second one, keying the gate
-    to nobody at all would also pass.
+    Authenticating /approve is necessary but not sufficient — the gate row is
+    scoped by (user_id, run_id) and /approve UPDATEs WHERE scope=caller.id, so a
+    leaked run_id is inert in anyone else's hands. Both halves are asserted here:
+    without the second one, scoping the gate to nobody at all would also pass.
 
-    No errand is started: a bare Future is parked in the registry exactly the way
-    errand_stream would, so nothing outbound can fire either way.
+    No errand is started: a pending row is seeded directly exactly the way
+    errand_stream's DB-backed gate would, so nothing outbound can fire either way.
     """
 
     async def scenario() -> None:
@@ -217,15 +232,18 @@ def test_approve_is_scoped_to_the_run_owner() -> None:
             _intruder, intruder_headers = await register_user(client)
 
             run_id = uuid.uuid4().hex
-            gate: asyncio.Future = asyncio.get_running_loop().create_future()
-            main_module._approvals[(owner["id"], run_id)] = gate
+            # Seed the gate exactly as errand_stream's approve() path does: a
+            # pending row scoped to the owner. No run, no broker, no spend.
+            async with session_scope() as s:
+                s.add(Approval(scope=owner["id"], run_id=run_id, status="pending"))
+                await s.commit()
             try:
                 res = await client.post(
                     f"/api/errand/{run_id}/approve",
                     json={"approved": True},
                     headers=intruder_headers,
                 )
-                assert not gate.done(), (
+                assert await _approval_status(owner["id"], run_id) == "pending", (
                     "a stranger resolved someone else's spend approval gate"
                 )
                 assert res.json().get("ok") is not True, res.text
@@ -242,10 +260,11 @@ def test_approve_is_scoped_to_the_run_owner() -> None:
                     headers=owner_headers,
                 )
                 assert res.json() == {"ok": True, "approved": True}, res.text
-                assert gate.done(), "the run's owner could not resolve their own gate"
-                assert gate.result().approved is True
+                assert await _approval_status(owner["id"], run_id) == "approved", (
+                    "the run's owner could not resolve their own gate"
+                )
             finally:
-                main_module._approvals.pop((owner["id"], run_id), None)
+                await main_module._delete_approval(owner["id"], run_id)
 
     run_async(scenario())
 

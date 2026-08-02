@@ -16,9 +16,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { api } from "@/lib/config";
 import { useChatShell, newConversationId } from "@/lib/chatShell";
-import { useChat, runStateFromEvents, type ConversationDetail } from "@/lib/useChat";
+import { useChat, type ConversationDetail } from "@/lib/useChat";
 import { useVoiceAgent } from "@/lib/useVoiceAgent";
-import type { RunState, RunPhase } from "@/lib/errandReducer";
+import type { RunState } from "@/lib/errandReducer";
 import type { ModelOption, ProfileKind } from "@/lib/types";
 
 import VoiceOrb, { type OrbPhase } from "@/components/VoiceOrb";
@@ -28,14 +28,16 @@ import ModelSelector from "@/components/ModelSelector";
 import Composer from "@/components/Composer";
 import Thread from "@/components/chat/Thread";
 import { AgentBubble } from "@/components/chat/bodies";
+// The user-turn row/bubble treatment and the run phase→label map live with the
+// memoized MessageRow (one source of truth); the live streaming turn below reuses
+// them so a committed row and its live equivalent are pixel-identical.
+import MessageRow, {
+  userRow,
+  userBubble,
+  phaseLabel,
+} from "@/components/chat/MessageRow";
 
 import "./chat.anim.css";
-
-// The user-turn row + bubble, matched to the same treatment Thread renders for
-// its own rows (a right-aligned tonal bubble, not the accent).
-const userRow = "flex justify-end";
-const userBubble =
-  "max-w-[84%] px-4 py-3 rounded-[16px_16px_4px_16px] bg-[linear-gradient(180deg,var(--color-ink-200),var(--color-ink-150))] shadow-[inset_0_1px_0_rgba(160,240,200,0.08),inset_0_0_0_1px_var(--color-edge)] text-hi text-[14.5px] leading-[1.5]";
 
 const FALLBACK_MODELS: ModelOption[] = [
   { key: "sol", label: "Sol", tagline: "Flagship — most capable", id: "gpt-5.6-sol" },
@@ -355,33 +357,17 @@ export default function ChatView({ initialId }: { initialId: string | null }) {
           ) : (
             <div className="flex w-full flex-col gap-[22px]">
               {/* History: rows loaded from the server, then rows committed from
-                  turns taken in this session. */}
-              {chat.messages.map((m) => {
-                if (m.role === "user") {
-                  return (
-                    <div key={m.id} className={userRow}>
-                      <div className={userBubble}>{m.content}</div>
-                    </div>
-                  );
-                }
-                if (m.role === "assistant") {
-                  return m.content.trim() ? (
-                    <AgentBubble key={m.id} text={m.content} />
-                  ) : null;
-                }
-                // tool: a locally-committed turn already carries the finished
-                // RunState; a server-loaded one carries the frames to replay.
-                const runState = m.runState ?? runStateFromEvents(m.events);
-                if (runState.audit.length === 0) return null;
-                return (
-                  <Thread
-                    key={m.id}
-                    state={runState}
-                    phaseLabel={phaseLabel(runState.phase)}
-                    onResolveApproval={chat.resolveApproval}
-                  />
-                );
-              })}
+                  turns taken in this session. Each row is a memoized MessageRow —
+                  while a turn streams, ChatView re-renders every token but a
+                  committed row's message reference is unchanged, so its memo skips
+                  the re-render. Only the live bubble below updates per token. */}
+              {chat.messages.map((m) => (
+                <MessageRow
+                  key={m.id}
+                  message={m}
+                  onResolveApproval={chat.resolveApproval}
+                />
+              ))}
 
               {/* Live streaming turn (before it is committed) */}
               {chat.liveUser !== null && (
@@ -491,31 +477,6 @@ function voiceStateLabel(phase: string): string {
       : phase === "speaking"
         ? "Speaking"
         : "Connected";
-}
-
-function phaseLabel(phase: RunPhase | string): string {
-  switch (phase) {
-    case "starting":
-      return "Starting the run";
-    case "planning":
-      return "Grounding against policy";
-    case "cart":
-      return "Building the cart";
-    case "awaiting_approval":
-      return "Waiting for your approval";
-    case "approving":
-      return "Confirming the passkey";
-    case "working":
-      return "Settling the order";
-    case "done":
-      return "Complete";
-    case "declined":
-      return "Declined";
-    case "error":
-      return "Stopped";
-    default:
-      return "Working";
-  }
 }
 
 // A quiet three-dot "assistant is typing" bubble, shown only before the first
