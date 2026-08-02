@@ -24,3 +24,7 @@ Newest at the bottom.
 - 2026-08-02 (user): when told to go faster, fan out subagents with strict non-overlapping file ownership and forbid them from running `next build` concurrently (they collide in .next).
 - Prava's card credential appears at status `awaiting_result`, not `completed` — keying on `completed` alone silently times the errand out with no 4xx anywhere.
 - Deepgram's BYO think endpoint needs the FULL /v1/chat/completions path and `reasoning_mode` (its name for OpenAI's reasoning_effort).
+- Authenticating an endpoint is not authorizing it: an in-memory gate keyed by run_id alone let any signed-in user resolve someone else's spend. Key it (owner, run_id).
+- A test written to pin a fix is what caught that the fix was incomplete — write the pin even when the change looks obviously right.
+- Before screenshotting a rebuild, confirm the OLD preview server actually died; EADDRINUSE means you are looking at stale output and will 'verify' the wrong thing.
+- Measure type against the font's real ascent/descent (canvas TextMetrics) rather than guessing line-height; the ERRAND wordmark's ink sat 25px past the cut.

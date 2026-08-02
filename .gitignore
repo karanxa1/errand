@@ -11,3 +11,4 @@ errand-handoff.md
 # Local verification artifacts (never commit)
 .playwright-mcp/
 errand/backend/local-verify.db
+opencode-prompt.md
