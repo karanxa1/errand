@@ -1,4 +1,6 @@
-reference-repos/
 node_modules/
 .env*
 .dev.vars
+reference-repos/
+errand/node_modules/
+errand/.env*
