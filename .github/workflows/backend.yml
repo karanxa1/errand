@@ -1,0 +1,66 @@
+name: Deploy Backend (Azure Container Apps)
+
+# Builds the FastAPI backend image, pushes it to ACR, and rolls the Azure
+# Container App to the new image. Runs only when backend code changes.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "errand/backend/**"
+      - ".github/workflows/backend.yml"
+  workflow_dispatch: {}
+
+concurrency:
+  group: backend-deploy
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Build & push image to ACR
+        run: |
+          set -euo pipefail
+          IMAGE="${{ secrets.ACR_LOGIN_SERVER }}/errand-backend:${GITHUB_SHA::12}"
+          IMAGE_LATEST="${{ secrets.ACR_LOGIN_SERVER }}/errand-backend:latest"
+          # `az acr build` builds on ACR tasks (linux/amd64) — no local Docker
+          # needed and no platform mismatch.
+          az acr build \
+            --registry "${{ secrets.ACR_NAME }}" \
+            --image "errand-backend:${GITHUB_SHA::12}" \
+            --image "errand-backend:latest" \
+            ./errand/backend
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+
+      - name: Update Container App to new image
+        run: |
+          set -euo pipefail
+          az containerapp update \
+            --name "${{ secrets.ACA_APP_NAME }}" \
+            --resource-group "${{ secrets.AZURE_RESOURCE_GROUP }}" \
+            --image "$IMAGE"
+
+      - name: Smoke test /health
+        run: |
+          set -euo pipefail
+          FQDN=$(az containerapp show \
+            --name "${{ secrets.ACA_APP_NAME }}" \
+            --resource-group "${{ secrets.AZURE_RESOURCE_GROUP }}" \
+            --query "properties.configuration.ingress.fqdn" -o tsv)
+          echo "Backend FQDN: https://$FQDN"
+          # Give the new revision a moment to accept traffic, then poll /health.
+          for i in $(seq 1 20); do
+            code=$(curl -s -o /dev/null -w "%{http_code}" -m 15 "https://$FQDN/health" || true)
+            echo "attempt $i: HTTP $code"
+            if [ "$code" = "200" ]; then echo "backend healthy"; exit 0; fi
+            sleep 6
+          done
+          echo "backend did not become healthy in time"; exit 1

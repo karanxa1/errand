@@ -1,0 +1,59 @@
+name: Deploy Frontend (Cloudflare Workers)
+
+# Builds the Next.js frontend with OpenNext and deploys it to Cloudflare
+# Workers via wrangler. The backend URL is baked in at build time (it is a
+# public NEXT_PUBLIC_* value, so it is safe in the client bundle). Runs only
+# when frontend code changes.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "errand/frontend/**"
+      - ".github/workflows/frontend.yml"
+  workflow_dispatch: {}
+
+concurrency:
+  group: frontend-deploy
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: errand/frontend
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build (OpenNext) + Deploy (wrangler)
+        env:
+          # Public backend URL, baked into the client bundle at build time.
+          NEXT_PUBLIC_BACKEND_URL: ${{ secrets.NEXT_PUBLIC_BACKEND_URL }}
+          # wrangler auth.
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          bunx opennextjs-cloudflare build
+          bunx wrangler deploy
+
+      - name: Smoke test deployed frontend
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 10); do
+            code=$(curl -s -o /dev/null -w "%{http_code}" -m 15 "https://errand-frontend.rough-cell-383c.workers.dev" || true)
+            echo "attempt $i: HTTP $code"
+            if [ "$code" = "200" ]; then echo "frontend healthy"; exit 0; fi
+            sleep 5
+          done
+          echo "frontend did not respond 200 in time"; exit 1
