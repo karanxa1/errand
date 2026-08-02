@@ -16,8 +16,11 @@ import { usePathname, useRouter } from "next/navigation";
 
 import { useAuth } from "@/lib/auth";
 import { useConversations } from "@/lib/useConversations";
+import { useMcpServers } from "@/lib/useMcpServers";
 import { ChatShellProvider, conversationIdFromPath } from "@/lib/chatShell";
+import { api } from "@/lib/config";
 import Sidebar from "@/components/Sidebar";
+import McpPanel, { type McpCapabilities } from "@/components/mcp/McpPanel";
 import { ErrandMark } from "@/components/Marks";
 
 export default function ChatLayout({ children }: { children: React.ReactNode }) {
@@ -31,6 +34,45 @@ export default function ChatLayout({ children }: { children: React.ReactNode }) 
   // pathname never changes — so a pathname-only signal silently never fires.
   const [newChatNonce, setNewChatNonce] = useState(0);
   const conversations = useConversations(token);
+
+  // MCP tool servers. Lives here rather than in the panel so the list survives
+  // closing the sheet, and so the rail can show the count without opening it.
+  const mcp = useMcpServers(token);
+  const [toolsOpen, setToolsOpen] = useState(false);
+  // What this deployment will actually accept. Read from /api/config so the UI
+  // never offers a control the backend refuses (a local-command server, or
+  // credential auth where no encryption key is configured). Null until known,
+  // which is what keeps the entry point hidden rather than flashing it.
+  const [mcpCaps, setMcpCaps] = useState<McpCapabilities | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        const res = await fetch(api("/api/config"));
+        if (!res.ok || !alive) return;
+        const body = (await res.json()) as {
+          mcp?: {
+            enabled?: boolean;
+            allowStdio?: boolean;
+            maxServers?: number;
+            canStoreCredentials?: boolean;
+          };
+        };
+        if (!alive || !body.mcp?.enabled) return;
+        setMcpCaps({
+          allowStdio: Boolean(body.mcp.allowStdio),
+          maxServers: body.mcp.maxServers ?? 12,
+          canStoreCredentials: Boolean(body.mcp.canStoreCredentials),
+        });
+      } catch {
+        /* readiness unknown — the entry point stays hidden */
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, []);
 
   // Send anyone without a session to the door. Guarding here rather than in each
   // page means no chat route can render, or fire a request, before we know.
@@ -139,11 +181,21 @@ export default function ChatLayout({ children }: { children: React.ReactNode }) 
             onDelete={deleteConversation}
             onLogout={signOut}
             onCloseMobile={() => setDrawerOpen(false)}
+            onOpenTools={mcpCaps ? () => setToolsOpen(true) : undefined}
+            toolServerCount={mcp.servers.filter((s) => s.enabled).length}
           />
         </div>
 
         <div className="relative flex min-w-0 flex-col overflow-hidden">{children}</div>
       </div>
+
+      {toolsOpen && mcpCaps && (
+        <McpPanel
+          api={mcp}
+          capabilities={mcpCaps}
+          onClose={() => setToolsOpen(false)}
+        />
+      )}
     </ChatShellProvider>
   );
 }

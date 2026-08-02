@@ -1,12 +1,17 @@
 """Real AI chat over SSE.
 
 The assistant (gpt-5.6-{sol|terra|luna} via the OpenAI-compatible endpoint)
-answers normally AND can call two tools:
+answers normally AND can call tools:
 
   - run_errand(intent, profile?)  -> the existing purchasing orchestrator, whose
     AuditEvents are streamed to the browser (same tool cards as before) and
     saved as a role='tool' message so the conversation re-renders later.
   - web_search(query, depth?)     -> Linkup grounded search.
+  - shop_live(...)                -> appended only when live handoff is configured.
+  - mcp__<server>__<tool>(...)    -> any tool from an MCP server THIS user has
+    registered and authorized. Built from the cached catalogue on each server row
+    (one SELECT, no network I/O per turn) and dispatched through
+    app/mcp/registry.call_tool, which re-checks ownership. See app/mcp/.
 
 Wire (client <-> server is streaming-only):
 
@@ -52,6 +57,7 @@ from app.brokers.linkup import LinkupSearchBroker
 from app.config import settings
 from app.contracts import AuditEvent
 from app.db import SessionLocal, get_session
+from app.mcp import registry as mcp_registry
 from app.models import Approval, Conversation, Message, User
 from app.orchestrator.guards import ApprovalDecision, cancellable_sleep
 from app.orchestrator.run_errand import run_errand
@@ -386,8 +392,23 @@ async def chat(
     profile = convo.profile if convo.profile in ("business", "personal") else "business"
     model_id = _MODEL_MAP.get(convo.model, _MODEL_MAP[_DEFAULT_MODEL])
 
+    # The user's own MCP servers. Read from the cached catalogue on each server
+    # row, so this is ONE indexed SELECT rather than a connect + initialize +
+    # tools/list per server — the tool list is needed on every turn and cannot
+    # afford network I/O. Only an actual invocation connects (app/mcp/registry.py).
+    mcp_catalogue = (
+        await mcp_registry.load_catalogue(user.id)
+        if settings.mcp_enabled
+        else mcp_registry.McpCatalogue(tools=())
+    )
+
     # Build the OpenAI message list from history (tool messages are context too).
-    oai_messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
+    # The MCP note is appended to the system prompt rather than replacing it: the
+    # model otherwise sees a set of oddly-prefixed function names with no idea they
+    # are the user's own integrations, and does not reach for them.
+    oai_messages: list[dict] = [
+        {"role": "system", "content": SYSTEM_PROMPT + mcp_registry.tool_prompt_note(mcp_catalogue)}
+    ]
     for m in prior:
         if m.role == "tool":
             # Represent a past tool run compactly as an assistant note.
@@ -701,7 +722,11 @@ async def chat(
             # per request and never closed, leaking a pool + sockets each turn.
             # Offer the live-handoff tool only when the deployment can actually
             # perform it, so the model never promises a capability that isn't wired.
-            active_tools = _TOOLS + ([_SHOP_LIVE_TOOL] if settings.live_handoff_ready else [])
+            active_tools = (
+                _TOOLS
+                + ([_SHOP_LIVE_TOOL] if settings.live_handoff_ready else [])
+                + mcp_catalogue.openai_tools()
+            )
             async with _client() as client:
                 # Tool-calling loop: keep going until the model returns plain text.
                 for _ in range(6):
@@ -784,6 +809,15 @@ async def chat(
                                 tool_events_all.extend(events)
                             elif name == "web_search":
                                 result = await do_web_search(cargs)
+                            elif mcp_catalogue.by_id(name) is not None:
+                                # A tool from one of the user's own MCP servers.
+                                # registry.call_tool re-derives the catalogue for
+                                # THIS user and refuses anything not in it, so a
+                                # replayed or hallucinated id cannot reach another
+                                # user's server even though we already matched here.
+                                result = await mcp_registry.call_tool(
+                                    user.id, name, cargs
+                                )
                             else:
                                 result = f"Unknown tool: {name}"
                         except asyncio.CancelledError:

@@ -229,6 +229,57 @@ class Settings(BaseSettings):
             and self.cloudflare_api_token
         )
 
+    # ── Custom MCP servers (the user's own tool providers) ───────────────────
+    # A user registers an MCP server and its tools become callable by the agent
+    # on both the chat and voice surfaces. See app/mcp/ for the whole feature.
+    mcp_enabled: bool = True
+
+    # Ceiling on servers one user may register. Each enabled server's cached tool
+    # catalogue is loaded on every turn and its tools cost input tokens on every
+    # pass of the tool loop, so this bounds cost as much as it bounds abuse.
+    mcp_max_servers_per_user: int = 12
+
+    # ⚠️ ARBITRARY CODE EXECUTION. A stdio MCP server is a command this backend
+    # SPAWNS. Registering one is equivalent to shell access to the container that
+    # holds the OpenAI, Cloudflare, Prava, Deepgram and AgentMail keys — so with
+    # more than one user account, leaving this on hands every one of them that
+    # access. OFF unless you are the sole operator of the instance.
+    #
+    # better-chatbot allows stdio and disables it only on Vercel
+    # (IS_MCP_SERVER_REMOTE_ONLY), which is the right default for a self-hosted
+    # single-operator app and the wrong one here; the polarity is inverted
+    # deliberately. Enforced in app/mcp/config.validate_stdio.
+    mcp_allow_stdio: bool = False
+
+    # Local development only: permit http:// MCP URLs and skip the private-range
+    # checks, so a server on the developer's own machine can be used. In a
+    # deployment this must stay false — it is what stops a user-supplied URL from
+    # reaching the cloud metadata endpoint or anything else inside the VNet
+    # (app/mcp/config.validate_remote_url).
+    mcp_allow_insecure_http: bool = False
+
+    # Encryption key for stored MCP credentials — static header secrets and OAuth
+    # token sets, which normally include a refresh token. A urlsafe-base64 32-byte
+    # Fernet key:
+    #   python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'
+    # When empty, one is derived from JWT_SECRET via HKDF. That works and inherits
+    # JWT_SECRET's enforced entropy, but it ties the two lifecycles together:
+    # rotating JWT_SECRET orphans every stored credential (recoverable by
+    # re-authorizing, but not silent). Set this explicitly if you rotate.
+    mcp_encryption_key: str = ""
+
+    # Public origin of THIS BACKEND, used to build the OAuth redirect URI
+    # (<base>/api/mcp/oauth/callback). It must be the address the user's browser
+    # can reach, because the authorization server sends the browser there — and it
+    # must match byte-for-byte across the authorization request and the token
+    # exchange or the exchange is rejected. Defaults to the local dev backend.
+    mcp_oauth_redirect_base: str = "http://localhost:8787"
+
+    # Where the callback page sends the user when it cannot talk to an opener
+    # window (a popup blocker, or the flow completed in a plain tab). Empty falls
+    # back to a self-closing page with no redirect.
+    mcp_oauth_success_redirect: str = ""
+
     # CORS: comma-separated list of allowed browser origins for the HTTP/SSE
     # API. Local dev defaults are always included; in production set
     # ALLOWED_ORIGINS to the deployed frontend origin(s), e.g.

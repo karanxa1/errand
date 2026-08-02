@@ -59,6 +59,8 @@ from app.brokers import build_brokers
 from app.brokers.linkup import LinkupSearchBroker
 from app.config import settings
 from app.contracts import AuditEvent
+from app.mcp import registry as mcp_registry
+from app.mcp.registry import McpCatalogue
 from app.orchestrator.guards import ApprovalDecision
 from app.orchestrator.run_errand import run_errand
 from app.orchestrator.shop_decide import make_shop_decide
@@ -297,13 +299,27 @@ def _think_functions() -> list[dict]:
     )
 
 
-def _settings_message(model_id: str) -> dict:
+def _settings_message(
+    model_id: str, mcp_catalogue: "McpCatalogue | None" = None
+) -> dict:
     """The first message on the Deepgram WS.
 
     THINK is Deepgram-managed Anthropic; SPEAK is Deepgram-managed Cartesia.
     `model_id` is accepted for signature compatibility with the chat path's
     sol/terra/luna selector but is deliberately NOT sent: see VOICE_THINK_MODEL.
+
+    `mcp_catalogue` carries the user's own MCP tools. Deepgram takes the whole
+    function list ONCE, in this Settings message — there is no mid-session update
+    — so the catalogue is loaded before the socket opens and a server the user
+    connects DURING a call is only picked up by the next call. The prompt names
+    the servers for the same reason the chat path does: an unexplained
+    `mcp__`-prefixed function is one the model will not reach for.
     """
+    prompt = SYSTEM_PROMPT
+    functions = _think_functions()
+    if mcp_catalogue is not None and mcp_catalogue.tools:
+        prompt += mcp_registry.tool_prompt_note(mcp_catalogue)
+        functions = functions + mcp_catalogue.deepgram_functions()
     return {
         "type": "Settings",
         "audio": {
@@ -333,8 +349,8 @@ def _settings_message(model_id: str) -> dict:
                 # LLMs"). Omitting it means Deepgram bills/authenticates the LLM
                 # hop, so no Anthropic API key is required on our side.
                 # https://developers.deepgram.com/docs/voice-agent-llm-models
-                "prompt": SYSTEM_PROMPT,
-                "functions": _think_functions(),
+                "prompt": prompt,
+                "functions": functions,
             },
             "speak": {
                 "provider": {
@@ -398,6 +414,10 @@ class VoiceSession:
         # When we last made the agent speak a progress note, so a burst of audit
         # events cannot turn into a burst of speech. See NARRATION_MIN_GAP_S.
         self._last_narration_ts = 0.0
+        # The user's MCP tools for THIS call, loaded just before the Settings
+        # message (Deepgram takes the function list only there). None until then,
+        # and left None when the feature is off or the read failed.
+        self._mcp_catalogue: McpCatalogue | None = None
 
     # ── browser I/O (serialized) ─────────────────────────────────────────────
 
@@ -494,7 +514,22 @@ class VoiceSession:
             return
 
         try:
-            await self._to_deepgram_json(_settings_message(self._model_id))
+            # The user's MCP tools, read from cache (one SELECT, no network I/O).
+            # Loaded here rather than in __init__ because Deepgram accepts the
+            # function list only in this Settings message, so it must be as fresh
+            # as the socket. A failure to read it must not take the call down —
+            # the built-in tools still work — so it degrades to no MCP tools.
+            mcp_catalogue = None
+            if settings.mcp_enabled:
+                try:
+                    mcp_catalogue = await mcp_registry.load_catalogue(self._user_id)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("Could not load MCP tools for voice session: %s", exc)
+            self._mcp_catalogue = mcp_catalogue
+
+            await self._to_deepgram_json(
+                _settings_message(self._model_id, mcp_catalogue)
+            )
             await self._to_browser({"type": "voice.state", "state": "listening"})
 
             browser_task = asyncio.create_task(self._browser_reader())
@@ -738,6 +773,15 @@ class VoiceSession:
                 content = await self._tool_shop_live(args)
             elif name == "web_search":
                 content = await self._tool_web_search(args)
+            elif (
+                self._mcp_catalogue is not None
+                and self._mcp_catalogue.by_id(name) is not None
+            ):
+                # A tool from one of the user's own MCP servers. The identity comes
+                # from the redeemed ticket, never the wire, so this cannot be
+                # steered at someone else's servers; registry.call_tool re-checks
+                # ownership regardless.
+                content = await mcp_registry.call_tool(self._user_id, name, args)
             else:
                 content = f"Unknown tool: {name}"
         except asyncio.CancelledError:
