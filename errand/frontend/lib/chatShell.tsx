@@ -61,3 +61,26 @@ export function conversationIdFromPath(pathname: string | null): string | null {
   const match = /^\/c\/([0-9a-f]{32})\/?$/.exec(pathname ?? "");
   return match ? match[1] : null;
 }
+
+// Should a mounted ChatView tear its own state down and become a fresh new chat?
+//
+// The subtlety this exists for: a first turn claims its id with
+// window.history.pushState — NOT a router navigation — so the App Router's
+// rendered route stays /c while the URL reads /c/<id>. Clicking "New chat" then
+// calls router.push("/c"), which the router treats as a no-op because /c is
+// already the rendered route: the ChatView instance is reused, its activeId
+// never clears, and the old conversation (and its cart) stays on screen until a
+// hard refresh. usePathname DOES see the pushState'd and pushed URLs both, so the
+// view watches the route and resets itself the moment the route says "new chat"
+// (routeId === null) while it is still bound to an id.
+//
+// Pure so it can be pinned by a test without a router. Returns true ONLY when the
+// route is the new-chat route but the view still holds a conversation — never on
+// a normal /c→/c/<id> first turn (routeId is the id, not null) and never on a
+// fresh mount at /c (boundId is already null).
+export function shouldResetToNewChat(
+  routeId: string | null,
+  boundId: string | null,
+): boolean {
+  return routeId === null && boundId !== null;
+}

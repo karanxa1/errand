@@ -216,7 +216,7 @@ export default function ApprovalPanel({
       {!frameFailed ? (
         /* The frame sits on a labelled substrate so it never reads as an empty
            void before/if the cross-origin Prava page paints. */
-        <div className="relative w-full min-h-[220px] rounded-card overflow-hidden shadow-[inset_0_0_0_1px_var(--color-edge)] bg-ink-000">
+        <div className="relative w-full rounded-card overflow-hidden shadow-[inset_0_0_0_1px_var(--color-edge)] bg-ink-000">
           {/* Labelled substrate behind the frame — visible until (or if) the
               cross-origin Prava page paints, so this is never a blank void. */}
           <div
@@ -235,7 +235,12 @@ export default function ApprovalPanel({
             </span>
           </div>
           <iframe
-            className="relative z-[1] w-full h-[320px] border-none rounded-card bg-transparent block"
+            /* Prava's hosted page stacks card entry → OTP → passkey vertically,
+               so a fixed 320px clipped the passkey step off the bottom ("isn't
+               opening in full"). A tall, viewport-relative height gives the whole
+               flow room while staying bounded on small screens; the frame scrolls
+               internally if Prava's content ever exceeds even this. */
+            className="relative z-[1] w-full h-[clamp(560px,78vh,760px)] border-none rounded-card bg-transparent block"
             src={session.iframe_url}
             title="Prava passkey verification"
             onError={() => setFrameFailed(true)}

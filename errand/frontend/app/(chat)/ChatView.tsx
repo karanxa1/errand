@@ -13,9 +13,15 @@
  * would tear this subtree down mid-token. */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { usePathname } from "next/navigation";
 
 import { api } from "@/lib/config";
-import { useChatShell, newConversationId } from "@/lib/chatShell";
+import {
+  useChatShell,
+  newConversationId,
+  conversationIdFromPath,
+  shouldResetToNewChat,
+} from "@/lib/chatShell";
 import { useChat, type ConversationDetail } from "@/lib/useChat";
 import { useVoiceAgent } from "@/lib/useVoiceAgent";
 import type { RunState } from "@/lib/errandReducer";
@@ -81,9 +87,36 @@ export default function ChatView({
   const [mode, setMode] = useState<"chat" | "voice">("chat");
 
   const voice = useVoiceAgent(token);
+  // The voice API changes identity across renders; a ref lets the reset effect
+  // stop a live session without taking `voice` as a dependency (which would
+  // re-run the effect every render and risk resetting mid-turn).
+  const voiceRef = useRef(voice);
+  voiceRef.current = voice;
 
   const activeIdRef = useRef<string | null>(activeId);
   activeIdRef.current = activeId;
+
+  // ── "New chat" while this instance is reused ────────────────────────────────
+  // See shouldResetToNewChat: because a first turn claims its id with
+  // history.pushState (not a navigation), the router keeps this ChatView mounted
+  // and router.push("/c") is a no-op. The route still flips to /c though, and
+  // usePathname sees it — so when the route says new-chat while we still hold an
+  // id, tear our own state down to a blank chat. This is what made "New chat"
+  // require a refresh, and what left the previous run's cart on screen.
+  const pathname = usePathname();
+  const routeId = conversationIdFromPath(pathname);
+  useEffect(() => {
+    if (!shouldResetToNewChat(routeId, activeIdRef.current)) return;
+    // Stop a live voice session first — a blank chat must not keep a mic open or
+    // keep streaming the old run's audio into a conversation that is now gone.
+    if (voiceRef.current.active) voiceRef.current.stop();
+    activeIdRef.current = null;
+    setActiveId(null);
+    setIntent("");
+    setMode("chat");
+    // activeId → null cascades into useChat (aborts any stream, clears messages)
+    // and flips emptyThread back on, so the welcome state paints, not stale cards.
+  }, [routeId]);
 
   // Sync model/profile from a loaded conversation so the top bar reflects it.
   const onLoaded = useCallback((detail: ConversationDetail) => {
@@ -164,6 +197,36 @@ export default function ChatView({
   // stays tappable (to STOP voice) even when the composer is otherwise locked.
   const composerLocked = streaming || voiceLive;
 
+  // Ensure this view is bound to a conversation id + URL, minting one if it is a
+  // brand-new chat, and returning it. Both a first typed turn AND opening voice
+  // call this, which is the whole fix for "typing after voice starts a new chat":
+  // voice used to bind no id, so stopping it and typing left activeId null and
+  // submit() minted a SECOND conversation. Now the id is claimed once, up front,
+  // and the spoken run and the typed turn share it. Idempotent — a second call
+  // returns the id already in place.
+  //
+  // pushState (not router.push) so an in-flight voice/SSE session is never torn
+  // down by being given a URL; the rail row is inserted locally because the
+  // server row is created lazily by the first turn that actually sends.
+  const ensureConversation = useCallback((): string => {
+    const existing = activeIdRef.current;
+    if (existing) return existing;
+    const id = newConversationId();
+    activeIdRef.current = id;
+    setActiveId(id);
+    window.history.pushState({}, "", `/c/${id}`);
+    const now = new Date().toISOString();
+    convs.insert({
+      id,
+      title: "New chat",
+      profile,
+      model,
+      created_at: now,
+      updated_at: now,
+    });
+    return id;
+  }, [convs, profile, model]);
+
   const submit = useCallback(async () => {
     if (composerLocked) return;
     const value = intent.trim();
@@ -172,26 +235,9 @@ export default function ChatView({
     if (voice.active) voice.stop();
     setIntent("");
 
-    let id = activeIdRef.current;
-    if (!id) {
-      // Claim an id, put it in the address bar, and start. No round-trip: the
-      // row is created server-side by this very turn.
-      id = newConversationId();
-      activeIdRef.current = id;
-      setActiveId(id);
-      window.history.pushState({}, "", `/c/${id}`);
-      const now = new Date().toISOString();
-      convs.insert({
-        id,
-        title: "New chat",
-        profile,
-        model,
-        created_at: now,
-        updated_at: now,
-      });
-    }
+    const id = ensureConversation();
     await chat.send(value, { conversationId: id, profile, model });
-  }, [composerLocked, intent, voice, convs, profile, model, chat]);
+  }, [composerLocked, intent, voice, ensureConversation, profile, model, chat]);
 
   // ── Voice mic (retained) ─────────────────────────────────────────────────
   const [mounted, setMounted] = useState(false);
@@ -203,9 +249,12 @@ export default function ChatView({
       return;
     }
     if (streaming) return; // don't start voice mid text-turn
+    // Claim/keep the conversation id BEFORE the mic opens, so a message typed
+    // after this voice session continues THIS chat instead of minting a new one.
+    ensureConversation();
     setMode("voice");
     void voice.start(model, profile);
-  }, [voice, streaming, model, profile]);
+  }, [voice, streaming, ensureConversation, model, profile]);
 
   // ── Which RunState + resolver the thread is currently showing ──────────────
   // In voice mode the live voice RunState + its WS resolver drive the thread;
