@@ -31,14 +31,17 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import uuid
 from datetime import datetime, timezone
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
 from openai import AsyncOpenAI
 from pydantic import BaseModel, Field
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import get_current_user
@@ -57,6 +60,27 @@ router = APIRouter(prefix="/api/conversations", tags=["chat"])
 _MODEL_MAP = {"sol": "gpt-5.6-sol", "terra": "gpt-5.6-terra", "luna": "gpt-5.6-luna"}
 _DEFAULT_MODEL = "sol"
 APPROVAL_TIMEOUT_S = 300
+
+# The reasoning-effort ladder gpt-5.6 accepts. This is the MODEL's set, which is
+# narrower than the endpoint's: /v1/chat/completions also accepts "minimal", but
+# gpt-5.6 does not, and sending a value a model rejects is an HTTP 400 rather
+# than a degraded answer. Kept next to this family rather than as one shared
+# enum, because the correct set and the correct down-map differ per model.
+# https://developers.openai.com/api/docs/models/gpt-5.6-sol
+GPT56_REASONING_EFFORTS = ("none", "low", "medium", "high", "xhigh", "max")
+
+# What we must send whenever the request carries `tools`. gpt-5.6 defaults to
+# "medium", and OpenAI documents function tools on /v1/chat/completions as
+# compatible only with effective reasoning "none" for this family — so the
+# default is the unsafe value and this is not optional.
+# https://developers.openai.com/api/docs/guides/upgrading-to-gpt-5p6-sol
+TOOL_REASONING_EFFORT = "none"
+
+# Ceiling on generated tokens. gpt-5.6's maximum output is 128k; a single wedged
+# turn should not be able to spend that. `max_completion_tokens`, never
+# `max_tokens` — the reference marks the latter deprecated in favour of it.
+# https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create
+MAX_COMPLETION_TOKENS = 4096
 
 # In-memory approval gates for chat-driven errands, keyed by (conversation_id,
 # run_id). The conversation id is part of the key so resolving a gate is scoped
@@ -122,7 +146,8 @@ _TOOLS = [
                 "type": "object",
                 "properties": {
                     "query": {"type": "string"},
-                    "depth": {"type": "string", "enum": ["standard", "deep"]},
+                    # Mirrors LinkupSearchBroker.DEPTHS; see the citation there.
+                    "depth": {"type": "string", "enum": list(LinkupSearchBroker.DEPTHS)},
                 },
                 "required": ["query"],
             },
@@ -133,6 +158,13 @@ _TOOLS = [
 
 class ChatRequest(BaseModel):
     content: str = Field(min_length=1, max_length=8000)
+    # Only read when this turn is the one that materializes the conversation (see
+    # _owned_or_created). On every later turn the stored row already carries the
+    # operator's choices and these are ignored, so a client cannot silently
+    # rewrite a conversation's profile/model through the chat path — that is what
+    # PATCH /api/conversations/{id} is for.
+    profile: Literal["business", "personal"] = "business"
+    model: Literal["sol", "terra", "luna"] = "sol"
 
 
 class ApproveRequest(BaseModel):
@@ -149,6 +181,65 @@ async def _owned(session: AsyncSession, user: User, conversation_id: str) -> Con
     convo = await session.get(Conversation, conversation_id)
     if convo is None or convo.user_id != user.id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
+    return convo
+
+
+# A client-generated conversation id must look exactly like a server-generated
+# one — uuid4().hex, i.e. 32 lowercase hex characters — before it is allowed to
+# become a primary key. Without this a caller could seed the table with arbitrary
+# 32-char strings, and any id shorter than the column would be silently
+# truncated by some backends into a collision with an existing row.
+_CLIENT_CONVERSATION_ID = re.compile(r"\A[0-9a-f]{32}\Z")
+
+
+async def _owned_or_created(
+    session: AsyncSession,
+    user: User,
+    conversation_id: str,
+    *,
+    profile: str,
+    model: str,
+) -> Conversation:
+    """The caller's conversation, materializing it on first use.
+
+    The frontend generates a conversation id locally, puts it in the URL, and
+    starts streaming immediately — there is no blocking POST /api/conversations
+    ahead of the first token. The row is therefore created here, on the first
+    turn that actually has something to say, which also means abandoning a new
+    chat without typing leaves no empty row behind.
+
+    An id that already exists and belongs to someone else is reported as 404, not
+    403: a caller must not be able to probe which conversation ids exist.
+    """
+    convo = await session.get(Conversation, conversation_id)
+    if convo is not None:
+        if convo.user_id != user.id:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found"
+            )
+        return convo
+
+    if not _CLIENT_CONVERSATION_ID.match(conversation_id):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found"
+        )
+
+    convo = Conversation(
+        id=conversation_id, user_id=user.id, profile=profile, model=model
+    )
+    session.add(convo)
+    try:
+        await session.flush()
+    except IntegrityError:
+        # Two first turns raced for the same id (a double-submit, or a retry that
+        # overlapped the original). The other one won and the row now exists, so
+        # roll this attempt back and adopt it rather than failing the turn.
+        await session.rollback()
+        convo = await session.get(Conversation, conversation_id)
+        if convo is None or convo.user_id != user.id:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found"
+            ) from None
     return convo
 
 
@@ -179,7 +270,9 @@ async def chat(
     user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ) -> StreamingResponse:
-    convo = await _owned(session, user, conversation_id)
+    convo = await _owned_or_created(
+        session, user, conversation_id, profile=req.profile, model=req.model
+    )
 
     # Persist the user's message + load prior turns for context.
     user_msg = Message(conversation_id=convo.id, role="user", content=req.content)
@@ -332,9 +425,12 @@ async def chat(
                         messages=oai_messages,
                         tools=_TOOLS,
                         stream=True,
-                        # gpt-5.6 requires reasoning_effort='none' to use function
-                        # tools via /v1/chat/completions.
-                        reasoning_effort="none",
+                        # gpt-5.6 defaults to "medium", and OpenAI documents
+                        # medium-with-function-tools on /v1/chat/completions as
+                        # unsupported for this family — it is an HTTP 400, not a
+                        # degraded answer. See TOOL_REASONING_EFFORT.
+                        reasoning_effort=TOOL_REASONING_EFFORT,
+                        max_completion_tokens=MAX_COMPLETION_TOKENS,
                     )
                     text_parts: list[str] = []
                     tool_calls: dict[int, dict] = {}

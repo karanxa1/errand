@@ -5,6 +5,15 @@
 // Deepgram Voice Agent WS and relays. The browser talks only to OUR backend WS:
 //
 //   ws://<backend>/api/voice/ws?model=<sol|terra|luna>&profile=<business|personal>
+//                              &ticket=<one-shot>
+//
+// The relay spends real money (Deepgram + OpenAI credits, and run_errand can
+// reach checkout), so it is authenticated. A WebSocket cannot carry an
+// Authorization header, so start() first POSTs /api/voice/ticket with the bearer
+// token and passes the opaque, single-use, 60s ticket it gets back in the query
+// string. Backend side: app/voice/tickets.py. A missing/stale/replayed ticket
+// closes the socket with 4401, which this hook reports as a sign-in problem
+// rather than as a dropped connection.
 //
 //   browser → backend
 //     · binary  : mic PCM (linear16, 48 kHz mono), captured via Web Audio.
@@ -26,7 +35,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { wsApi } from "./config";
+import { api, wsApi } from "./config";
 import {
   applyFrame,
   initialRunState,
@@ -62,7 +71,15 @@ const BANDS = 5;
 const MIC_SAMPLE_RATE = 48000; // linear16 mic per Deepgram Settings.input
 const TTS_SAMPLE_RATE = 16000; // linear16 agent audio per Settings.output
 
-export function useVoiceAgent(): VoiceAgentApi {
+// Application close code the relay uses for "your ticket was missing, stale or
+// already spent" — distinct from 1008 so an auth failure never reads as a
+// generic policy close or a network blip.
+const WS_UNAUTHORIZED = 4401;
+const SIGNED_OUT_MESSAGE = "Voice needs you to be signed in.";
+
+// `token` is optional so a call site that has not resolved auth yet still
+// compiles; without one the mint below fails and voice never opens a socket.
+export function useVoiceAgent(token?: string | null): VoiceAgentApi {
   const [state, setState] = useState<RunState>(initialRunState);
   const [active, setActive] = useState(false);
   const [voicePhase, setVoicePhase] = useState<VoicePhase>("idle");
@@ -316,6 +333,33 @@ export function useVoiceAgent(): VoiceAgentApi {
       // Fresh conversation state each session.
       setState({ ...initialRunState, connection: "connecting" });
 
+      // Mint the one-shot relay ticket BEFORE asking for the microphone: a
+      // signed-out user should be told so instead of being made to grant mic
+      // permission for a socket that will be refused anyway. The ticket lives
+      // 60s, which covers even a slow permission prompt.
+      //
+      // This await is the second place a second start() can interleave (the mic
+      // prompt is the first), so the same sessionId guard brackets it: a stale
+      // mint result is discarded rather than opening a second socket.
+      let ticket: string;
+      try {
+        const res = await fetch(api("/api/voice/ticket"), {
+          method: "POST",
+          headers: token ? { Authorization: `Bearer ${token}` } : {},
+        });
+        if (!res.ok) throw new Error(`ticket ${res.status}`);
+        const body = (await res.json()) as { ticket?: unknown };
+        if (typeof body.ticket !== "string" || !body.ticket) {
+          throw new Error("ticket missing from response");
+        }
+        ticket = body.ticket;
+      } catch {
+        if (sessionId !== sessionIdRef.current) return;
+        setError(SIGNED_OUT_MESSAGE);
+        return;
+      }
+      if (sessionId !== sessionIdRef.current) return;
+
       let stream: MediaStream;
       try {
         stream = await navigator.mediaDevices.getUserMedia({
@@ -413,9 +457,9 @@ export function useVoiceAgent(): VoiceAgentApi {
       playCursorRef.current = audioCtx.currentTime;
 
       // Open the relay WS.
-      const url = wsApi(
+      const url = `${wsApi(
         `/api/voice/ws?model=${encodeURIComponent(model)}&profile=${encodeURIComponent(profile)}`,
-      );
+      )}&ticket=${encodeURIComponent(ticket)}`;
       const ws = new WebSocket(url);
       ws.binaryType = "arraybuffer";
       wsRef.current = ws;
@@ -453,9 +497,14 @@ export function useVoiceAgent(): VoiceAgentApi {
           setError("Voice connection error.");
         }
       };
-      ws.onclose = () => {
+      ws.onclose = (ev?: CloseEvent) => {
         if (sessionId !== sessionIdRef.current || wsRef.current !== ws) return;
-        if (!stoppingRef.current) {
+        if (ev?.code === WS_UNAUTHORIZED) {
+          // The relay refused the ticket (stale, replayed, or the session
+          // expired between mint and handshake). Say what to do about it rather
+          // than reporting a connection drop the user cannot act on.
+          setError(SIGNED_OUT_MESSAGE);
+        } else if (!stoppingRef.current) {
           // Dropped mid-session — keep the transcript/cards, flag the drop.
           setState((s) =>
             pushAuditEntry(
@@ -472,7 +521,7 @@ export function useVoiceAgent(): VoiceAgentApi {
         teardown();
       };
     },
-    [supported, tick, handleEvent, playPcm, teardown],
+    [supported, token, tick, handleEvent, playPcm, teardown],
   );
 
   // Resolve the approval gate over the voice WS control channel.

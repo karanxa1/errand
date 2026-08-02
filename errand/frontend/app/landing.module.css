@@ -1,0 +1,475 @@
+/* ============================================================================
+   Landing — the front door.
+   ----------------------------------------------------------------------------
+   Built on the app's own palette so the page and the product are one surface,
+   not a marketing skin bolted onto a different brand. The page background comes
+   from globals.css (authored directional light + grain on the substrate), and
+   every section here sits on it transparently — so colour carries straight
+   through the scroll with no seam anywhere.
+
+   Deliberate absences: no pills, no gradient fills, no glow behind anything, no
+   icon-in-a-tile, no decorative hairlines, no card that lifts on hover, no
+   growing underline, no button that jumps when you point at it. Emphasis is a
+   tonal step, never a saturated pop.
+   ========================================================================== */
+
+.page {
+  position: relative;
+  z-index: 1;
+  --gutter: clamp(20px, 5vw, 64px);
+}
+
+/* ── Nav ───────────────────────────────────────────────────────────────────
+   Treated, not a default row: the wordmark and the actions sit on the same
+   optical baseline inside the page's own gutter, at the page's max width. */
+.nav {
+  max-width: var(--maxw);
+  margin: 0 auto;
+  padding: 26px var(--gutter) 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+}
+
+.navBrand {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.navMark {
+  display: inline-flex;
+  color: var(--green-soft);
+}
+
+.navName {
+  font-family: var(--display);
+  font-size: 21px;
+  letter-spacing: 0.005em;
+  color: var(--text-hi);
+}
+
+.navLinks {
+  display: flex;
+  align-items: center;
+  gap: clamp(14px, 3vw, 28px);
+}
+
+.navQuiet {
+  color: var(--text-mid);
+  text-decoration: none;
+  font-size: 14.5px;
+  transition: color 160ms ease;
+}
+
+.navQuiet:hover {
+  color: var(--text-hi);
+}
+
+/* The one action. Solid, self-coloured edge, no glow, no radius theatrics, and
+   it does not move when you point at it — the surface warms instead. */
+.navAction {
+  color: #04150d;
+  background: var(--green-soft);
+  text-decoration: none;
+  font-size: 14.5px;
+  font-weight: 560;
+  padding: 9px 16px;
+  border-radius: var(--radius-sm);
+  transition: background-color 160ms ease;
+}
+
+.navAction:hover {
+  background: var(--green);
+}
+
+/* ── The fold ──────────────────────────────────────────────────────────────
+   One composition: the statement, then a single horizontal band that runs the
+   full content width beneath it. Not a text column with a panel beside it. */
+.fold {
+  max-width: var(--maxw);
+  margin: 0 auto;
+  padding: clamp(56px, 11vh, 108px) var(--gutter) clamp(64px, 12vh, 120px);
+  min-height: calc(100dvh - 72px);
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: clamp(44px, 7vh, 76px);
+}
+
+.foldHead {
+  max-width: 46ch;
+}
+
+.headline {
+  font-family: var(--display);
+  font-weight: 400;
+  /* Held to two lines at every width. A display line that stacks into three or
+     four short rows is a staircase, not a composition. */
+  font-size: clamp(40px, 6.4vw, 82px);
+  line-height: 1.03;
+  letter-spacing: -0.015em;
+  color: var(--text-hi);
+  margin: 0;
+}
+
+/* Emphasis as a tonal step down, not a colour pop: the turn of the sentence
+   sits quieter than the claim, which is how it reads out loud. */
+.headlineTurn {
+  color: var(--text-mid);
+}
+
+.lede {
+  margin: clamp(18px, 2.6vh, 26px) 0 0;
+  font-size: clamp(15px, 1.25vw, 17px);
+  line-height: 1.62;
+  color: var(--text-mid);
+  max-width: 54ch;
+}
+
+/* ── The hold ──────────────────────────────────────────────────────────────
+   Page-scale type, not a card: no panel fill, no drawn border, no shadow. The
+   band is defined by its own tone and rhythm, the way a real ledger is. */
+.hold {
+  display: grid;
+  grid-template-columns: minmax(210px, 1fr) minmax(280px, 1.35fr) minmax(230px, 0.95fr);
+  gap: clamp(28px, 4vw, 56px);
+  align-items: start;
+  padding-top: clamp(26px, 4vh, 40px);
+  /* The only rule on the page, and it is structural rather than ornamental: the
+     lip that separates the statement from the ledger under it. Self-coloured,
+     so it reads as an edge catching light and not as a drawn line. */
+  box-shadow: inset 0 1px 0 0 var(--edge);
+}
+
+.holdMerchant {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+
+.holdStatus {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--green-dim);
+  transition: color 220ms ease;
+}
+
+.hold[data-state="approved"] .holdStatus {
+  color: var(--green-soft);
+}
+
+.hold[data-state="declined"] .holdStatus {
+  color: var(--danger);
+}
+
+.holdName {
+  font-family: var(--display);
+  font-size: clamp(22px, 2.3vw, 29px);
+  line-height: 1.15;
+  color: var(--text-hi);
+}
+
+.holdNote {
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text-low);
+  max-width: 30ch;
+}
+
+.holdLines {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.holdLine {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  grid-template-areas:
+    "label amount"
+    "detail amount";
+  column-gap: 18px;
+  align-items: baseline;
+}
+
+.holdLabel {
+  grid-area: label;
+  color: var(--text);
+  font-size: 15px;
+}
+
+.holdDetail {
+  grid-area: detail;
+  color: var(--text-low);
+  font-size: 12.5px;
+}
+
+.holdAmount {
+  grid-area: amount;
+  align-self: center;
+  font-family: var(--mono);
+  font-size: 14px;
+  color: var(--text-mid);
+  font-variant-numeric: tabular-nums;
+}
+
+.holdTotal {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+}
+
+/* Big type needs air. The total is the loudest thing on the page, so it gets
+   room rather than tight tracking. */
+.holdSum {
+  font-family: var(--display);
+  font-size: clamp(42px, 5.2vw, 66px);
+  line-height: 1.02;
+  letter-spacing: -0.01em;
+  color: var(--text-hi);
+  font-variant-numeric: tabular-nums;
+  transition: color 260ms ease;
+}
+
+.hold[data-state="declined"] .holdSum {
+  color: var(--text-low);
+}
+
+.holdCaption {
+  font-size: 13.5px;
+  color: var(--text-mid);
+  min-height: 20px;
+}
+
+.holdControls {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin-top: 16px;
+  flex-wrap: wrap;
+}
+
+/* One real action. Same treatment as the nav's, so the page speaks with one
+   voice, and it stays put on hover. */
+.approve {
+  border: none;
+  background: var(--green-soft);
+  color: #04150d;
+  font-size: 14.5px;
+  font-weight: 560;
+  padding: 11px 18px;
+  border-radius: var(--radius-sm);
+  transition: background-color 160ms ease;
+}
+
+.approve:hover {
+  background: var(--green);
+}
+
+/* Not an outlined twin of the primary — a quiet text control, which is what
+   declining actually is. */
+.decline {
+  border: none;
+  background: none;
+  padding: 11px 2px;
+  color: var(--text-mid);
+  font-size: 14.5px;
+  transition: color 160ms ease;
+}
+
+.decline:hover {
+  color: var(--text-hi);
+}
+
+/* ── Sections ──────────────────────────────────────────────────────────────
+   Each opens with a full sentence at display scale. No kicker above a heading,
+   no small label over a big line. */
+.section {
+  max-width: var(--maxw);
+  margin: 0 auto;
+  padding: clamp(72px, 13vh, 132px) var(--gutter) 0;
+}
+
+.sectionTitle {
+  font-family: var(--display);
+  font-weight: 400;
+  font-size: clamp(26px, 3.4vw, 44px);
+  line-height: 1.16;
+  letter-spacing: -0.01em;
+  color: var(--text-hi);
+  margin: 0;
+  max-width: 22ch;
+}
+
+.sectionBody {
+  margin: 20px 0 0;
+  font-size: clamp(15px, 1.2vw, 16.5px);
+  line-height: 1.65;
+  color: var(--text-mid);
+  max-width: 58ch;
+}
+
+.sectionAction {
+  display: inline-block;
+  margin-top: 28px;
+  color: #04150d;
+  background: var(--green-soft);
+  text-decoration: none;
+  font-size: 14.5px;
+  font-weight: 560;
+  padding: 11px 18px;
+  border-radius: var(--radius-sm);
+  transition: background-color 160ms ease;
+}
+
+.sectionAction:hover {
+  background: var(--green);
+}
+
+/* ── The audit list ────────────────────────────────────────────────────────
+   Real event names, set as data — which is the one place a mono belongs. Rows
+   are separated by tone and rhythm, not by rules running down a rail. */
+.audit {
+  list-style: none;
+  margin: clamp(30px, 5vh, 46px) 0 0;
+  padding: 0;
+  display: grid;
+  gap: 2px;
+  max-width: 720px;
+}
+
+.auditRow {
+  display: grid;
+  grid-template-columns: minmax(150px, 210px) 1fr;
+  gap: clamp(14px, 2.4vw, 30px);
+  align-items: baseline;
+  padding: 13px 0;
+  box-shadow: inset 0 1px 0 0 var(--edge);
+}
+
+.auditStep {
+  font-family: var(--mono);
+  font-size: 13px;
+  color: var(--green-dim);
+}
+
+.auditDetail {
+  font-size: 14.5px;
+  color: var(--text-mid);
+}
+
+/* The last row is the point of the section, so it carries the page's live tone
+   rather than the dimmed one. */
+.auditRow:last-child .auditStep {
+  color: var(--green-soft);
+}
+
+.auditRow:last-child .auditDetail {
+  color: var(--text);
+}
+
+/* ── Footer ────────────────────────────────────────────────────────────────
+   The wordmark is anchored flush to the bottom with nothing beneath it, on the
+   layer above the page texture, and the links sit above it. */
+.footer {
+  position: relative;
+  max-width: var(--maxw);
+  margin: clamp(96px, 16vh, 168px) auto 0;
+  padding: 0 var(--gutter);
+  overflow: hidden;
+}
+
+.footerRow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 20px 40px;
+  padding-bottom: clamp(28px, 5vh, 48px);
+}
+
+.footerNote {
+  font-size: 13px;
+  color: var(--text-low);
+  max-width: 42ch;
+}
+
+.footerLinks {
+  display: flex;
+  gap: clamp(14px, 2.6vw, 28px);
+  flex-wrap: wrap;
+}
+
+.footerLinks a {
+  font-size: 13.5px;
+  color: var(--text-mid);
+  text-decoration: none;
+  transition: color 160ms ease;
+}
+
+.footerLinks a:hover {
+  color: var(--text-hi);
+}
+
+/* Full-width, tracked out, sitting on its own baseline at the very bottom edge.
+   ERRAND has no descenders, so a baseline flush with the container clips
+   nothing — the caps keep their full height with room above them. */
+.footerWordmark {
+  display: block;
+  font-family: var(--display);
+  font-size: clamp(56px, 15.4vw, 214px);
+  line-height: 0.78;
+  letter-spacing: 0.055em;
+  text-align: center;
+  color: var(--ink-250);
+  user-select: none;
+  padding-top: 0.06em;
+}
+
+/* ── Narrow ────────────────────────────────────────────────────────────────
+   The band becomes a column. Every part keeps its gutter; nothing touches an
+   edge, and nothing is hidden. */
+@media (max-width: 900px) {
+  .hold {
+    grid-template-columns: 1fr;
+    gap: 30px;
+  }
+
+  .holdTotal {
+    padding-top: 6px;
+    box-shadow: inset 0 1px 0 0 var(--edge);
+  }
+
+  .holdSum {
+    padding-top: 18px;
+  }
+
+  .auditRow {
+    grid-template-columns: 1fr;
+    gap: 5px;
+  }
+}
+
+@media (max-width: 560px) {
+  .fold {
+    min-height: auto;
+    padding-top: clamp(40px, 8vh, 64px);
+  }
+
+  .navName {
+    font-size: 19px;
+  }
+
+  .footerRow {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+}

@@ -12,7 +12,19 @@
 // (mirroring lib/stream.ts). `token` frames stream into the live assistant
 // bubble; tool / errand / websearch / approval frames fold through applyFrame
 // into a live RunState so tool cards animate inline; `title` renames the sidebar
-// item; `done` ends the stream and we reload the canonical messages.
+// item; `done` ends the stream.
+//
+// When the turn ends it is COMMITTED LOCALLY into `messages` — the exact user
+// text, the exact RunState the operator watched build, and the assistant text the
+// server confirmed via `assistant.saved`. It is deliberately not re-fetched: the
+// stream already delivered every part of the turn, so a GET of the whole
+// conversation would spend a round-trip to be told what we just watched happen,
+// and would briefly re-render the thread from scratch on the way. A genuine
+// reload of the page still reads canonical state from the server.
+//
+// The conversation row itself is created lazily server-side on the first turn, so
+// `send` carries the profile/model to seed it with. That is why a brand-new chat
+// needs no blocking POST before the first token.
 //
 // Every request carries Authorization: Bearer <token> from useAuth.
 
@@ -36,6 +48,11 @@ export interface ChatMessage {
   role: ChatRole;
   content: string;
   events?: (Record<string, unknown> & { type: string })[];
+  // Set only on a turn committed locally from the live stream (role="tool"): the
+  // finished RunState exactly as it was rendered, so committing the turn does not
+  // have to round-trip the frames back through the reducer to say the same thing.
+  // Server-loaded tool messages carry `events` instead and are replayed.
+  runState?: RunState;
   created_at: string;
 }
 
@@ -59,10 +76,20 @@ interface UseChatArgs {
   token: string | null;
   // Fired when the backend auto-titles a conversation on its first turn.
   onTitle?: (conversationId: string, title: string) => void;
-  // Fired after a turn is persisted + reloaded, so the sidebar can re-sort.
-  onTurnComplete?: () => void;
+  // Fired once a turn has finished and been committed, so the rail can re-sort.
+  onTurnComplete?: (conversationId: string) => void;
   // Fired after a conversation's full detail loads (to sync model/profile).
   onLoaded?: (detail: ConversationDetail) => void;
+}
+
+// What a turn needs beyond its text. `conversationId` overrides the hook's
+// current id (the caller has just minted one for a brand-new chat and the state
+// update has not landed yet); profile/model seed the conversation row if this
+// turn is the one that creates it.
+export interface SendOptions {
+  conversationId?: string;
+  profile?: ProfileKind;
+  model?: string;
 }
 
 export interface ChatApi {
@@ -70,13 +97,13 @@ export interface ChatApi {
   loading: boolean;
   streaming: boolean;
   error: string | null;
-  // The just-sent user turn, shown immediately (before the reload persists it).
+  // The just-sent user turn, shown immediately (before the turn is committed).
   liveUser: string | null;
   // The assistant text streaming in token-by-token.
   liveAssistant: string;
   // The live errand/tool RunState for the current turn (drives Thread cards).
   liveRun: RunState;
-  send: (content: string, conversationIdOverride?: string) => Promise<void>;
+  send: (content: string, opts?: SendOptions) => Promise<void>;
   resolveApproval: (verdict: ApprovalResult) => Promise<void>;
 }
 
@@ -174,26 +201,6 @@ export function useChat({
     runIdRef.current = null;
   }, []);
 
-  // Fetch the canonical conversation detail and swap it in (only if it's still
-  // the active conversation — a mid-stream switch must not clobber the new one).
-  const reload = useCallback(async (id: string) => {
-    const tk = tokenRef.current;
-    if (!tk) return;
-    try {
-      const res = await fetch(api(`/api/conversations/${id}`), {
-        headers: { Authorization: `Bearer ${tk}` },
-      });
-      if (!res.ok) return;
-      const detail = (await res.json()) as ConversationDetail;
-      if (convIdRef.current !== id) return;
-      setMessages(detail.messages ?? []);
-      clearLive();
-      onLoadedRef.current?.(detail);
-    } catch {
-      /* keep live state visible if the reload fails — nothing vanishes */
-    }
-  }, [clearLive]);
-
   // Load history whenever the active conversation changes. Aborts any in-flight
   // stream from the previous conversation.
   useEffect(() => {
@@ -248,8 +255,8 @@ export function useChat({
   }, [conversationId, token, clearLive]);
 
   const send = useCallback(
-    async (content: string, conversationIdOverride?: string) => {
-      const id = conversationIdOverride ?? convIdRef.current;
+    async (content: string, opts?: SendOptions) => {
+      const id = opts?.conversationId ?? convIdRef.current;
       const tk = tokenRef.current;
       const text = content.trim();
       if (!id || !tk || !text) return;
@@ -266,6 +273,15 @@ export function useChat({
       setLiveRun({ ...initialRunState, connection: "open" });
       setStreaming(true);
 
+      // The turn accumulated synchronously, alongside the React state. Committing
+      // the turn at the end needs the FINAL values, and reading them back out of
+      // state (or a ref mirroring state) at that moment is a race — the last
+      // setState of the stream may not have rendered yet. These are the truth;
+      // the setState calls are how it gets on screen.
+      let runAcc: RunState = { ...initialRunState, connection: "open" };
+      let textAcc = "";
+      let savedMessageId: string | null = null;
+
       // Handle one decoded frame. `id` is captured so `title` targets the right
       // conversation even for a freshly-created one.
       const handleFrame = (frame: RawFrame) => {
@@ -274,7 +290,10 @@ export function useChat({
         switch (event) {
           case "token": {
             const t = (data.text as string) ?? "";
-            if (t) setLiveAssistant((prev) => prev + t);
+            if (t) {
+              textAcc += t;
+              setLiveAssistant(textAcc);
+            }
             return;
           }
           case "title": {
@@ -283,10 +302,17 @@ export function useChat({
             return;
           }
           case "assistant.saved": {
-            // The persisted final text; adopt it so the live bubble matches what
-            // the reload will show, avoiding any flicker.
+            // The persisted final text and its real row id. Adopting both means
+            // the committed message is identical to what a later page load will
+            // read back from the server, id included.
             const finalText = data.content as string | undefined;
-            if (typeof finalText === "string") setLiveAssistant(finalText);
+            if (typeof finalText === "string") {
+              textAcc = finalText;
+              setLiveAssistant(finalText);
+            }
+            if (typeof data.message_id === "string") {
+              savedMessageId = data.message_id;
+            }
             return;
           }
           case "done":
@@ -297,13 +323,15 @@ export function useChat({
           }
           case "approval.request": {
             if (typeof data.run_id === "string") runIdRef.current = data.run_id;
-            setLiveRun((s) => foldLive(s, frame));
+            runAcc = foldLive(runAcc, frame);
+            setLiveRun(runAcc);
             return;
           }
           default:
             // tool.call, tool.result, websearch.result, and every errand audit
             // event (run.started … run.done) fold into the live RunState.
-            setLiveRun((s) => foldLive(s, frame));
+            runAcc = foldLive(runAcc, frame);
+            setLiveRun(runAcc);
         }
       };
 
@@ -314,7 +342,12 @@ export function useChat({
             "Content-Type": "application/json",
             Authorization: `Bearer ${tk}`,
           },
-          body: JSON.stringify({ content: text }),
+          body: JSON.stringify({
+            content: text,
+            // Read server-side only when this turn creates the conversation.
+            ...(opts?.profile ? { profile: opts.profile } : {}),
+            ...(opts?.model ? { model: opts.model } : {}),
+          }),
           signal: ctrl.signal,
         });
         if (!res.ok || !res.body) {
@@ -344,13 +377,41 @@ export function useChat({
         if (abortRef.current === ctrl) abortRef.current = null;
         if (!ctrl.signal.aborted) {
           setStreaming(false);
-          // Swap in the canonical persisted turn, then let the sidebar re-sort.
-          await reload(id);
-          onTurnCompleteRef.current?.();
+          // Commit the turn into history. This runs even if the stream errored
+          // part-way: the operator watched those tokens and those tool cards
+          // arrive, and dropping them because the tail failed would delete
+          // content off the screen. Whatever did arrive stays.
+          if (convIdRef.current === id || streamIdRef.current === id) {
+            const now = new Date().toISOString();
+            const seq = `${id}-${Date.now()}`;
+            const committed: ChatMessage[] = [
+              { id: `u-${seq}`, role: "user", content: text, created_at: now },
+            ];
+            if (runAcc.audit.length > 0) {
+              committed.push({
+                id: `t-${seq}`,
+                role: "tool",
+                content: "",
+                runState: runAcc,
+                created_at: now,
+              });
+            }
+            if (textAcc.trim()) {
+              committed.push({
+                id: savedMessageId ?? `a-${seq}`,
+                role: "assistant",
+                content: textAcc,
+                created_at: now,
+              });
+            }
+            setMessages((prev) => [...prev, ...committed]);
+            clearLive();
+          }
+          onTurnCompleteRef.current?.(id);
         }
       }
     },
-    [reload],
+    [clearLive],
   );
 
   // Resolve the human approval gate. POSTs { run_id, approved, reason? } to

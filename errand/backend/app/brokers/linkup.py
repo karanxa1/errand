@@ -26,13 +26,20 @@ class LinkupSearchBroker:
             "Content-Type": "application/json",
         }
 
+    # The depth values the upstream API accepts. Taken from the reference, not
+    # from what we happened to use before: "fast" is a sub-second mode for
+    # simple, focused queries, "standard" is agentic search, "deep" runs several
+    # agentic iterations. An unknown value here is coerced rather than sent, so a
+    # model that invents one gets a slower search instead of a 4xx.
+    # https://docs.linkup.so/pages/documentation/api-reference/endpoint/post-search
+    DEPTHS = ("fast", "standard", "deep")
+
     async def search(self, query: str, depth: str = "standard") -> dict:
         """Return a grounded answer plus its sources.
 
         Shape: { "answer": str, "sources": [{ "name", "url", "snippet" }, ...] }.
-        `depth` is "standard" (fast) or "deep" (multi-iteration).
         """
-        if depth not in ("standard", "deep"):
+        if depth not in self.DEPTHS:
             depth = "standard"
         body = {"q": query, "depth": depth, "outputType": "sourcedAnswer"}
         async with httpx.AsyncClient(timeout=60) as client:
