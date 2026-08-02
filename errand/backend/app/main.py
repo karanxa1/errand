@@ -148,8 +148,13 @@ async def models() -> dict:
 
 @app.get("/api/config")
 async def config() -> dict:
-    # Client-safe values only.
-    return {"pravaPublishableKey": settings.prava_publishable_key}
+    # Client-safe values only. `liveHandoff` is a plain readiness boolean (never a
+    # secret) so the client — and an operator hitting this endpoint — can confirm
+    # the live-browser-handoff path is actually enabled + configured at runtime.
+    return {
+        "pravaPublishableKey": settings.prava_publishable_key,
+        "liveHandoff": settings.live_handoff_ready,
+    }
 
 
 async def _await_approval_via_db(
