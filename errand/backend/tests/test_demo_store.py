@@ -114,6 +114,19 @@ def test_catalog_exposes_add_buttons_and_a_machine_readable_total() -> None:
     assert "data-total-cents" in html
 
 
+def test_catalog_exposes_remove_buttons_and_per_line_qty() -> None:
+    """The agentic shop loop takes a unit back out with
+    button[data-remove="<id>"], and reads the current cart off each
+    li[data-line="<id>"]'s data-qty. A renamed hook here is a silent multi-minute
+    timeout at run time, so it is pinned exactly like the add/total contract."""
+    html = _INDEX.read_text(encoding="utf-8")
+    assert "data-remove=" in html
+    assert "data-line" in html
+    assert "data-qty" in html
+    # The remove handler must actually decrement/delete, not just exist as markup.
+    assert "function removeFromCart" in html
+
+
 def test_catalog_prices_are_integer_cents() -> None:
     """Cents everywhere: a float price would drift against the Prava session
     amount, and the session pins the total the card is scoped to."""

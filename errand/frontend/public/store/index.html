@@ -26,6 +26,8 @@
     [data-product-id]  with data-brand and data-price-cents
     [data-name]        product name, inside each product
     button[data-add="<id>"]
+    button[data-remove="<id>"]        removes one unit (agentic shop loop)
+    #cart-lines li[data-line="<id>"]  per-line row, with data-qty (agentic loop)
     #cart-total        with data-total-cents
   Prices are integer CENTS to avoid float drift; the total is recomputed from
   them, never parsed back out of the rendered string.
@@ -169,16 +171,37 @@
       add.textContent = "Add to cart";
       add.addEventListener("click", function () { addToCart(p.id); });
 
+      // Remove one unit. The agentic shop loop drives button[data-remove="<id>"]
+      // to take a product back out when the human (or the budget) says so; a
+      // human demoing the store gets the same control.
+      var remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "remove";
+      remove.setAttribute("data-remove", p.id);
+      remove.textContent = "Remove";
+      remove.addEventListener("click", function () { removeFromCart(p.id); });
+
       card.appendChild(brand);
       card.appendChild(name);
       card.appendChild(price);
       card.appendChild(add);
+      card.appendChild(remove);
       host.appendChild(card);
     });
   }
 
   function addToCart(id) {
     cart[id] = (cart[id] || 0) + 1;
+    renderCart();
+  }
+
+  function removeFromCart(id) {
+    var qty = cart[id] || 0;
+    if (qty <= 1) {
+      delete cart[id];
+    } else {
+      cart[id] = qty - 1;
+    }
     renderCart();
   }
 
@@ -199,6 +222,11 @@
       if (!qty) return;
       any = true;
       var li = document.createElement("li");
+      // data-line + data-qty make the cart machine-readable: the agentic shop
+      // loop reads what is currently in the cart straight off the DOM, the same
+      // way build_cart reads the total, rather than trusting its own bookkeeping.
+      li.setAttribute("data-line", p.id);
+      li.setAttribute("data-qty", String(qty));
       var left = document.createElement("span");
       left.textContent = p.name;
       var right = document.createElement("span");

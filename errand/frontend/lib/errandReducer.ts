@@ -62,6 +62,10 @@ export interface RunState {
   result: RunDone | null;
   errorMessage: string | null;
   audit: AuditEntry[];
+  // The LATEST live browser screenshot from the agentic shop loop (a data: URL)
+  // plus its caption. Only ever the most recent frame — never a list — so the
+  // live view is bounded memory no matter how many frames stream in.
+  browserFrame: { src: string; caption: string } | null;
 }
 
 export const initialRunState: RunState = {
@@ -80,6 +84,7 @@ export const initialRunState: RunState = {
   result: null,
   errorMessage: null,
   audit: [],
+  browserFrame: null,
 };
 
 // A resolved/pending web-search card lives as a single audit entry whose payload
@@ -128,6 +133,22 @@ export function pushAuditEntry(
 export function applyFrame(state: RunState, frame: RawFrame): RunState {
   const event = frame.event;
   const data = (frame.data ?? {}) as Record<string, unknown>;
+
+  // ── browser.frame: the live shop view. Replace the single latest frame; never
+  // an audit entry (it would flood the timeline) and never accumulated (it would
+  // grow without bound). A missing/empty payload is ignored so a stray frame
+  // cannot blank a good one. ─────────────────────────────────────────────────
+  if (event === "browser.frame") {
+    const b64 = typeof data.b64 === "string" ? data.b64 : "";
+    if (!b64) return state;
+    const mime = typeof data.mime === "string" ? data.mime : "image/jpeg";
+    const caption = typeof data.caption === "string" ? data.caption : "";
+    return {
+      ...state,
+      connection: state.connection === "open" ? state.connection : "open",
+      browserFrame: { src: `data:${mime};base64,${b64}`, caption },
+    };
+  }
 
   // ── websearch.result: fill the pending web-search card IN PLACE (no new
   // card), so the search animates from running → resolved like one unit. ──────
@@ -240,6 +261,7 @@ export function applyFrame(state: RunState, frame: RawFrame): RunState {
         model: (data.model as string) ?? next.model,
         context: null,
         cart: null,
+        browserFrame: null,
         approval: null,
         approvalResult: null,
         credentialLast4: null,

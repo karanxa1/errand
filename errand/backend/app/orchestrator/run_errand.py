@@ -88,6 +88,8 @@ async def _shop_the_ladder(
     rec: Callable[..., Awaitable[None]],
     guard: Callable[[str], Awaitable[None]],
     discovery_allowed: bool,
+    shop_decide=None,
+    on_frame=None,
 ) -> tuple[Merchant, "object"] | None:
     """Try the approved vendors, then (if allowed) whoever else stocks it.
 
@@ -130,7 +132,18 @@ async def _shop_the_ladder(
 
         await guard("cart.attempt")
         try:
-            cart = await brokers.shopper.build_cart(resolved.url, intent, ctx)
+            # When the caller supplied a decision fn AND this shopper can be
+            # driven step-by-step (the real browser shopper implements
+            # agentic_build_cart; the mock/wallet shoppers do not), let the LLM
+            # build the cart live. Otherwise fall back to the fixed pass. Same
+            # CartResult either way, so everything downstream is unchanged.
+            agentic = getattr(brokers.shopper, "agentic_build_cart", None)
+            if shop_decide is not None and agentic is not None:
+                cart = await agentic(
+                    resolved.url, intent, ctx, decide=shop_decide, on_frame=on_frame
+                )
+            else:
+                cart = await brokers.shopper.build_cart(resolved.url, intent, ctx)
         except (RunCancelled, StepBudgetExceeded):
             raise
         except Exception as exc:  # noqa: BLE001 — any shopper failure is "not here"
@@ -203,6 +216,20 @@ async def run_errand(
     # bindings, which is how a card ends up permanently at "Maximum binding for
     # token exceeded".
     browser_profile_id: str | None = None,
+    # A user-supplied spend cap (cents) for THIS errand — e.g. "keep it under
+    # $10". It can only TIGHTEN spend: the effective budget is min(policy, cap),
+    # so a cap above the policy is ignored and the policy stays the hard ceiling.
+    # Without it the cart is built to the full policy budget, which is why a
+    # spoken "make it cheaper" changed nothing — the shopper filled to policy
+    # every time. None means "no extra cap; use the policy budget as before".
+    max_cents: int | None = None,
+    # When provided, the LLM DRIVES the cart step-by-step (observe/add/remove/
+    # done) via the shopper's agentic_build_cart, instead of the fixed
+    # budget-fill. `on_frame(step, detail, jpeg_bytes|None)` streams the live
+    # browser view. Both optional: without shop_decide the classic pass runs, so
+    # nothing changes for callers that don't opt in.
+    shop_decide=None,
+    on_frame=None,
     max_steps: int = DEFAULT_MAX_STEPS,
     credential_wait_s: float = DEFAULT_CREDENTIAL_WAIT_S,
 ) -> dict:
@@ -236,6 +263,22 @@ async def run_errand(
             await rec("context.no_merchant", "No approved merchant; stopping.")
             return {"kind": "aborted", "reason": "No approved merchant in context."}
 
+        # Apply a user-supplied spend cap to the SHOPPING context only, as
+        # min(policy, cap) — the shopper reads context.budget_cents to fill the
+        # cart, so lowering it here is what actually makes "under $10" produce a
+        # cheaper cart instead of the same policy-sized one. `ctx` (the real
+        # policy budget) is left intact for the over-budget backstop below, so
+        # the cap can only ever tighten spend, never raise it above policy.
+        shop_ctx = ctx
+        if max_cents is not None and max_cents > 0 and max_cents < ctx.budget_cents:
+            shop_ctx = ctx.model_copy(update={"budget_cents": max_cents})
+            await rec(
+                "cart.capped",
+                f"Capping this cart at ${max_cents/100:.2f} "
+                f"(policy allows ${ctx.budget_cents/100:.2f}).",
+                {"max_cents": max_cents, "policy_budget_cents": ctx.budget_cents},
+            )
+
         # 2. Shop; park on checkout.
         #
         # An approved vendor being out of stock is ordinary, not exceptional, so
@@ -247,11 +290,13 @@ async def run_errand(
         # learns from their statement.
         shopped = await _shop_the_ladder(
             brokers,
-            ctx,
+            shop_ctx,
             intent,
             rec=rec,
             guard=guard,
             discovery_allowed=discovery_allowed,
+            shop_decide=shop_decide,
+            on_frame=on_frame,
         )
         if shopped is None:
             await rec(
@@ -264,6 +309,24 @@ async def run_errand(
                 "reason": "Nothing matching the request was available to buy.",
             }
         merchant, cart = shopped
+
+        # An empty cart must never reach a payment session — that would pin a card
+        # for $0 and ask a human to approve nothing. With a user cap this is the
+        # honest "nothing fit" answer (the cheapest allowed item was over the
+        # cap), so say that specifically rather than a generic empty-cart abort.
+        if not cart.items or cart.total_cents <= 0:
+            if max_cents is not None and max_cents < ctx.budget_cents:
+                await rec(
+                    "cart.capped_empty",
+                    f"Nothing here fits under ${max_cents/100:.2f}.",
+                    {"max_cents": max_cents},
+                )
+                return {
+                    "kind": "aborted",
+                    "reason": f"Nothing available fit under ${max_cents/100:.2f}.",
+                }
+            await rec("cart.empty", "Cart came back empty; stopping.")
+            return {"kind": "aborted", "reason": "Nothing could be added to the cart."}
 
         await rec(
             "cart.built",

@@ -131,6 +131,17 @@ export default function Thread({
       <div className="flex flex-col gap-3">
         {state.audit.map((e) => renderEntry(e, state, onResolveApproval))}
 
+        {/* Live browser view — the agent shopping on screen. Shown while a frame
+            exists and the run is still going; it holds as a still on a terminal
+            state. A real <img> present by default (never opacity-gated), so a
+            dropped animation can never blank it. */}
+        {state.browserFrame && running && (
+          <BrowserView
+            src={state.browserFrame.src}
+            caption={state.browserFrame.caption}
+          />
+        )}
+
         {forming && (
           <div className={USER_ROW_INLINE}>
             <div className={USER_BUBBLE_FORMING}>{forming}</div>
@@ -487,4 +498,33 @@ function renderEntry(
 function humanize(step: string): string {
   const s = step.replace(/[._]/g, " ");
   return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
+/* The live browser view: a screenshot of the store the agent is shopping, with
+   the current action as a caption and a quiet "live" marker. The image updates
+   in place as new frames arrive (the reducer keeps only the latest), so this is
+   one element re-sourced, not a growing list. Tonal card, self-coloured lip — no
+   drawn border, no bloom. */
+function BrowserView({ src, caption }: { src: string; caption: string }) {
+  return (
+    <figure className="m-0 overflow-hidden rounded-card bg-ink-050 shadow-[inset_0_0_0_1px_var(--color-edge)]">
+      <figcaption className="flex items-center gap-2 px-[14px] py-[9px] text-[12px] text-mid shadow-[inset_0_-1px_0_var(--color-edge)]">
+        <span
+          className="h-[7px] w-[7px] flex-none rounded-full bg-green animate-[typingPulse_1.4s_ease-in-out_infinite]"
+          aria-hidden="true"
+        />
+        <span className="[font-weight:600] text-hi">Live</span>
+        <span className="min-w-0 flex-1 overflow-hidden text-ellipsis whitespace-nowrap">
+          {caption || "Shopping the store"}
+        </span>
+      </figcaption>
+      {/* eslint-disable-next-line @next/next/no-img-element — a base64 data: URL
+          streamed frame-by-frame is not something next/image can optimise. */}
+      <img
+        src={src}
+        alt={caption || "The agent shopping the store"}
+        className="block w-full"
+      />
+    </figure>
+  );
 }

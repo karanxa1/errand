@@ -122,7 +122,11 @@ SYSTEM_PROMPT = (
     "run_errand tool with their request verbatim as `intent` and set `profile` "
     "('business' for work/office, 'personal' for the user's own items). Don't "
     "quiz them about budget or merchant first — the spend policy supplies both, "
-    "and the errand pauses for their approval before any money moves. After it "
+    "and the errand pauses for their approval before any money moves. If the user "
+    "names a spend limit ('under $10', 'keep it below $25'), pass it as "
+    "`max_cents` in CENTS (under $10 → 1000). If they see the cart and ask for a "
+    "cheaper one, call run_errand AGAIN with a NEW, lower `max_cents` — do not "
+    "just re-send the same call, or you will get the same cart back. After it "
     "returns, tell them the result plainly; never invent an order.\n"
     "SPEND IS THE EXCEPTION: before anything is charged the user sees the exact "
     "amount and merchant and approves it on screen with a passkey. That gate is "
@@ -149,6 +153,18 @@ _TOOLS = [
                         "type": "string",
                         "enum": ["business", "personal"],
                         "description": "'business' for work/office, 'personal' for own items.",
+                    },
+                    "max_cents": {
+                        "type": "integer",
+                        "description": (
+                            "Optional spend cap in CENTS for THIS order, from an "
+                            "explicit user limit like 'under $10' (=1000) or 'keep "
+                            "it below $25' (=2500). Only lowers spend; the policy "
+                            "budget is still the ceiling. Omit if the user gave no "
+                            "amount. Re-send a NEW, lower value when the user asks "
+                            "for a cheaper cart."
+                        ),
+                        "minimum": 1,
                     },
                 },
                 "required": ["intent"],
@@ -204,6 +220,108 @@ class ApproveRequest(BaseModel):
 
 def _client() -> AsyncOpenAI:
     return AsyncOpenAI(api_key=settings.openai_api_key)
+
+
+# The single tool the shop sub-agent is given: pick the next cart action. It is a
+# tightly-bounded surface (add/remove/done + a product_id) — NOT free browsing —
+# so the model can shape the cart but cannot navigate anywhere or do anything the
+# storefront driver does not expose.
+_SHOP_TOOL = [
+    {
+        "type": "function",
+        "function": {
+            "name": "cart_action",
+            "description": (
+                "Choose the next action to build the cart toward the user's "
+                "request: add one unit of a product, remove one unit, or finish "
+                "when the cart matches the request and fits the budget."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["add", "remove", "done"]},
+                    "product_id": {
+                        "type": "string",
+                        "description": "Required for add/remove; the shelf product id.",
+                    },
+                    "reason": {"type": "string", "description": "One short phrase; optional."},
+                },
+                "required": ["action"],
+            },
+        },
+    },
+]
+
+
+def _make_shop_decide(model_id: str):
+    """Build the `decide` step the agentic shop loop calls each turn.
+
+    Given the intent, the shelf, the current cart, the spend so far and the
+    budget, ask the model for ONE cart_action. The loop enforces policy + budget,
+    so this only has to choose; a malformed or missing tool call becomes a `done`
+    so a confused model ends the loop cleanly rather than hanging it.
+    """
+
+    async def decide(
+        *, intent, catalog, cart, spent_cents, budget_cents, last_refusal=None
+    ) -> dict:
+        shelf = "\n".join(
+            f"  {p['id']}: {p['name']} ({p['brand']}) ${p['price_cents']/100:.2f}"
+            for p in catalog
+        )
+        in_cart = (
+            ", ".join(f"{pid}×{qty}" for pid, qty in cart.items()) if cart else "empty"
+        )
+        refusal = f"\nLast action was refused: {last_refusal}" if last_refusal else ""
+        user = (
+            f"Request: {intent}\n\n"
+            f"Shelf (id: name (brand) price):\n{shelf}\n\n"
+            f"Cart now: {in_cart}\n"
+            f"Spent: ${spent_cents/100:.2f} of ${budget_cents/100:.2f} budget."
+            f"{refusal}\n\n"
+            "Call cart_action for the single best next step. Prefer the products "
+            "the request names and the budget allows; call done when the cart "
+            "satisfies the request or nothing else fits."
+        )
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You build a shopping cart one action at a time by calling "
+                    "cart_action. You may only add or remove products that are on "
+                    "the shelf. Stay within budget. Finish with done as soon as "
+                    "the cart fits the request — do not pad it."
+                ),
+            },
+            {"role": "user", "content": user},
+        ]
+        try:
+            async with _client() as client:
+                completion = await client.chat.completions.create(
+                    model=model_id,
+                    messages=messages,
+                    tools=_SHOP_TOOL,
+                    tool_choice="required",
+                    reasoning_effort=TOOL_REASONING_EFFORT,
+                    max_completion_tokens=256,
+                )
+            choice = completion.choices[0] if completion.choices else None
+            calls = getattr(choice.message, "tool_calls", None) if choice else None
+            if not calls:
+                return {"action": "done"}
+            args = json.loads(calls[0].function.arguments or "{}")
+            action = str(args.get("action") or "done").lower()
+            if action not in ("add", "remove", "done"):
+                return {"action": "done"}
+            return {
+                "action": action,
+                "product_id": str(args.get("product_id") or ""),
+                "reason": str(args.get("reason") or ""),
+            }
+        except Exception:  # noqa: BLE001 — a decision failure ends the loop, never the errand
+            return {"action": "done"}
+
+    return decide
 
 
 async def _owned(session: AsyncSession, user: User, conversation_id: str) -> Conversation:
@@ -442,6 +560,19 @@ async def chat(
         if not intent:
             return "I need to know what to buy first.", []
 
+        # Optional user spend cap. Coerce defensively — the model can hand back a
+        # string, a float, or a nonsense value — and drop anything non-positive so
+        # a bad cap never blocks the run; run_errand treats None as "no cap".
+        max_cents: int | None = None
+        raw_cap = args.get("max_cents")
+        if raw_cap is not None:
+            try:
+                parsed = int(float(raw_cap))
+                if parsed > 0:
+                    max_cents = parsed
+            except (TypeError, ValueError):
+                max_cents = None
+
         run_id = uuid.uuid4().hex
         approval_id = uuid.uuid4().hex
         brokers = build_brokers()
@@ -453,6 +584,32 @@ async def chat(
 
         async def approve_wrap(payload: dict) -> ApprovalDecision:
             return await approve(run_id, approval_id, payload)
+
+        # Live browser view. Each shop action pushes ONE browser.frame carrying a
+        # base64 JPEG of the page + a caption. Throttled to ~2/s so a fast loop
+        # cannot flood the SSE stream, and the frame is dropped (not queued) if it
+        # arrives inside the throttle window — the LATEST frame is what matters,
+        # never a backlog. The reducer keeps only the most recent frame, so this
+        # is bounded end to end.
+        import base64
+
+        last_frame_at = 0.0
+
+        async def on_frame(step: str, detail: str, shot: bytes | None) -> None:
+            nonlocal last_frame_at
+            if not shot:
+                return
+            now = time.monotonic()
+            if now - last_frame_at < 0.5:
+                return
+            last_frame_at = now
+            b64 = base64.b64encode(shot).decode("ascii")
+            await stream.emit_raw(
+                "browser.frame",
+                {"run_id": run_id, "mime": "image/jpeg", "b64": b64, "caption": detail},
+            )
+
+        shop_decide = _make_shop_decide(model_id)
 
         await stream.emit_raw("run.started", {"run_id": run_id, "model": model_id})
         collected.append({"type": "run.started", "run_id": run_id, "model": model_id})
@@ -467,6 +624,9 @@ async def chat(
                 emit=emit,
                 approve=approve_wrap,
                 cancel=cancel,
+                max_cents=max_cents,
+                shop_decide=shop_decide,
+                on_frame=on_frame,
             )
         except asyncio.CancelledError:
             # Client disconnected / stream torn down. Must propagate so the task

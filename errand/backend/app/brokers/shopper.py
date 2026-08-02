@@ -419,6 +419,104 @@ class CloudflareShopperBroker:
             ),
         )
 
+    async def agentic_build_cart(
+        self,
+        merchant_url: str,
+        intent: str,
+        context: PurchaseContext,
+        *,
+        decide,
+        on_frame=None,
+        max_actions: int = 16,
+    ) -> CartResult:
+        """The LLM DRIVES this cart: it observes the shelf + cart and chooses each
+        add/remove, instead of the fixed budget-filler in build_cart. Every add is
+        still checked against policy + budget by run_agentic_shop, so the model
+        picks WHAT to buy but cannot break a spend rule.
+
+        `decide` is the injected model step (see app.routers.chat). `on_frame`, if
+        given, is awaited with a JPEG screenshot (bytes) + a caption after each
+        action so the caller can stream the browser live. The authoritative total
+        is still read from #cart-total off the real DOM at the end — never trusted
+        from the loop — so the money-path invariants downstream do not move.
+        """
+        from app.orchestrator.agentic_shop import Product, run_agentic_shop
+
+        try:
+            async with self._page(merchant_url) as (page, _mode):
+                await self._goto_ready(page, merchant_url, "[data-product-id]", "build_cart")
+
+                surface = _PlaywrightShopSurface(page, self, merchant_url)
+
+                async def on_step(step: str, detail: str) -> None:
+                    # A frame is best-effort: a failed screenshot must never abort
+                    # a real shopping run, so it is swallowed and the loop goes on.
+                    if on_frame is None:
+                        return
+                    shot: bytes | None = None
+                    with contextlib.suppress(Exception):
+                        shot = await asyncio.wait_for(
+                            page.screenshot(type="jpeg", quality=45), timeout=8.0
+                        )
+                    await on_frame(step, detail, shot)
+
+                plan = await run_agentic_shop(
+                    surface,
+                    intent=intent,
+                    budget_cents=context.budget_cents,
+                    rules=context.rules,
+                    decide=decide,
+                    max_actions=max_actions,
+                    on_step=on_step,
+                )
+
+                # Authoritative total from the DOM, exactly as build_cart does.
+                total_cents = await self._guard(
+                    "build_cart", "reading the cart total",
+                    page.eval_on_selector(
+                        "#cart-total", "(el) => parseInt(el.dataset.totalCents || '0', 10)"
+                    ),
+                    url=merchant_url,
+                )
+                products = await self._guard(
+                    "build_cart", "reading the product catalog",
+                    page.eval_on_selector_all(
+                        "[data-product-id]",
+                        """(nodes) => nodes.map((n) => ({
+                            id: n.dataset.productId,
+                            price_cents: parseInt(n.dataset.priceCents || '0', 10),
+                            name: (n.querySelector('[data-name]') || {}).textContent || ''
+                        }))""",
+                    ),
+                    url=merchant_url,
+                )
+                id_to_prod = {p["id"]: p for p in products}
+                items: list[CartItem] = []
+                for pid, qty in plan:
+                    if qty <= 0 or pid not in id_to_prod:
+                        continue
+                    p = id_to_prod[pid]
+                    items.append(
+                        CartItem(name=p["name"].strip(), qty=qty, price_cents=int(p["price_cents"]))
+                    )
+        except ShopperError:
+            raise
+        except (asyncio.TimeoutError, PlaywrightTimeoutError) as exc:
+            raise ShopperError("build_cart", "browser session timed out", url=merchant_url) from exc
+        except PlaywrightError as exc:
+            raise ShopperError(
+                "build_cart", f"browser session failed: {_short(exc)}", url=merchant_url
+            ) from exc
+
+        session_ref = _checkout_url_for(merchant_url, total_cents)
+        return CartResult(
+            items=items,
+            total_cents=int(total_cents),
+            checkout=CheckoutState(
+                merchant_url=merchant_url, items=items, session_ref=session_ref
+            ),
+        )
+
     async def complete_checkout(
         self, checkout: CheckoutState, credential: PaymentCredential
     ) -> OrderResult:
@@ -500,6 +598,80 @@ class CloudflareShopperBroker:
             )
 
         return OrderResult(order_id=order_id, confirmation_text=confirmation_text)
+
+
+class _PlaywrightShopSurface:
+    """ShopSurface (app.orchestrator.agentic_shop) over the real storefront DOM.
+
+    Reads the shelf and the cart straight off the page, and drives the same
+    add/remove buttons a human would — button[data-add=<id>] /
+    button[data-remove=<id>], with the cart re-read from #cart-lines each time so
+    the loop's view can never drift from the store's own state.
+    """
+
+    def __init__(self, page: Page, broker: "CloudflareShopperBroker", url: str) -> None:
+        self._page = page
+        self._broker = broker
+        self._url = url
+
+    async def catalog(self):
+        from app.orchestrator.agentic_shop import Product
+
+        rows = await self._broker._guard(
+            "build_cart", "reading the product catalog",
+            self._page.eval_on_selector_all(
+                "[data-product-id]",
+                """(nodes) => nodes.map((n) => ({
+                    id: n.dataset.productId,
+                    brand: n.dataset.brand || '',
+                    price_cents: parseInt(n.dataset.priceCents || '0', 10),
+                    name: (n.querySelector('[data-name]') || {}).textContent || ''
+                }))""",
+            ),
+            url=self._url,
+        )
+        return [
+            Product(
+                id=r["id"],
+                name=(r["name"] or "").strip(),
+                brand=r["brand"] or "",
+                price_cents=int(r["price_cents"]),
+            )
+            for r in rows
+            if r.get("id")
+        ]
+
+    async def cart(self) -> dict[str, int]:
+        rows = await self._broker._guard(
+            "build_cart", "reading the cart",
+            self._page.eval_on_selector_all(
+                "#cart-lines li[data-line]",
+                """(nodes) => nodes.map((n) => ({
+                    id: n.dataset.line,
+                    qty: parseInt(n.dataset.qty || '0', 10)
+                }))""",
+            ),
+            url=self._url,
+        )
+        return {r["id"]: int(r["qty"]) for r in rows if r.get("id") and int(r["qty"]) > 0}
+
+    async def add(self, product_id: str) -> None:
+        await self._broker._guard(
+            "build_cart", f"adding {product_id} to cart",
+            self._page.click(
+                f'button[data-add="{product_id}"]', timeout=self._broker._action_timeout_ms
+            ),
+            url=self._url,
+        )
+
+    async def remove(self, product_id: str) -> None:
+        await self._broker._guard(
+            "build_cart", f"removing {product_id} from cart",
+            self._page.click(
+                f'button[data-remove="{product_id}"]', timeout=self._broker._action_timeout_ms
+            ),
+            url=self._url,
+        )
 
 
 # ── selection helpers ──────────────────────────────────────────────────────────

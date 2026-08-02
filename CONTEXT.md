@@ -98,6 +98,42 @@ The first turn mints an id, writes it to the address bar with `window.history.pu
 streams. Navigation *between* existing chats is a real `router.push`, so browser back
 works.
 
+The catch that `pushState` creates: after a first turn, the URL reads `/c/<id>` but the
+App Router's *rendered* route is still `/c`, so "New chat" (`router.push("/c")`) is a
+no-op — the same `ChatView` is reused and its `activeId` never clears, so the new chat
+would not open without a refresh. `ChatView` therefore watches `usePathname()` and, when
+the route reads new-chat (`conversationIdFromPath` → null) while it still holds an id
+(`shouldResetToNewChat`), blanks itself back to the welcome state. That reset also clears
+the previous run's cart/thread. Pinned by `lib/chatShell.newchat.test.ts`.
+
+### Live agentic browser shopping
+The LLM can DRIVE the cart instead of the old fixed budget-fill. `run_errand`
+takes an optional `shop_decide` (an LLM step: observe → add/remove/done) and
+`on_frame` (a live screenshot callback); when both are present and the shopper
+implements `agentic_build_cart` (the real browser shopper does; the mock/wallet
+shoppers don't, so they cleanly fall back to the classic `build_cart`), the model
+builds the cart step by step. The loop lives in
+`app/orchestrator/agentic_shop.py` and is driver-agnostic (no Playwright/OpenAI
+imports) so it unit-tests against a fake surface; `_PlaywrightShopSurface` in
+`app/brokers/shopper.py` drives the real demo DOM. Every add is still checked
+against policy (`_is_disallowed`) and the effective budget (`min(policy,
+max_cents)`) — the model chooses WHAT, never loosens a rule — and the
+authoritative total is still read off `#cart-total`, so every money-path
+invariant downstream is unchanged. A user spend cap arrives as `max_cents` on the
+`run_errand` tool. Live browser view streams as `browser.frame` SSE frames
+(throttled JPEG); the reducer keeps only the latest (`browserFrame`) and the
+`BrowserView` card renders it. Design: `docs/superpowers/specs/2026-08-03-live-agentic-browser-design.md`.
+Real-merchant agentic shopping (behind `USE_PRAVA_SHOP`) is not built yet — the
+wallet shopper falls back to its own `build_cart`.
+
+### Voice binds the same conversation id as a typed turn
+The voice relay socket carries only `model`/`profile`/`ticket` — no conversation id — so a
+spoken run is ephemeral. To keep "stop voice, then type" in the *same* chat, both the
+first typed turn and opening the mic call one `ensureConversation()` in `ChatView`: it
+mints the id + URL once (via `pushState`, so a live session is never torn down) and the
+spoken run and the typed turn share it. Without this, voice left `activeId` null and the
+first typed message minted a second conversation.
+
 ### Styling
 Tailwind v4 only. The brand lives in the `@theme` block in `app/globals.css`; there are
 no `.module.css` files. See the CSS rules in `AGENTS.md` — in particular that
