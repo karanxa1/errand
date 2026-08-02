@@ -16,6 +16,17 @@ describe("mirrorSessionToken", () => {
     });
   });
 
+  it("POSTs an empty token for route validation", async () => {
+    const fetchMock = vi.fn(async () => ({ ok: false }) as Response);
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(mirrorSessionToken("")).resolves.toBe(false);
+    expect(fetchMock).toHaveBeenCalledWith("/api/session", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token: "" }),
+    });
+  });
+
   it("DELETEs the mirror on logout", async () => {
     const fetchMock = vi.fn(async () => ({ ok: true }) as Response);
     vi.stubGlobal("fetch", fetchMock);

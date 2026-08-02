@@ -2,7 +2,7 @@ export async function mirrorSessionToken(token: string | null): Promise<boolean>
   try {
     const response = await fetch(
       "/api/session",
-      token
+      token !== null
         ? {
             method: "POST",
             headers: { "Content-Type": "application/json" },
