@@ -7,6 +7,11 @@ const nextConfig: NextConfig = {
 export default nextConfig;
 
 // Lets `next dev` integrate with the OpenNext Cloudflare adapter (and access
-// Cloudflare bindings locally). No-op at build/deploy time.
-import { initOpenNextCloudflareForDev } from "@opennextjs/cloudflare";
-initOpenNextCloudflareForDev();
+// Cloudflare bindings locally). Guarded to dev only: during `next build` (incl.
+// the build OpenNext runs on CI) it must NOT boot the Workers runtime, which
+// otherwise fails with SQLITE_BUSY on the CI runner.
+if (process.env.NODE_ENV === "development") {
+  import("@opennextjs/cloudflare").then(({ initOpenNextCloudflareForDev }) => {
+    initOpenNextCloudflareForDev();
+  });
+}
