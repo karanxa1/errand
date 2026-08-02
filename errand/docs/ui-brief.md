@@ -16,6 +16,20 @@ Use the official Deepgram kit, NOT shadcn/21st.dev as a component source:
   (13-standalone, 14-voice-button, 15-orb). Lift these patterns directly.
 The orb is the signature artifact and it's audio-reactive out of the box.
 
+## Streaming — NON-NEGOTIABLE (real-time, no client polling)
+- Client <-> server is streaming-only. The client NEVER polls.
+- Voice + text chat both flow over the Deepgram agent WebSocket (the kit's
+  `AgentTextInput` sends text into the same WS; tokens stream back). Chat is
+  streaming responses only.
+- Orchestrator progress is PUSHED to the client via SSE: use
+  `sseResponse(run)` + `StreamingAuditSink` from `src/lib/orchestrator/stream.ts`
+  in the errand Route Handler. Every step (context.loaded, cart.built,
+  approval.granted, payment.credential, checkout.completed, mail.confirmation)
+  streams to the UI the instant it happens.
+- Server <-> third-party polling (Prava payment-result every 3s, AgentMail inbox)
+  is INTERNAL to the brokers and hidden from the client. Its results surface as
+  streamed events. This is the only polling allowed, and it never touches the client.
+
 ## Voice + tools architecture (the key insight)
 The Deepgram `AgentProvider` config carries the whole voice loop AND tool-calling:
 ```

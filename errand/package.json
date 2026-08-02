@@ -8,7 +8,20 @@
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
-    "typescript": "^5.6.0",
-    "@types/node": "^22.0.0"
+    "@tailwindcss/postcss": "^4.3.3",
+    "@types/node": "^22.0.0",
+    "postcss": "^8.5.25",
+    "tailwindcss": "4",
+    "typescript": "^5.6.0"
+  },
+  "dependencies": {
+    "@deepgram/agents": "^0.1.1",
+    "@deepgram/react": "^0.1.0",
+    "@deepgram/ui": "^0.1.4",
+    "agentmail": "^0.5.18",
+    "next": "15",
+    "react": "19",
+    "react-dom": "19",
+    "zod": "^4.4.3"
   }
 }
