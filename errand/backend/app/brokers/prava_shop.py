@@ -48,6 +48,7 @@ from app.contracts import (
     CartItem,
     CartResult,
     CheckoutState,
+    Merchant,
     OrderResult,
     PaymentCredential,
     PurchaseContext,
@@ -254,6 +255,63 @@ class PravaShopBroker:
                     code="PRICE_MOVED",
                 ) from exc
             return await self._pay(refreshed.session_id, credential)
+
+    async def discover_merchants(
+        self, intent: str, context: PurchaseContext, limit: int = 3
+    ) -> list[Merchant]:
+        """Merchants that appear to stock this, when the approved ones do not.
+
+        The LAST resort, and the orchestrator decides whether it is allowed at
+        all (see Settings.merchant_discovery) — this method only answers "who
+        has it". Same policy filter as `_rank_variants`: an offer whose price
+        blows the budget, or whose text a rule prohibits, is not a merchant we
+        would buy from, so it does not get suggested either.
+
+        Returned in catalog rank order, cheapest offer first within a merchant,
+        de-duplicated by domain.
+        """
+        try:
+            data = await self._client.post(
+                "/v1/wallet/shop/search",
+                {
+                    "query": search_query(intent),
+                    "intent": intent[:500],
+                    "limit": MAX_PRODUCTS_INSPECTED,
+                    "shipsTo": self._ships_to,
+                },
+            )
+        except WalletError as exc:
+            logger.info("[prava-shop] merchant discovery failed: %s", exc)
+            return []
+
+        results = data.get("results")
+        if not isinstance(results, list):
+            return []
+
+        cheapest: dict[str, int] = {}
+        for result in results:
+            if not isinstance(result, dict):
+                continue
+            domain = str(result.get("merchant") or "").lower().strip()
+            if not domain:
+                continue
+            title = str(result.get("title") or "")
+            if _is_disallowed(title, domain, context.rules):
+                continue
+            estimate = result.get("price_estimate")
+            price = _amount_to_cents(
+                estimate.get("amount") if isinstance(estimate, dict) else None
+            )
+            # An unpriced hit is still a lead — the quote is the real price
+            # anyway — but a hit we KNOW blows the budget is not.
+            if price is not None and price > context.budget_cents:
+                continue
+            best = cheapest.get(domain)
+            if best is None or (price is not None and price < best):
+                cheapest[domain] = price if price is not None else best or 0
+
+        ordered = sorted(cheapest.items(), key=lambda kv: kv[1])
+        return [Merchant(name=domain, url=f"https://{domain}") for domain, _ in ordered[:limit]]
 
     # ── steps ─────────────────────────────────────────────────────────────────
 

@@ -101,6 +101,10 @@ export function useVoiceAgent(token?: string | null): VoiceAgentApi {
   const rafRef = useRef<number | null>(null);
   // Playback scheduling cursor (seconds, in the audio context clock).
   const playCursorRef = useRef(0);
+  // Every TTS chunk scheduled but not yet finished. Web Audio has no "stop
+  // everything" call — a BufferSource that has been start()ed will play to the
+  // end unless it is individually stopped — so barge-in needs the handles.
+  const scheduledRef = useRef<Set<AudioBufferSourceNode>>(new Set());
   // The active run_id an approval belongs to (set by approval.request).
   const approvalRunIdRef = useRef<string | null>(null);
   // Guard against a manual stop being reported as a lost connection.
@@ -166,6 +170,30 @@ export function useVoiceAgent(token?: string | null): VoiceAgentApi {
     const startAt = Math.max(now + 0.02, playCursorRef.current);
     src.start(startAt);
     playCursorRef.current = startAt + audioBuf.duration;
+    scheduledRef.current.add(src);
+    src.onended = () => {
+      scheduledRef.current.delete(src);
+    };
+  }, []);
+
+  // Barge-in. Deepgram's message flow is explicit — "User began talking. Stop any
+  // audio playback immediately" — and by the time that arrives, seconds of agent
+  // speech are already scheduled ahead on the Web Audio timeline. Dropping the
+  // socket's future chunks is not enough; the queue itself has to go, or the
+  // agent keeps talking over the person who interrupted it.
+  const flushPlayback = useCallback(() => {
+    for (const src of scheduledRef.current) {
+      try {
+        src.stop();
+      } catch {
+        /* already ended between the send and this tick */
+      }
+    }
+    scheduledRef.current.clear();
+    // Re-anchor the cursor to now, so the next chunk starts immediately rather
+    // than waiting out the silence where the cancelled audio would have been.
+    const ctx = audioCtxRef.current;
+    playCursorRef.current = ctx ? ctx.currentTime : 0;
   }, []);
 
   // ── JSON event routing ──────────────────────────────────────────────────────
@@ -173,6 +201,10 @@ export function useVoiceAgent(token?: string | null): VoiceAgentApi {
     const type = (msg.type as string) ?? "";
 
     switch (type) {
+      case "voice.clear_audio": {
+        flushPlayback();
+        return;
+      }
       case "voice.state": {
         const st = (msg.state as string) ?? "idle";
         setVoicePhase(
@@ -232,7 +264,7 @@ export function useVoiceAgent(token?: string | null): VoiceAgentApi {
         });
       }
     }
-  }, []);
+  }, [flushPlayback]);
 
   // ── teardown ────────────────────────────────────────────────────────────────
   const teardown = useCallback(() => {
@@ -262,6 +294,7 @@ export function useVoiceAgent(token?: string | null): VoiceAgentApi {
       /* noop */
     }
     micSinkRef.current = null;
+    flushPlayback();
     try {
       playGainRef.current?.disconnect();
     } catch {
@@ -280,7 +313,7 @@ export function useVoiceAgent(token?: string | null): VoiceAgentApi {
     setInterim("");
     setVoicePhase("idle");
     setActive(false);
-  }, []);
+  }, [flushPlayback]);
 
   const stop = useCallback(() => {
     sessionIdRef.current += 1;

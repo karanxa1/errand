@@ -20,6 +20,8 @@ Wire contract (docs/api-reference.md — "Errand Voice Relay + Tool Bridge"):
     - binary: agent TTS PCM (linear16, 16 kHz), forwarded verbatim from Deepgram.
     - JSON events:
         voice.state           {state: listening|thinking|speaking|idle}
+        voice.clear_audio     {} — barge-in: DROP all queued/scheduled TTS now.
+                              Sent on UserStartedSpeaking, ahead of voice.state.
         voice.user_transcript {text, is_final}
         voice.agent_transcript{text}
         tool.call             {name, args}
@@ -99,6 +101,47 @@ VOICE_SPEAK_VOICE_ID = "a167e0f3-df7e-4d52-a9c3-f949145efdab"
 # Human-in-the-loop gate timeout (seconds) for a voice-driven errand.
 APPROVAL_TIMEOUT_S = 300
 
+# ── Barge-in ──────────────────────────────────────────────────────────────────
+# Deepgram's message-flow reference states the client obligation on
+# UserStartedSpeaking plainly: "User began talking. Stop any audio playback
+# immediately to handle barge-in."
+#
+# The relay cannot do that itself — the audio it already forwarded is sitting in
+# the browser's Web Audio schedule, seconds of it, and a state change to
+# "listening" does not unschedule anything. So the browser is told explicitly,
+# and useVoiceAgent stops every scheduled source and resets its play cursor.
+# Without this the agent talks straight over the person interrupting it, which
+# is the single most conspicuous way a voice agent feels broken.
+# https://developers.deepgram.com/docs/voice-agent-message-flow
+CLEAR_AUDIO_EVENT = "voice.clear_audio"
+
+# ── Progress narration during a long tool call ────────────────────────────────
+# run_errand takes minutes: policy lookup, catalog search, one real browser quote
+# per merchant attempted. Deepgram's think model is blocked on our
+# FunctionCallResponse for that entire time, so the agent says NOTHING — the user
+# is left listening to silence wondering whether it crashed.
+#
+# InjectAgentMessage is the documented way to make the agent speak mid-turn:
+#   {"type":"InjectAgentMessage","message":"…","behavior":"default"|"queue"|"interrupt"}
+# `queue` appends after any queued content without cutting off the current turn,
+# which is what a progress note wants. If it arrives while the USER is mid-turn
+# the server ignores it and answers InjectionRefused — harmless, and handled.
+# https://developers.deepgram.com/docs/voice-agent-inject-agent-message
+#
+# Only these steps are narrated. Everything else in the audit stream is for the
+# screen, not the ear: reading twelve events aloud is worse than silence.
+NARRATED_STEPS: dict[str, str] = {
+    "context.loaded": "Got your spend policy. Finding what to buy now.",
+    "cart.merchant_unavailable": "That vendor doesn't have it. Trying the next one.",
+    "cart.merchant_discovered": "None of your approved vendors had it, so I found another.",
+    "cart.built": "Cart's ready. Pricing it up for your approval.",
+}
+
+# Floor between two spoken progress notes. A merchant ladder can emit several
+# `cart.merchant_unavailable` events in a few seconds; narrating each one turns a
+# helpful nudge into chatter.
+NARRATION_MIN_GAP_S = 12.0
+
 # Deepgram closes the socket at 1011 when it has received no Binary or Text
 # frame from us for 10s. That close is NET-0001 ("The service has not received a
 # Binary or Text frame from the client within the timeout window"); NET-0002 is a
@@ -137,10 +180,11 @@ SYSTEM_PROMPT = (
     "whenever the user wants something bought, ordered, or restocked. Pass the "
     "user's request verbatim as `intent`, and set `profile` to 'business' for "
     "work/office purchases or 'personal' for the user's own groceries/items. "
-    "The errand pauses for the user's spoken approval before any spend — when it "
-    "does, tell the user what will be charged and to whom, and wait for their "
-    "yes/no. Never invent an order confirmation; only report what the tool "
-    "returns.\n"
+    "The errand PAUSES for approval before any spend, and that approval happens "
+    "ON SCREEN with the user's passkey — a spoken 'yes' cannot authorise it and "
+    "you must never imply otherwise. When the errand pauses, say what will be "
+    "charged and to whom, then ask the user to confirm it on screen. Never invent "
+    "an order confirmation; only report what the tool returns.\n"
     "- web_search: look up current facts, prices, or product recommendations. "
     "Summarize the grounded answer naturally; do not read raw URLs aloud.\n"
     "Speak in short, natural sentences. Avoid lists and filler. Confirm intent "
@@ -313,6 +357,9 @@ class VoiceSession:
         # two hours run from its side of the socket, and starting ours later
         # would let the local backstop trail the real ceiling.
         self._started_at = time.monotonic()
+        # When we last made the agent speak a progress note, so a burst of audit
+        # events cannot turn into a burst of speech. See NARRATION_MIN_GAP_S.
+        self._last_narration_ts = 0.0
 
     # ── browser I/O (serialized) ─────────────────────────────────────────────
 
@@ -341,6 +388,37 @@ class VoiceSession:
             return
         async with self._dg_lock:
             await self._dg.send(json.dumps(payload))
+
+    async def _inject(self, message: str, *, behavior: str = "queue") -> bool:
+        """Have the agent speak `message` mid-turn (Deepgram InjectAgentMessage).
+
+        Returns whether it was sent, not whether it was spoken: the server may
+        still answer InjectionRefused if the user turns out to be mid-turn, which
+        is fine — a progress note is worth exactly nothing if it would talk over
+        the person it is for.
+        """
+        if self._dg is None or self._closed.is_set():
+            return False
+        try:
+            await self._to_deepgram_json(
+                {"type": "InjectAgentMessage", "message": message, "behavior": behavior}
+            )
+            return True
+        except Exception as e:  # noqa: BLE001 — narration must never break a run
+            logger.info("InjectAgentMessage failed (non-fatal): %r", e)
+            return False
+
+    async def _narrate(self, step: str) -> None:
+        """Speak a progress note for `step`, if it is one we narrate and we have
+        not just spoken one."""
+        line = NARRATED_STEPS.get(step)
+        if line is None:
+            return
+        now = time.monotonic()
+        if now - self._last_narration_ts < NARRATION_MIN_GAP_S:
+            return
+        self._last_narration_ts = now
+        await self._inject(line)
 
     async def _to_deepgram_audio(self, data: bytes) -> None:
         if self._dg is None:
@@ -540,6 +618,11 @@ class VoiceSession:
         if etype == "SettingsApplied":
             await self._to_browser({"type": "voice.state", "state": "listening"})
         elif etype == "UserStartedSpeaking":
+            # Deepgram: "Stop any audio playback immediately to handle barge-in."
+            # The state change alone does not do that — seconds of agent audio are
+            # already scheduled in the browser. Order matters: clear first, so the
+            # talking stops before the orb changes to match.
+            await self._to_browser({"type": CLEAR_AUDIO_EVENT})
             await self._to_browser({"type": "voice.state", "state": "listening"})
         elif etype == "AgentThinking":
             await self._to_browser({"type": "voice.state", "state": "thinking"})
@@ -564,6 +647,13 @@ class VoiceSession:
                 task = asyncio.create_task(self._run_tool(call))
                 self._tool_tasks.add(task)
                 task.add_done_callback(self._tool_tasks.discard)
+        elif etype == "InjectionRefused":
+            # We asked the agent to speak a progress note while the user was
+            # mid-turn. Declining is correct behaviour, not a fault: the note
+            # exists to reassure the user, and talking over them does the
+            # opposite. Nothing to surface.
+            # https://developers.deepgram.com/docs/voice-agent-inject-agent-message
+            logger.debug("progress narration refused (user was speaking)")
         elif etype == "Warning":
             # Deepgram's advance notice, carrying MAXIMUM_SESSION_LENGTH_APPROACHING
             # at 1h55m. Forwarded so a long conversation can be told it is about to
@@ -668,6 +758,11 @@ class VoiceSession:
             payload["type"] = ev.step
             payload["run_id"] = run_id
             await self._to_browser(payload)
+            # The screen gets every event; the ear gets the few that explain a
+            # long silence. Deepgram is blocked on our FunctionCallResponse for
+            # the whole errand, so without this the agent simply goes quiet for
+            # minutes.
+            await self._narrate(ev.step)
 
         # Approval gate: surface approval.request to the browser, then block on
         # the browser's {type:"approve", run_id, approved} control message.
@@ -679,6 +774,12 @@ class VoiceSession:
             await self._to_browser(
                 {"type": "approval.request", "run_id": run_id, **payload}
             )
+            # Say the number out loud and point at the gate. `interrupt` rather
+            # than `queue`: this is the one moment in the errand where being
+            # heard immediately matters more than conversational manners, and
+            # everything downstream is blocked on the user acting on it.
+            await self._inject(_approval_line(payload), behavior="interrupt")
+            self._last_narration_ts = time.monotonic()
             try:
                 decision = await asyncio.wait_for(fut, timeout=APPROVAL_TIMEOUT_S)
             except asyncio.TimeoutError:
@@ -723,6 +824,29 @@ class VoiceSession:
         outcome = {**outcome, "run_id": run_id}
         await self._to_browser({"type": "run.done", **outcome})
         return _summarize_outcome(outcome)
+
+
+def _approval_line(payload: dict) -> str:
+    """What the agent says when the spend gate opens.
+
+    Amount and merchant, then the on-screen instruction. It names the passkey
+    because a spoken "yes" genuinely cannot authorise this — the gate resolves on
+    a control message from the browser — and an agent that implies otherwise
+    leaves the user waiting for a purchase that will time out.
+    """
+    cart = payload.get("cart") or {}
+    total = cart.get("total_cents")
+    merchant = ""
+    checkout = cart.get("checkout") or {}
+    url = checkout.get("merchant_url") or ""
+    if url:
+        merchant = url.split("://")[-1].split("/")[0]
+    amount = f"${total / 100:.2f}" if isinstance(total, int) else "the cart total"
+    where = f" at {merchant}" if merchant else ""
+    return (
+        f"That comes to {amount}{where}. Approve it on screen with your passkey "
+        f"and I'll place the order."
+    )
 
 
 def _summarize_outcome(outcome: dict) -> str:

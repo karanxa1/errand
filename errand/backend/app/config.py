@@ -92,6 +92,38 @@ class Settings(BaseSettings):
     prava_ships_to: str = "US"
     use_prava_shop: bool = False
 
+    # ── What to do when the approved merchant does not stock the item ────────
+    # The policy's approved vendors are a LIST, and every one of them is tried
+    # before this setting matters at all. It governs only the last resort:
+    # widening the search to Prava's whole catalog and buying from a merchant
+    # the policy never named.
+    #
+    #   "off"      — never. An out-of-stock errand stops and says so.
+    #   "personal" — only on the personal profile (DEFAULT). A personal policy is
+    #                a set of preferences; a business one names approved vendors,
+    #                and "avoid non-approved vendors" is a rule we do not get to
+    #                overrule because a shelf was empty.
+    #   "always"   — both profiles. Reasonable if your business policy treats its
+    #                vendor list as a hint, but say so out loud before setting it.
+    #
+    # In every case the chosen merchant is named in the audit trail and shown on
+    # the approval screen before a cent moves — discovery widens what we can
+    # offer, never what we can spend without being asked.
+    merchant_discovery: str = "personal"
+
+    # Hard cap on merchants tried in one errand (approved + discovered). Each
+    # attempt on the wallet path spins a real browser for the quote (20-40s), so
+    # this bounds wall-clock as much as it bounds breadth.
+    max_merchant_attempts: int = 4
+
+    def discovery_allowed(self, profile: str) -> bool:
+        mode = self.merchant_discovery.strip().lower()
+        if mode == "always":
+            return True
+        if mode == "personal":
+            return profile == "personal"
+        return False
+
     @property
     def prava_shop_ready(self) -> bool:
         """True when the wallet shopper has an approved agent identity to use."""

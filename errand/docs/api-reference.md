@@ -249,6 +249,14 @@ backend WS, never to Deepgram directly.
 - Backend → browser (binary): agent TTS audio frames (linear16, 16kHz) to play.
 - Backend → browser (JSON events), superset of the SSE errand events plus voice events:
   - `voice.state` { state: "listening"|"thinking"|"speaking"|"idle" }
+  - `voice.clear_audio` {} — **barge-in.** Sent on Deepgram `UserStartedSpeaking`,
+    immediately BEFORE the `voice.state` change. The browser must stop every
+    scheduled TTS source and re-anchor its play cursor. Deepgram's message-flow
+    reference: *"User began talking. Stop any audio playback immediately to
+    handle barge-in."* A state change unschedules nothing — by the time this
+    arrives, seconds of agent speech are already queued in Web Audio, and
+    without the flush the agent talks over the user.
+    https://developers.deepgram.com/docs/voice-agent-message-flow
   - `voice.user_transcript` { text, is_final }
   - `voice.agent_transcript` { text }        (what the agent says)
   - `tool.call` { name, args }               (agent invoked a tool)
@@ -257,6 +265,19 @@ backend WS, never to Deepgram directly.
     approval.request, ... run.done) — emitted when the errand subagent tool runs,
     so the chat thread shows everything the voice agent is doing.
   - `websearch.result` { query, answer, sources:[{name,url,snippet}] }
+
+### Backend → Deepgram: InjectAgentMessage (progress narration)
+`{ "type":"InjectAgentMessage", "message":"…", "behavior":"default"|"queue"|"interrupt" }`
+- `default` — only during silence; refused if either party is mid-turn.
+- `queue` — appends after queued content without cutting the current turn.
+- `interrupt` — always allowed; the agent speaks immediately.
+- Refusal comes back as `{"type":"InjectionRefused"}` — expected, not an error.
+
+Used because the think model is blocked on our `FunctionCallResponse` for the
+whole errand, so a multi-minute `run_errand` is otherwise dead air. `queue` for
+the four narrated audit steps (throttled to one per 12s); `interrupt` for the
+spend gate, which is the one moment worth cutting in for.
+https://developers.deepgram.com/docs/voice-agent-inject-agent-message
 
 ### Deepgram think.functions (the voice agent's tools) — 2 tools
 1. `run_errand` — the CHAT/ERRAND AGENT AS A SUBAGENT. args: { intent:string,

@@ -166,6 +166,20 @@ class ShopperBroker(Protocol):
     ) -> OrderResult: ...
 
 
+class MerchantDiscovery(Protocol):
+    """Optional capability: find merchants that stock what was asked for.
+
+    Only a shopper with a real catalog behind it can implement this — the
+    storefront shopper has exactly one shop and the mock has none. The
+    orchestrator therefore probes for it with getattr rather than requiring it,
+    and simply has no last resort when a shopper does not offer one.
+    """
+
+    async def discover_merchants(
+        self, intent: str, context: PurchaseContext, limit: int
+    ) -> list["Merchant"]: ...
+
+
 class PaymentBroker(Protocol):
     async def create_session(self, data: CreateSessionInput) -> CreateSessionResult: ...
     async def poll_credential(self, session_id: str) -> PollCredentialResult: ...
