@@ -39,9 +39,12 @@ export interface RunStreamHandlers {
 export interface RunStreamOptions {
   profile: string;
   intent: string;
-  user_id: string;
-  user_email: string;
   model: string;
+  // Stable per-browser identity, forwarded to Prava when the card session opens.
+  // No user_id / user_email: the backend takes the spender's identity from the
+  // verified bearer token and does not read them off the body, so sending them
+  // only suggested the client got a say in who pays.
+  browser_profile_id?: string;
 }
 
 export interface RunStreamController {

@@ -109,13 +109,26 @@ _APPROVAL_POLL_INTERVAL_S = 1.0
 
 SYSTEM_PROMPT = (
     "You are Errand, a warm, concise assistant that chats naturally and can run "
-    "real purchasing errands. Answer general questions directly. When the user "
-    "wants something bought, ordered, or restocked, call the run_errand tool "
-    "with their request verbatim as `intent` and set `profile` ('business' for "
-    "work/office, 'personal' for the user's own items). The errand pauses for "
-    "the user's approval before any spend — after it returns, tell them the "
-    "result plainly; never invent an order. Use web_search for current facts, "
-    "prices, or product recommendations. Keep replies short and human."
+    "real purchasing errands.\n"
+    "ANSWER, DON'T INTERROGATE. When the user asks something, go and find out. "
+    "Reach for web_search whenever the answer depends on anything current — "
+    "prices, availability, specs, recommendations, news — rather than hedging or "
+    "asking them to narrow it down. If a request is slightly underspecified, "
+    "make the sensible assumption, say which assumption you made in one clause, "
+    "and answer. Ask a clarifying question ONLY when the readings genuinely lead "
+    "somewhere different and you cannot pick, or when money is about to move. "
+    "Never bounce a question back that you could have researched.\n"
+    "When the user wants something bought, ordered, or restocked, call the "
+    "run_errand tool with their request verbatim as `intent` and set `profile` "
+    "('business' for work/office, 'personal' for the user's own items). Don't "
+    "quiz them about budget or merchant first — the spend policy supplies both, "
+    "and the errand pauses for their approval before any money moves. After it "
+    "returns, tell them the result plainly; never invent an order.\n"
+    "SPEND IS THE EXCEPTION: before anything is charged the user sees the exact "
+    "amount and merchant and approves it on screen with a passkey. That gate is "
+    "never skipped or assumed. If an errand fails, say specifically what failed "
+    "and what would fix it — not just that it failed.\n"
+    "Keep replies short and human."
 )
 
 _TOOLS = [
@@ -170,6 +183,17 @@ class ChatRequest(BaseModel):
     # PATCH /api/conversations/{id} is for.
     profile: Literal["business", "personal"] = "business"
     model: Literal["sol", "terra", "luna"] = "sol"
+    # Stable per-BROWSER id, minted once client-side and persisted
+    # (lib/deviceProfile.ts). Unlike profile/model this is read on EVERY turn,
+    # not just the first: it describes the device this turn is being sent from,
+    # and that is a property of now, not of the conversation row.
+    #
+    # Safe to accept from the client because it identifies the device, not the
+    # spender — the buyer still comes from the bearer token. Forwarded to Prava
+    # so a repeat buyer reads as the same device; a fresh value each checkout
+    # forces another passkey registration and burns one of a hard-capped number
+    # of token bindings.
+    browser_profile_id: str | None = None
 
 
 class ApproveRequest(BaseModel):
@@ -439,6 +463,7 @@ async def chat(
                 intent=intent,
                 user_id=f"u_{user.id[:12]}",
                 user_email_fallback=user.email,
+                browser_profile_id=req.browser_profile_id,
                 emit=emit,
                 approve=approve_wrap,
                 cancel=cancel,
@@ -449,8 +474,13 @@ async def chat(
             # "the errand failed" tool result fed back to the model.
             raise
         except Exception as e:  # noqa: BLE001
-            await stream.emit_raw("run.error", {"run_id": run_id, "message": str(e)})
-            collected.append({"type": "run.error", "run_id": run_id, "message": str(e)})
+            # The provider CODE, not just the prose — see main.py for why.
+            err: dict = {"run_id": run_id, "message": str(e)}
+            code = getattr(e, "code", None)
+            if isinstance(code, str) and code:
+                err["code"] = code
+            await stream.emit_raw("run.error", err)
+            collected.append({"type": "run.error", **err})
             return f"The errand failed: {e}", collected
         outcome = {**outcome, "run_id": run_id}
         await stream.emit_raw("run.done", outcome)

@@ -79,6 +79,13 @@ class CreateSessionInput(BaseModel):
     # Our own reference for the order, echoed back on the session. Optional per
     # the API; useful for reconciling a Prava session against our run.
     external_order_ref: str | None = None
+    # Stable per-BROWSER identity, minted once client-side and persisted.
+    # A fresh value reads as a brand-new device to the card network, which forces
+    # another passkey registration and consumes one of a hard-capped number of
+    # device bindings on the token. Regenerating it per checkout is how a card
+    # reaches "Maximum binding for token exceeded" — permanently, for everyone
+    # sharing that card.
+    browser_profile_id: str | None = None
 
 
 class CreateSessionResult(BaseModel):

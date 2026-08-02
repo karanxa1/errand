@@ -44,6 +44,7 @@ def build_brokers() -> Brokers:
             user_country=settings.prava_user_country,
             merchant_category_code=settings.prava_merchant_category_code,
             merchant_category=settings.prava_merchant_category,
+            verify_merchant_dns=settings.prava_verify_merchant_dns,
         )
     )
     # Shopper. Three implementations, chosen most-real-first:

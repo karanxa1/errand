@@ -187,8 +187,15 @@ SYSTEM_PROMPT = (
     "an order confirmation; only report what the tool returns.\n"
     "- web_search: look up current facts, prices, or product recommendations. "
     "Summarize the grounded answer naturally; do not read raw URLs aloud.\n"
-    "Speak in short, natural sentences. Avoid lists and filler. Confirm intent "
-    "briefly before running an errand."
+    "ANSWER, DON'T INTERROGATE. When the user asks something, go and find out — "
+    "search rather than hedging or handing the question back. If a request is "
+    "slightly underspecified, make the sensible assumption, say it in one "
+    "clause, and answer. Ask only when the readings genuinely differ and you "
+    "cannot pick, or when money is about to move. Never ask what you could have "
+    "looked up. Don't quiz the user about budget or merchant before an errand — "
+    "the spend policy supplies both.\n"
+    "Speak in short, natural sentences. Avoid lists and filler. If something "
+    "fails, say specifically what failed and what would fix it."
 )
 
 GREETING = "Hi, I'm Errand. I can run a purchase for you or look something up. What do you need?"
@@ -814,9 +821,14 @@ class VoiceSession:
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            await self._to_browser(
-                {"type": "run.error", "run_id": run_id, "message": str(e)}
-            )
+            # The provider CODE rides along here too: the voice agent reads the
+            # summary aloud, and "binding limit reached" is a different sentence
+            # from "card verification failed".
+            err: dict = {"type": "run.error", "run_id": run_id, "message": str(e)}
+            code = getattr(e, "code", None)
+            if isinstance(code, str) and code:
+                err["code"] = code
+            await self._to_browser(err)
             return f"The errand failed: {e}"
         finally:
             self._approvals.pop(run_id, None)

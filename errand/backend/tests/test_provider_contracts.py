@@ -318,7 +318,7 @@ def test_create_session_keeps_the_ids_prava_returns() -> None:
         merchant=Merchant(name="Demo Pantry Co", url="https://demo-pantry.example.com"),
         total_cents=6300,
         user_id="u1",
-        user_email="a@b.test",
+        user_email="buyer@example.com",
         items=[CartItem(name="Beans", qty=2, price_cents=2100)],
         external_order_ref="errand-run-1",
     )
@@ -350,10 +350,10 @@ def test_create_session_omits_an_unusable_callback_url() -> None:
         lambda: asyncio.run(
             broker.create_session(
                 CreateSessionInput(
-                    merchant=Merchant(name="M", url="https://m.test"),
+                    merchant=Merchant(name="M", url="https://www.acme.com"),
                     total_cents=100,
                     user_id="u",
-                    user_email="a@b.test",
+                    user_email="buyer@example.com",
                     items=[CartItem(name="x", qty=1, price_cents=100)],
                 )
             )
@@ -382,10 +382,10 @@ def test_api_errors_carry_pravas_own_code_and_field_detail() -> None:
             lambda: asyncio.run(
                 broker.create_session(
                     CreateSessionInput(
-                        merchant=Merchant(name="M", url="https://m.test"),
+                        merchant=Merchant(name="M", url="https://www.acme.com"),
                         total_cents=100,
                         user_id="u",
-                        user_email="a@b.test",
+                        user_email="buyer@example.com",
                         items=[CartItem(name="x", qty=1, price_cents=100)],
                     )
                 )

@@ -558,32 +558,56 @@ export function useVoiceAgent(token?: string | null): VoiceAgentApi {
   );
 
   // Resolve the approval gate over the voice WS control channel.
+  //
+  // The deliverability check comes FIRST, before any state is mutated. It used
+  // to run after: the card was moved to "approving" and only then did we look at
+  // the socket, so a dropped relay left the UI claiming the spend was being
+  // authorised while the verdict had gone nowhere. A verdict that evaporates is
+  // the worst possible outcome here — the operator believes they approved, the
+  // run is still sitting on the gate, and it will time out with no explanation.
+  // Say plainly that it did not send, and leave the gate where it is so it can
+  // be answered again. (Same principle as the HTTP paths: the difference between
+  // "expired code", "binding limit reached", "card verification failed" and
+  // "device not supported" is the difference between a ten-second recovery and a
+  // support ticket — so never collapse any of them into silence.)
   const resolveApproval = useCallback((verdict: ApprovalResult) => {
     const runId = approvalRunIdRef.current;
     const ws = wsRef.current;
+
+    if (!ws || ws.readyState !== WebSocket.OPEN || !runId) {
+      setError(
+        !runId
+          ? "There is no approval waiting on this run — it may have already timed out."
+          : "The voice connection is closed, so the approval was not sent. Reconnect and approve again.",
+      );
+      return;
+    }
+
+    try {
+      ws.send(
+        JSON.stringify({
+          type: "approve",
+          run_id: runId,
+          approved: verdict.approved,
+          ...(verdict.reason ? { reason: verdict.reason } : {}),
+        }),
+      );
+    } catch {
+      setError("Approval failed to reach the voice relay. Try again.");
+      setState((s) => ({
+        ...s,
+        phase: "error",
+        errorMessage: "Approval failed to reach the voice relay.",
+      }));
+      return;
+    }
+
+    // Only once the verdict is genuinely on the wire does the card move.
     setState((s) => ({
       ...s,
       approvalResult: verdict,
       phase: verdict.approved ? "approving" : s.phase,
     }));
-    if (ws && ws.readyState === WebSocket.OPEN && runId) {
-      try {
-        ws.send(
-          JSON.stringify({
-            type: "approve",
-            run_id: runId,
-            approved: verdict.approved,
-            ...(verdict.reason ? { reason: verdict.reason } : {}),
-          }),
-        );
-      } catch {
-        setState((s) => ({
-          ...s,
-          phase: "error",
-          errorMessage: "Approval failed to reach the voice relay.",
-        }));
-      }
-    }
   }, []);
 
   useEffect(() => () => stop(), [stop]);

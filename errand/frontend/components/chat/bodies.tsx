@@ -6,7 +6,8 @@
    ToolCard already supplies the frame + status. This is the CartPanel/PlanPanel
    content reused inside tool cards, as the brief asks. */
 
-import { useState } from "react";
+import { memo, useState } from "react";
+import Markdown from "./Markdown";
 import type {
   CartResult,
   PurchaseContext,
@@ -370,14 +371,17 @@ function LinkGlyph() {
 }
 
 /* An agent spoken reply — a calm conversational bubble (left-aligned in the
-   thread), distinct from a tool card. */
-export function AgentBubble({ text }: { text: string }) {
+   thread), distinct from a tool card. The body is markdown, rendered
+   stream-safe (see components/chat/Markdown.tsx).
+   Memoized on `text`: ChatView re-renders on every streaming token, and only
+   the live bubble's text actually changes — committed ones must not re-parse. */
+export const AgentBubble = memo(function AgentBubble({ text }: { text: string }) {
   return (
     <div className={`${BUBBLE} ${BUBBLE_CALM}`}>
-      <p className={BUBBLE_TEXT}>{text}</p>
+      <Markdown text={text} />
     </div>
   );
-}
+});
 
 /* run.done / run.error closing bubble — the assistant's conversational close. */
 export function ClosingBubble({ state }: { state: RunState }) {

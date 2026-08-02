@@ -59,6 +59,48 @@ A `card_id` from here can be passed as `card.card_id` on a new session to skip c
 `callback_url` (**HTTPS only**, ≤2048), `card: { card_id | vault_ref_id }`,
 `merchant_details.category_code` (MCC, ≤10), `merchant_details.category` (≤100).
 
+### Two fields Visa sees — validated before we send (app/prava/validate.py)
+Both are forwarded to the card network, and both fail LATER and ELSEWHERE:
+
+| Field | Rule | Symptom when wrong |
+|---|---|---|
+| `user_email` | No reserved TLD (`.local .test .example .demo .invalid .localhost .internal .devices`). `example.com` is FINE — `.com` is real; `x.example` is not. | Card adds, OTP arrives, OTP accepted — then fails at the **last** step, `PASSKEY_REG_FAILED`, generic error. |
+| `merchant_details.url` | Bare **https origin**, real delegated TLD, **no path, no port**. | Generic `400` at authentication, before any charge, on **100%** of that merchant's checkouts. |
+
+The path is **dropped, not rejected** — the shopper legitimately needs a deep
+link to navigate to (the demo storefront's URL ends `/store/index.html`); the
+network wants the merchant's identity, not the page. Scheme typos
+(`htttps://`), a missing scheme, and `http://` are hard errors.
+
+`PRAVA_VERIFY_MERCHANT_DNS=true` adds a resolvability check. The reserved list is
+enforced always and offline; only DNS can know that `.nep` is invented or that
+`demo-pantry.example.com` was never delegated. Fails closed.
+
+`user_email` is the **human's registered address**, not the agent's AgentMail
+inbox. Those are different jobs: the inbox catches the merchant's order
+confirmation; `user_email` is the customer identity used for passkey
+registration. Sending the inbox registered a passkey against an address the
+person does not own.
+
+### `browser_profile_id` — stable per browser, NEVER per checkout
+Minted once client-side (`lib/deviceProfile.ts`, localStorage `prava_bpid`) and
+reused forever. A fresh id reads as a brand-new device: another passkey
+registration, and one of a hard-capped number of token bindings burned. That is
+how a card reaches `Maximum binding for token exceeded` — permanently, for
+everyone sharing it. Deleting and re-adding the card does not reset it.
+
+> **UNVERIFIED:** sandbox accepts `browser_profile_id` on `POST /v1/sessions` —
+> but it also accepts an invented `device_id`, so acceptance only proves unknown
+> keys are ignored. Whether Prava *consumes* this field name needs confirming
+> with them. Sent regardless: omitting it guarantees no benefit.
+
+### Retries
+Only a stale quote (`SHOP_SESSION_EXPIRED`) is retried, once, and only after the
+re-quoted total is checked against the approved one. Everything else is
+deterministic — see `NEVER_RETRY_CODES` in `app/brokers/prava_shop.py`. Unknown
+codes are treated as non-retryable: an honest error costs less than a duplicate
+charge or a wallet filling with unusable cards.
+
 ### Error envelope
 `{ "error": { "code", "message", "details": { "fieldErrors": { … } } } }`.
 Codes seen: `AUTH_1001` (invalid API key), `AUTH_1002` (missing/invalid header),

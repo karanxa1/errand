@@ -87,10 +87,14 @@ class _NoCatalogShopper(_Shopper):
 class _Payment:
     def __init__(self) -> None:
         self.scoped_to: str | None = None
+        self.browser_profile_id: str | None = None
+        self.customer_email: str | None = None
 
     async def create_session(self, data) -> CreateSessionResult:
         self.scoped_to = data.merchant.url
-        return CreateSessionResult(session_id="ses_1", iframe_url="https://collect.test")
+        self.browser_profile_id = data.browser_profile_id
+        self.customer_email = data.user_email
+        return CreateSessionResult(session_id="ses_1", iframe_url="https://collect.example.com")
 
     async def poll_credential(self, session_id: str):
         return PollCompleted(
@@ -109,7 +113,7 @@ class _Payment:
 
 class _Mail:
     async def ensure_inbox(self) -> str:
-        return "agent@inbox.test"
+        return "agent-inbox@agentmail.to"
 
     async def wait_for_confirmation(self, merchant, since_iso, timeout_ms) -> OrderConfirmation:
         return OrderConfirmation(matched=False)
@@ -135,7 +139,7 @@ class _Context:
         )
 
 
-def _run(shopper, context, *, profile="business", discovery="personal"):
+def _run(shopper, context, *, profile="business", discovery="personal", bpid=None):
     """Run one errand to completion, returning (result, events, payment)."""
     payment = _Payment()
     brokers = Brokers(context=context, shopper=shopper, payment=payment, mail=_Mail())
@@ -156,7 +160,8 @@ def _run(shopper, context, *, profile="business", discovery="personal"):
                 profile=profile,
                 intent="buy dark roast coffee",
                 user_id="u1",
-                user_email_fallback="u@test",
+                user_email_fallback="buyer@example.com",
+                browser_profile_id=bpid,
                 emit=emit,
                 approve=approve,
             )
@@ -278,6 +283,33 @@ def test_a_cart_parked_at_the_wrong_merchant_is_refused_before_any_card() -> Non
     assert result["kind"] == "aborted"
     assert "cart.merchant_mismatch" in _steps(events)
     assert payment.scoped_to is None  # refused before minting anything
+
+
+def test_the_browser_profile_id_reaches_the_payment_session() -> None:
+    """The whole point of persisting it client-side is that it arrives here.
+
+    It crosses four boundaries — HTTP request model, run_errand,
+    CreateSessionInput, the Prava body — and a break at any one of them is
+    silent: pydantic ignores unknown fields, so the value is simply dropped and
+    every checkout goes back to looking like a brand-new device.
+    """
+    shopper = _Shopper({"first.test": 1000})
+    _, _, payment = _run(shopper, _Context(["first.test"]), bpid="bp_persisted_42")
+    assert payment.browser_profile_id == "bp_persisted_42"
+
+
+def test_prava_gets_the_humans_email_not_the_agent_mailbox() -> None:
+    """Two different jobs that were conflated.
+
+    The agent inbox catches the MERCHANT's order confirmation. Prava's
+    `user_email` is the CUSTOMER identity, forwarded to the card network for
+    passkey registration. Sending the inbox registered a person's passkey
+    against an address they do not own and cannot read.
+    """
+    shopper = _Shopper({"first.test": 1000})
+    _, _, payment = _run(shopper, _Context(["first.test"]))
+    assert payment.customer_email == "buyer@example.com"
+    assert "agentmail" not in (payment.customer_email or "")
 
 
 if __name__ == "__main__":

@@ -197,6 +197,12 @@ async def run_errand(
     emit: Emit,
     approve: ApprovalFn,
     cancel: asyncio.Event | None = None,
+    # Stable per-browser identity from the client. Forwarded to Prava so a repeat
+    # buyer reads as the SAME device: a fresh id each checkout forces another
+    # passkey registration and burns one of a hard-capped number of token
+    # bindings, which is how a card ends up permanently at "Maximum binding for
+    # token exceeded".
+    browser_profile_id: str | None = None,
     max_steps: int = DEFAULT_MAX_STEPS,
     credential_wait_s: float = DEFAULT_CREDENTIAL_WAIT_S,
 ) -> dict:
@@ -294,8 +300,19 @@ async def run_errand(
                 merchant=merchant,
                 total_cents=cart.total_cents,
                 user_id=user_id,
-                user_email=address or user_email_fallback,
+                # The HUMAN'S registered address, not the agent's inbox.
+                #
+                # These are two different jobs and were conflated. The agent
+                # inbox exists so the mail broker can catch the MERCHANT'S order
+                # confirmation. Prava's `user_email` is the CUSTOMER identity: it
+                # is forwarded to the card network during passkey registration
+                # and is where a verification code goes. Sending the agent's
+                # mailbox registered the person's passkey against an address
+                # they do not own and cannot read — and if the OTP ever routes
+                # there, the human simply never receives it.
+                user_email=user_email_fallback or address,
                 items=cart.items,
+                browser_profile_id=browser_profile_id,
             )
         )
         await rec("payment.session", f"Prava session {session.session_id}", session.model_dump())

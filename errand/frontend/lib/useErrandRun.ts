@@ -12,6 +12,8 @@
 
 import { useCallback, useRef, useState } from "react";
 import { api } from "./config";
+import { getBrowserProfileId } from "./deviceProfile";
+import { approvalFailure } from "./approvalError";
 import { startErrandStream, type RunStreamController } from "./stream";
 import {
   applyFrame,
@@ -25,12 +27,14 @@ import type { ApprovalResult } from "./types";
 // working unchanged.
 export type { RunPhase, ConnectionStatus, RunState } from "./errandReducer";
 
+// No userId/userEmail here on purpose. /api/errand/stream derives both from the
+// verified bearer token (app/main.py ErrandRequest carries neither field) —
+// precisely so a caller cannot attribute a purchase to someone else. Sending
+// them was dead weight that read as if the client chose who was spending.
 interface StartArgs {
   profile: string;
   intent: string;
   model: string;
-  userId?: string;
-  userEmail?: string;
 }
 
 export function useErrandRun() {
@@ -47,7 +51,7 @@ export function useErrandRun() {
   }, []);
 
   const start = useCallback((args: StartArgs) => {
-    const { profile, intent, model, userId, userEmail } = args;
+    const { profile, intent, model } = args;
     lastArgs.current = args;
     ctrl.current?.abort();
     setState({ ...initialRunState, phase: "starting", connection: "connecting" });
@@ -58,8 +62,10 @@ export function useErrandRun() {
         profile,
         intent,
         model,
-        user_id: userId || "u_demo",
-        user_email: userEmail || "operator@example.com",
+        // Forwarded by the backend to Prava when it opens the card session. It
+        // must be the SAME value on every checkout from this browser: a new one
+        // reads as a new device and burns a device binding off the token.
+        browser_profile_id: getBrowserProfileId(),
       },
       {
         onFrame: (frame) => {
@@ -141,7 +147,7 @@ export function useErrandRun() {
         phase: verdict.approved ? "approving" : s.phase,
       }));
       try {
-        await fetch(api(`/api/errand/${runId}/approve`), {
+        const res = await fetch(api(`/api/errand/${runId}/approve`), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -149,6 +155,17 @@ export function useErrandRun() {
             ...(verdict.reason ? { reason: verdict.reason } : {}),
           }),
         });
+        // The verdict reaching the backend and the backend ACCEPTING it are two
+        // different things, and this used to ignore the second. "Expired code",
+        // "binding limit reached", "card verification failed" and "device not
+        // supported" all arrive here as distinct answers; collapsing them into a
+        // generic failure (or into nothing at all, while the UI sits on
+        // "approving") turns a ten-second recovery into a support ticket. So
+        // surface exactly what the backend said.
+        const failure = await approvalFailure(res);
+        if (failure) {
+          setState((s) => ({ ...s, phase: "error", errorMessage: failure }));
+        }
       } catch (err) {
         setState((s) => ({
           ...s,

@@ -242,6 +242,11 @@ class ErrandRequest(BaseModel):
     profile: str = "business"
     intent: str = "Restock the office pantry, under $200, approved brands only."
     model: str = "sol"
+    # Stable per-browser id, minted and persisted by the client (localStorage).
+    # UNLIKE user_id/user_email this one legitimately comes from the browser:
+    # it identifies the DEVICE, not the spender, and the server has no way to
+    # know it. It cannot be used to attribute a purchase to anyone.
+    browser_profile_id: str | None = None
     # NOTE: user_id / user_email are deliberately NOT accepted from the client.
     # This endpoint spends real money, so the spender's identity is taken from
     # the bearer token, not from the request body — otherwise a caller could
@@ -293,6 +298,7 @@ async def errand_stream(
                 intent=req.intent,
                 user_id=user_id,
                 user_email_fallback=user_email,
+                browser_profile_id=req.browser_profile_id,
                 emit=stream.emit,
                 approve=approve,
                 cancel=cancel,
@@ -303,7 +309,17 @@ async def errand_stream(
             await stream.emit_raw("run.error", {"message": "run cancelled"})
             raise
         except Exception as e:  # surface errors as a stream event, never 500 mid-stream
-            await stream.emit_raw("run.error", {"message": str(e)})
+            # Carry the provider's own CODE alongside the message. "expired
+            # code", "binding limit reached", "card verification failed" and
+            # "device not supported" all collapse to "Payment failed" without
+            # it — and that is the difference between a user who recovers in ten
+            # seconds and a support ticket. PravaApiError/WalletError expose
+            # `.code`; anything else simply has none to give.
+            payload: dict = {"message": str(e)}
+            code = getattr(e, "code", None)
+            if isinstance(code, str) and code:
+                payload["code"] = code
+            await stream.emit_raw("run.error", payload)
         finally:
             await stream.close()
 

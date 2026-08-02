@@ -88,13 +88,32 @@ def test_approve_rejects_an_anonymous_caller() -> None:
     run_async(scenario())
 
 
+# Fields the request model is ALLOWED to carry. An exact-set assertion, not a
+# subset one: the point is that adding a field to a spend endpoint has to be a
+# deliberate act that fails this test first and makes someone justify it.
+#
+# `browser_profile_id` was justified as follows. It identifies the DEVICE, not
+# the spender: it is a random opaque id the browser mints once and persists, and
+# the server cannot derive it. Forwarded to Prava, it is what stops every
+# checkout looking like a brand-new device — which would force a fresh passkey
+# registration each time and burn one of a hard-capped number of token bindings
+# until the card is permanently unusable. Crucially, it is not a capability:
+# nothing is authorised by it, and supplying someone else's value attributes no
+# purchase to them, because the spender still comes from the bearer token.
+_ALLOWED_REQUEST_FIELDS = {"profile", "intent", "model", "browser_profile_id"}
+
+
 def test_errand_request_has_no_identity_fields() -> None:
     """The spender is whoever the token says, so the model must not even carry
     somewhere for a caller-supplied identity to land."""
     fields = set(ErrandRequest.model_fields)
-    assert fields == {"profile", "intent", "model"}, fields
+    assert fields == _ALLOWED_REQUEST_FIELDS, fields
     assert "user_id" not in fields
     assert "user_email" not in fields
+    # The device id must never become a way to say WHO is spending.
+    assert not any(
+        f in fields for f in ("user", "email", "customer_id", "account_id", "sub")
+    ), fields
 
 
 def test_errand_request_drops_identity_smuggled_in_the_body() -> None:

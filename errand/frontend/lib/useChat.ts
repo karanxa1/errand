@@ -32,6 +32,8 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "./config";
+import { approvalFailure } from "./approvalError";
+import { getBrowserProfileId } from "./deviceProfile";
 import {
   applyFrame,
   initialRunState,
@@ -354,6 +356,11 @@ export function useChat({
             // Read server-side only when this turn creates the conversation.
             ...(opts?.profile ? { profile: opts.profile } : {}),
             ...(opts?.model ? { model: opts.model } : {}),
+            // A turn can reach checkout, so it carries the browser's identity:
+            // the backend forwards it to Prava when the card session opens. The
+            // value must be stable per browser — a fresh one reads as a new
+            // device and burns a device binding off the token.
+            browser_profile_id: getBrowserProfileId(),
           }),
           signal: ctrl.signal,
         });
@@ -440,7 +447,7 @@ export function useChat({
     }));
 
     try {
-      await fetch(api(`/api/conversations/${id}/approve`), {
+      const res = await fetch(api(`/api/conversations/${id}/approve`), {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -452,12 +459,21 @@ export function useChat({
           ...(verdict.reason ? { reason: verdict.reason } : {}),
         }),
       });
+      // Reaching the backend is not the same as being accepted by it, and this
+      // used to check only the former. "Expired code", "binding limit reached",
+      // "card verification failed" and "device not supported" are four different
+      // problems with four different fixes; reporting them as one generic
+      // failure — or as none, leaving the card stuck on "approving" — is the
+      // difference between a ten-second recovery and a support ticket.
+      const failure = await approvalFailure(res);
+      if (failure) {
+        setError(failure);
+        setLiveRun((s) => ({ ...s, phase: "error", errorMessage: failure }));
+      }
     } catch (err) {
-      setLiveRun((s) => ({
-        ...s,
-        phase: "error",
-        errorMessage: `Approval failed to reach backend: ${(err as Error).message}`,
-      }));
+      const message = `Approval failed to reach backend: ${(err as Error).message}`;
+      setError(message);
+      setLiveRun((s) => ({ ...s, phase: "error", errorMessage: message }));
     }
   }, []);
 

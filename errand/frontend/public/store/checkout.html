@@ -16,6 +16,13 @@
   then waits for  #confirmation.show  and reads  data-order-id  (falling back to
   an ORD-\d+ match in the confirmation text).
 
+  That list is exhaustive, which constrains every field added later: #place-order
+  is gated on the whole form being valid, so any field the shopper does NOT type
+  into has to be valid the moment the page paints, or the click waits for a
+  button that never enables and the errand dies on a ten-second timeout with
+  nothing on screen to explain it. #cardholder-name ships pre-filled for exactly
+  that reason.
+
   The amount comes from ?total_cents= because the shopper opens this URL in a
   FRESH browser context with no shared storage — see _checkout_url_for. A missing
   or malformed value renders $0.00 rather than inventing a total.
@@ -55,19 +62,28 @@
   }
   #order-total { font-size: 26px; font-weight: 700; font-variant-numeric: tabular-nums; }
   form { margin-top: 22px; display: grid; gap: 14px; }
-  label { display: grid; gap: 6px; font-size: 13px; color: var(--muted); }
+  /* The input sits beside its label rather than inside it: the per-field error
+     lives in this wrapper, and an error nested in a <label> would be read out
+     as part of the input's accessible NAME instead of its description. */
+  .field { display: grid; gap: 6px; }
+  label { font-size: 13px; color: var(--muted); }
   input {
     font: inherit; color: var(--text); background: #0e1512;
     border: 1px solid var(--line); border-radius: 9px; padding: 10px 12px;
+    width: 100%;
   }
   input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
-  .row { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; }
+  input[aria-invalid="true"] { border-color: #ff9c8f; }
+  .row { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; align-items: start; }
   button {
     font: inherit; font-weight: 600; cursor: pointer; margin-top: 4px;
     background: var(--accent); color: var(--accent-ink);
     border: 0; border-radius: 9px; padding: 12px 14px;
   }
   button:hover { background: #7ff5c7; }
+  button:disabled, button:disabled:hover {
+    background: #1b2a23; color: var(--muted); cursor: not-allowed;
+  }
   #confirmation {
     display: none; margin-top: 22px; border: 1px solid var(--line);
     border-radius: 12px; padding: 16px; background: var(--panel);
@@ -77,6 +93,14 @@
   #confirmation.show { display: block; }
   #confirmation h2 { font-size: 16px; margin: 0 0 6px; }
   .err { color: #ff9c8f; font-size: 13px; min-height: 18px; }
+  /* Per-field messages collapse to nothing when empty, so a clean form reserves
+     no gaps and a field that grows a message pushes only its own column. The
+     shared #form-error keeps its min-height instead, because it sits directly
+     above the button and a button that jumps under the cursor is worse. */
+  .field-err, .field-warn { font-size: 12px; line-height: 1.4; }
+  .field-err { color: #ff9c8f; }
+  .field-warn { color: #f2d08a; }
+  .field-err:empty, .field-warn:empty { display: none; }
 </style>
 </head>
 <body>
@@ -94,23 +118,71 @@
     <span id="order-total" data-total-cents="0">$0.00</span>
   </div>
 
+  <p class="demo">
+    Pay with the <strong>single-use token and dynamic CVV</strong> issued for
+    this one order, not a personal card. Nothing here is guessable, and nothing
+    below is an example to copy: an invented card-shaped number is refused by
+    the network, not by this page.
+  </p>
+
+  <!--
+    `novalidate` stays, deliberately. The rules in script are stricter than
+    anything the native constraints can express — a combined month+year past
+    check, and a Luhn result that WARNS rather than blocks — and they are what
+    gates #place-order. Letting the browser also refuse the submit would put two
+    validators with two different verdicts on one form, and native bubbles are
+    the half the automated shopper cannot see, dismiss, or report. One
+    validator, in script, where both the human and the agent hit the same rules.
+  -->
   <form id="checkout-form" novalidate>
-    <label for="card-number">Card number
-      <input id="card-number" name="card-number" inputmode="numeric" autocomplete="off" placeholder="4622 9431 2313 7789" />
-    </label>
-    <div class="row">
-      <label for="expiry-month">Exp. month
-        <input id="expiry-month" name="expiry-month" inputmode="numeric" autocomplete="off" placeholder="12" />
-      </label>
-      <label for="expiry-year">Exp. year
-        <input id="expiry-year" name="expiry-year" inputmode="numeric" autocomplete="off" placeholder="2027" />
-      </label>
-      <label for="cvv">CVV
-        <input id="cvv" name="cvv" inputmode="numeric" autocomplete="off" placeholder="757" />
-      </label>
+    <!--
+      The shopper fills #card-number, #expiry-month, #expiry-year and #cvv and
+      NOTHING else, so this field must already hold a value that passes its own
+      rule. Left blank it would keep the form invalid, keep #place-order
+      disabled, and turn every automated checkout into a click timeout. The
+      default is a genuine name that clears the same check a human's entry has
+      to; a human simply types over it.
+    -->
+    <div class="field">
+      <label for="cardholder-name">Cardholder name</label>
+      <input id="cardholder-name" name="cardholder-name" type="text" autocomplete="off"
+             required value="Errand Agent" placeholder="Name as printed on the card"
+             aria-describedby="cardholder-name-error" />
+      <span class="field-err" id="cardholder-name-error" aria-live="polite"></span>
     </div>
+    <div class="field">
+      <label for="card-number">Card number</label>
+      <input id="card-number" name="card-number" inputmode="numeric" autocomplete="off"
+             required placeholder="Card or network token"
+             aria-describedby="card-number-error card-number-warning" />
+      <span class="field-err" id="card-number-error" aria-live="polite"></span>
+      <span class="field-warn" id="card-number-warning" aria-live="polite"></span>
+    </div>
+    <div class="row">
+      <div class="field">
+        <label for="expiry-month">Exp. month</label>
+        <input id="expiry-month" name="expiry-month" inputmode="numeric" autocomplete="off"
+               required placeholder="Month" aria-describedby="expiry-month-error" />
+        <span class="field-err" id="expiry-month-error" aria-live="polite"></span>
+      </div>
+      <div class="field">
+        <label for="expiry-year">Exp. year</label>
+        <input id="expiry-year" name="expiry-year" inputmode="numeric" autocomplete="off"
+               required placeholder="Year" aria-describedby="expiry-year-error" />
+        <span class="field-err" id="expiry-year-error" aria-live="polite"></span>
+      </div>
+      <div class="field">
+        <label for="cvv">CVV</label>
+        <input id="cvv" name="cvv" inputmode="numeric" autocomplete="off"
+               required placeholder="Code" aria-describedby="cvv-error" />
+        <span class="field-err" id="cvv-error" aria-live="polite"></span>
+      </div>
+    </div>
+    <!-- Kept, and kept meaning what it says: form-LEVEL problems only. Field
+         problems belong to the field that caused them, or the last one written
+         wins and the visitor is told about one error at a time. -->
     <p class="err" id="form-error" role="alert"></p>
-    <button id="place-order" type="submit">Place order</button>
+    <button id="place-order" type="submit" disabled>Place order</button>
   </form>
 
   <section id="confirmation" data-order-id="" aria-live="polite">
@@ -147,40 +219,185 @@
 
   var form = document.getElementById("checkout-form");
   var errEl = document.getElementById("form-error");
+  var placeOrder = document.getElementById("place-order");
+
+  var FIELD_IDS = [
+    "cardholder-name", "card-number", "expiry-month", "expiry-year", "cvv"
+  ];
+
+  function el(id) {
+    return document.getElementById(id);
+  }
+  function digits(id) {
+    return (el(id).value || "").replace(/\D+/g, "");
+  }
+  function countKeys(obj) {
+    var n = 0;
+    for (var key in obj) {
+      if (Object.prototype.hasOwnProperty.call(obj, key)) { n++; }
+    }
+    return n;
+  }
+
+  // Letters, spaces, hyphens and apostrophes; the accented range is in because
+  // plenty of real cardholders have one and no network minds. A DIGIT does get
+  // the authorization rejected, and rejected with an empty reason string, so it
+  // has to be caught here — otherwise the visitor sees a blank decline and no
+  // way to work out that their name was the problem.
+  var NAME_RE = /^[A-Za-zÀ-ɏ][A-Za-zÀ-ɏ '\-]*$/;
+
+  // Luhn checksum, used as a WARNING and never as a block. The credential this
+  // page exists to take is a Prava single-use network token, which is not
+  // required to carry a valid Luhn digit; refusing one would lock the agent out
+  // of the only payment path there is. But a mistyped real card fails Luhn too,
+  // and saying so before the network declines it costs nothing.
+  function luhnOk(pan) {
+    var sum = 0;
+    var double = false;
+    for (var i = pan.length - 1; i >= 0; i--) {
+      var d = pan.charCodeAt(i) - 48;
+      if (double) {
+        d *= 2;
+        if (d > 9) { d -= 9; }
+      }
+      sum += d;
+      double = !double;
+    }
+    return sum % 10 === 0;
+  }
+
+  // "27" and "2027" have to mean the same date. Two-digit years resolve into
+  // the CURRENT century rather than a hard-coded 2000, so this page does not
+  // quietly start reading "05" as 1905 once the century turns.
+  function expandYear(year, now) {
+    if (year.length !== 2) { return Number(year); }
+    return Math.floor(now.getFullYear() / 100) * 100 + Number(year);
+  }
+
+  // A card is good THROUGH the last day of its expiry month, so the current
+  // month is not yet past.
+  function isPastExpiry(month, year, now) {
+    var y = expandYear(year, now);
+    return y < now.getFullYear() ||
+      (y === now.getFullYear() && Number(month) < now.getMonth() + 1);
+  }
+
+  // Shape-only validation, one rule set, evaluated twice: once to gate the
+  // button and once to back-stop the submit. A second copy of these rules is
+  // exactly how a button that looks clickable and a submit that refuses start
+  // disagreeing with each other.
+  //
+  // This is a demo surface: it must refuse an empty or obviously malformed card
+  // so a silent success can never be mistaken for a real authorization, but it
+  // deliberately does NOT judge the card's legitimacy — Prava owns that.
+  function validate() {
+    var now = new Date();
+    var errors = {};
+    var warnings = {};
+
+    var name = (el("cardholder-name").value || "").trim();
+    if (!name) {
+      errors["cardholder-name"] = "Enter the cardholder name.";
+    } else if (!NAME_RE.test(name)) {
+      errors["cardholder-name"] = "Letters, spaces, hyphens and apostrophes only.";
+    }
+
+    var pan = digits("card-number");
+    if (pan.length < 12 || pan.length > 19) {
+      errors["card-number"] = "Enter the full card number.";
+    } else if (!luhnOk(pan)) {
+      warnings["card-number"] =
+        "This doesn't look like a normal card number. Expected for a network " +
+        "token — worth re-reading if you typed a card.";
+    }
+
+    var month = digits("expiry-month");
+    var year = digits("expiry-year");
+    if (month.length < 1 || month.length > 2 || Number(month) < 1 || Number(month) > 12) {
+      errors["expiry-month"] = "Month must be 1-12.";
+    }
+    if (year.length !== 2 && year.length !== 4) {
+      errors["expiry-year"] = "Year must be YY or YYYY.";
+    }
+    // Only worth asking once both halves parse. The answer is reported against
+    // the year, since that is the half that goes stale.
+    if (!errors["expiry-month"] && !errors["expiry-year"] &&
+        isPastExpiry(month, year, now)) {
+      errors["expiry-year"] = "That expiry has already passed.";
+    }
+
+    var cvv = digits("cvv");
+    if (cvv.length < 3 || cvv.length > 4) {
+      errors["cvv"] = "CVV must be 3-4 digits.";
+    }
+
+    return { errors: errors, warnings: warnings, pan: pan, name: name };
+  }
+
+  // Messages surface only for fields the visitor has actually reached, or for
+  // every field once they have tried to submit. The BUTTON is gated from the
+  // first paint regardless: an unfillable form should not offer a click, but it
+  // should not open by shouting about inputs nobody has touched yet either.
+  var touched = {};
+
+  function refresh(revealAll) {
+    var state = validate();
+    for (var i = 0; i < FIELD_IDS.length; i++) {
+      var id = FIELD_IDS[i];
+      if (revealAll) { touched[id] = true; }
+      var visible = touched[id] === true;
+      var input = el(id);
+      var message = visible ? (state.errors[id] || "") : "";
+
+      el(id + "-error").textContent = message;
+      // aria-invalid tracks BLOCKING errors only. A Luhn warning is not a
+      // failure state and must not be announced as one.
+      if (message) {
+        input.setAttribute("aria-invalid", "true");
+      } else {
+        input.removeAttribute("aria-invalid");
+      }
+
+      var warnEl = el(id + "-warning");
+      if (warnEl) {
+        warnEl.textContent = visible ? (state.warnings[id] || "") : "";
+      }
+    }
+    placeOrder.disabled = countKeys(state.errors) > 0;
+    return state;
+  }
+
+  FIELD_IDS.forEach(function (id) {
+    // Playwright's fill() dispatches a real `input` event, so the automated
+    // path re-validates and un-gates the button on exactly the same path a
+    // human typing does. Nothing about the gate is agent-specific.
+    el(id).addEventListener("input", function () {
+      touched[id] = true;
+      refresh(false);
+    });
+    el(id).addEventListener("blur", function () {
+      touched[id] = true;
+      refresh(false);
+    });
+  });
+
+  refresh(false);
 
   form.addEventListener("submit", function (event) {
     event.preventDefault();
 
-    var digits = function (id) {
-      return (document.getElementById(id).value || "").replace(/\D+/g, "");
-    };
-    var pan = digits("card-number");
-    var month = digits("expiry-month");
-    var year = digits("expiry-year");
-    var cvv = digits("cvv");
-
-    // Shape-only validation. This is a demo surface: it must refuse an empty or
-    // obviously malformed card so a silent success can never be mistaken for a
-    // real authorization, but it deliberately does NOT judge the card's
-    // legitimacy — Prava owns that.
-    if (pan.length < 12 || pan.length > 19) {
-      errEl.textContent = "Enter the full card number.";
-      return;
-    }
-    if (month.length < 1 || month.length > 2 || Number(month) < 1 || Number(month) > 12) {
-      errEl.textContent = "Expiry month must be 1-12.";
-      return;
-    }
-    if (year.length !== 2 && year.length !== 4) {
-      errEl.textContent = "Expiry year must be YY or YYYY.";
-      return;
-    }
-    if (cvv.length < 3 || cvv.length > 4) {
-      errEl.textContent = "CVV must be 3-4 digits.";
+    // Defence in depth. The disabled button is an affordance, not a guarantee —
+    // an extension, an autofill, or anything that re-enables it out from under
+    // us can still land a submit here, and a checkout that renders a
+    // confirmation for a malformed card is lying about what happened.
+    var state = refresh(true);
+    if (countKeys(state.errors) > 0) {
+      errEl.textContent = "Fix the highlighted fields before placing the order.";
       return;
     }
     errEl.textContent = "";
 
+    var pan = state.pan;
     var orderId = newOrderId();
     var confirmation = document.getElementById("confirmation");
     // Set the id BEFORE revealing the panel: the shopper waits on
@@ -190,6 +407,7 @@
     document.getElementById("confirmation-copy").textContent =
       "Order " + orderId + " placed for " + money(TOTAL_CENTS) +
       " at Northwind Provisions. Card ending " + pan.slice(-4) +
+      " for " + state.name +
       ". Demonstration only — nothing was charged and nothing ships.";
     confirmation.classList.add("show");
   });

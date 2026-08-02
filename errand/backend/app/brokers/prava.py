@@ -23,6 +23,12 @@ from typing import Any
 
 import httpx
 
+from app.prava.validate import (
+    PravaValidationError,  # noqa: F401  (re-exported for callers catching it)
+    assert_resolvable,
+    merchant_origin,
+    validate_customer_email,
+)
 from app.contracts import (
     CreateSessionInput,
     CreateSessionResult,
@@ -94,6 +100,7 @@ class PravaPaymentBroker:
         user_country: str = "US",
         merchant_category_code: str = "",
         merchant_category: str = "",
+        verify_merchant_dns: bool = False,
     ) -> None:
         if not secret_key.startswith("sk_"):
             raise ValueError("Prava secret key must start with sk_")
@@ -103,6 +110,7 @@ class PravaPaymentBroker:
         self._user_country = user_country
         self._category_code = merchant_category_code
         self._category = merchant_category
+        self._verify_merchant_dns = verify_merchant_dns
         # Session ids this broker has read back a 200 for. Read by the 404 branch
         # in poll_credential to tell a misconfiguration apart from a blip.
         # Bounded by construction: build_brokers() makes a fresh broker per run
@@ -116,9 +124,23 @@ class PravaPaymentBroker:
         }
 
     async def create_session(self, data: CreateSessionInput) -> CreateSessionResult:
+        # Both of these are forwarded to the card network, and both fail LATER
+        # and elsewhere when they are wrong: a bad merchant url is a generic 400
+        # at authentication, a reserved-TLD email is a passkey failure at the
+        # very last step, after the OTP was already accepted. Checked here, at
+        # the last point before the request leaves us, rather than trusted from
+        # whichever caller assembled them. See app/prava/validate.py.
+        origin = merchant_origin(data.merchant.url)
+        if self._verify_merchant_dns:
+            assert_resolvable(origin.removeprefix("https://"))
+        user_email = validate_customer_email(data.user_email)
+
         merchant_details: dict[str, Any] = {
             "name": data.merchant.name,
-            "url": data.merchant.url,
+            # The ORIGIN, never the deep link the shopper navigates. The demo
+            # storefront's url ends in /store/index.html and sending that path
+            # breaks every checkout at that merchant.
+            "url": origin,
             "country_code_iso2": "US",
         }
         # MCC scopes the token at the network, so it is sent only when the
@@ -130,7 +152,7 @@ class PravaPaymentBroker:
 
         body: dict[str, Any] = {
             "user_id": data.user_id,
-            "user_email": data.user_email,
+            "user_email": user_email,
             "total_amount": f"{data.total_cents / 100:.2f}",
             "currency": "USD",
             "description": "Errand agent purchase",
@@ -153,6 +175,13 @@ class PravaPaymentBroker:
             body["user_country_code_iso2"] = self._user_country
         if data.external_order_ref:
             body["external_order_ref"] = data.external_order_ref[:255]
+        if data.browser_profile_id:
+            # NOT VERIFIED as a field Prava consumes — sandbox accepts it, but it
+            # also accepts an invented `device_id`, so acceptance proves only that
+            # unknown keys are ignored. Sent because a stable device identity is
+            # what prevents burning a token binding per checkout, and omitting it
+            # guarantees we cannot benefit. Flagged for confirmation with Prava.
+            body["browser_profile_id"] = data.browser_profile_id[:128]
         # Must be HTTPS per the API; an http:// dev URL is dropped rather than
         # sent, since a rejected optional field would fail the whole session.
         if self._callback_url.startswith("https://"):

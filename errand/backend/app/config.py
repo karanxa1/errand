@@ -43,6 +43,12 @@ class Settings(BaseSettings):
     # the MCC to scope the token, so a wrong code is worse than none.
     prava_merchant_category_code: str = ""
     prava_merchant_category: str = ""
+    # Opt-in DNS check on the merchant host before creating a session. The
+    # reserved-TLD list in app/prava/validate.py is enforced always and offline;
+    # this catches the rest — an invented TLD like `.nep`, or a domain that was
+    # simply never delegated — which no offline list can know. Fails CLOSED, so
+    # switch it on only where the resolver is dependable.
+    prava_verify_merchant_dns: bool = False
 
     @property
     def prava_is_sandbox(self) -> bool:
@@ -99,17 +105,22 @@ class Settings(BaseSettings):
     # the policy never named.
     #
     #   "off"      — never. An out-of-stock errand stops and says so.
-    #   "personal" — only on the personal profile (DEFAULT). A personal policy is
-    #                a set of preferences; a business one names approved vendors,
-    #                and "avoid non-approved vendors" is a rule we do not get to
-    #                overrule because a shelf was empty.
-    #   "always"   — both profiles. Reasonable if your business policy treats its
-    #                vendor list as a hint, but say so out loud before setting it.
+    #   "personal" — only on the personal profile.
+    #   "always"   — both profiles (DEFAULT, by explicit product decision: the
+    #                user asked for the whole catalog so that anything can be
+    #                bought, not just what one vendor happens to stock).
+    #
+    # Worth being clear about what "always" costs, since it is now the default: a
+    # business policy that says "avoid non-approved vendors" WILL be widened past
+    # its vendor list when none of those vendors stock the item. That is a
+    # deliberate choice, not an oversight. Set MERCHANT_DISCOVERY=personal to get
+    # the strict reading back.
     #
     # In every case the chosen merchant is named in the audit trail and shown on
     # the approval screen before a cent moves — discovery widens what we can
-    # offer, never what we can spend without being asked.
-    merchant_discovery: str = "personal"
+    # offer, never what we can spend without being asked. The approval gate is
+    # what keeps "always" safe rather than merely permissive.
+    merchant_discovery: str = "always"
 
     # Hard cap on merchants tried in one errand (approved + discovered). Each
     # attempt on the wallet path spins a real browser for the quote (20-40s), so

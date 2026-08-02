@@ -67,8 +67,46 @@ MAX_PRODUCTS_INSPECTED = 6
 # "the cheapest one's shipping pushed it over budget, try the next".
 MAX_QUOTE_ATTEMPTS = 2
 
-# Wallet error codes that mean "this quote is stale, get another one".
+# Wallet error codes that mean "this quote is stale, get another one". An
+# ALLOWLIST, deliberately: the only failure this code retries is one where the
+# retry is against a freshly-priced session, and the new total is checked against
+# the approved one before the card is presented again.
 _EXPIRED_CODES = frozenset({"SHOP_SESSION_EXPIRED", "SHOP_QUOTE_EXPIRED"})
+
+# Failures that are DETERMINISTIC. A retry fails identically, and on the add-card
+# path it also provisions and saves another unusable card — one observed session
+# went from four saved cards to six in ninety seconds. These are listed so that
+# adding a retry for any of them has to mean deleting a name from this set, in a
+# diff, on purpose.
+NEVER_RETRY_CODES = frozenset(
+    {
+        "MAXIMUM_BINDING_EXCEEDED",
+        "MAX_BINDING_EXCEEDED",
+        "CARD_VERIFICATION_FAILED",
+        "INVALID_REQUEST",
+        "VAL_2001",
+        "PASSKEY_REG_FAILED",
+        "DEVICE_NOT_SUPPORTED",
+        "BROWSER_NOT_SUPPORTED",
+        "AUTH_1001",
+        "AUTH_1002",
+        "AUTH_INVALID_SIGNATURE",
+    }
+)
+
+
+def is_retryable(code: str | None) -> bool:
+    """Only a stale quote is worth another attempt. Everything else is not.
+
+    Unknown codes are treated as NOT retryable. That is the safe default on a
+    spend path: the cost of not retrying a transient failure is one honest error
+    message, and the cost of retrying a deterministic one is a duplicate charge
+    or a wallet full of dead cards.
+    """
+    if not code:
+        return False
+    upper = code.upper()
+    return upper in _EXPIRED_CODES and upper not in NEVER_RETRY_CODES
 
 # Words that describe the ASK rather than the PRODUCT. Left in the keyword query
 # they pull the catalog toward stopwords; the user's full sentence still travels
@@ -230,7 +268,7 @@ class PravaShopBroker:
         try:
             return await self._pay(session_id, credential)
         except PravaShopError as exc:
-            if exc.code not in _EXPIRED_CODES:
+            if not is_retryable(exc.code):
                 raise
             memo = self._quoted.get(session_id)
             if memo is None:
