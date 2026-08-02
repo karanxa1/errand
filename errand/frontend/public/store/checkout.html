@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="robots" content="noindex, nofollow" />
+<title>Checkout — Northwind Provisions</title>
+<!--
+  Northwind Provisions checkout — the page the Errand agent pays on.
+
+  DOM CONTRACT with app/brokers/shopper.py complete_checkout(). It fills and
+  clicks exactly:
+    #checkout-form   readiness probe
+    #card-number  #expiry-month  #expiry-year  #cvv
+    #place-order
+  then waits for  #confirmation.show  and reads  data-order-id  (falling back to
+  an ORD-\d+ match in the confirmation text).
+
+  The amount comes from ?total_cents= because the shopper opens this URL in a
+  FRESH browser context with no shared storage — see _checkout_url_for. A missing
+  or malformed value renders $0.00 rather than inventing a total.
+
+  No real money: this accepts Prava SANDBOX test cards only and settles nothing.
+  The card credential the agent types here is Prava's single-use token +
+  dynamic CVV, which is why the fields are plain text inputs rather than a
+  payment element.
+-->
+<style>
+  :root {
+    color-scheme: dark;
+    --ink: #0b0f0d;
+    --panel: #121a16;
+    --line: rgba(150, 220, 185, 0.14);
+    --text: #e8f5ee;
+    --muted: #9fb6a9;
+    --accent: #5ff2b6;
+    --accent-ink: #06170f;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--ink); color: var(--text);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  .wrap { max-width: 560px; margin: 0 auto; padding: 32px 20px 64px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .note { color: var(--muted); font-size: 13px; margin: 0; }
+  .demo {
+    margin: 20px 0 0; padding: 12px 14px; border: 1px solid var(--line);
+    border-radius: 10px; color: var(--muted); font-size: 13px; background: var(--panel);
+  }
+  .amount {
+    margin-top: 22px; border: 1px solid var(--line); border-radius: 12px;
+    padding: 16px; background: var(--panel);
+    display: flex; align-items: baseline; justify-content: space-between; gap: 12px;
+  }
+  #order-total { font-size: 26px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  form { margin-top: 22px; display: grid; gap: 14px; }
+  label { display: grid; gap: 6px; font-size: 13px; color: var(--muted); }
+  input {
+    font: inherit; color: var(--text); background: #0e1512;
+    border: 1px solid var(--line); border-radius: 9px; padding: 10px 12px;
+  }
+  input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .row { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; }
+  button {
+    font: inherit; font-weight: 600; cursor: pointer; margin-top: 4px;
+    background: var(--accent); color: var(--accent-ink);
+    border: 0; border-radius: 9px; padding: 12px 14px;
+  }
+  button:hover { background: #7ff5c7; }
+  #confirmation {
+    display: none; margin-top: 22px; border: 1px solid var(--line);
+    border-radius: 12px; padding: 16px; background: var(--panel);
+  }
+  /* The shopper waits for #confirmation.show, so `show` is the signal that the
+     order is placed. Display is toggled here and nowhere else. */
+  #confirmation.show { display: block; }
+  #confirmation h2 { font-size: 16px; margin: 0 0 6px; }
+  .err { color: #ff9c8f; font-size: 13px; min-height: 18px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Checkout</h1>
+  <p class="note">Northwind Provisions</p>
+
+  <p class="demo">
+    Demonstration checkout. Prava <strong>sandbox</strong> test cards only — no
+    money moves and no goods ship.
+  </p>
+
+  <div class="amount">
+    <span>Amount due</span>
+    <span id="order-total" data-total-cents="0">$0.00</span>
+  </div>
+
+  <form id="checkout-form" novalidate>
+    <label for="card-number">Card number
+      <input id="card-number" name="card-number" inputmode="numeric" autocomplete="off" placeholder="4622 9431 2313 7789" />
+    </label>
+    <div class="row">
+      <label for="expiry-month">Exp. month
+        <input id="expiry-month" name="expiry-month" inputmode="numeric" autocomplete="off" placeholder="12" />
+      </label>
+      <label for="expiry-year">Exp. year
+        <input id="expiry-year" name="expiry-year" inputmode="numeric" autocomplete="off" placeholder="2027" />
+      </label>
+      <label for="cvv">CVV
+        <input id="cvv" name="cvv" inputmode="numeric" autocomplete="off" placeholder="757" />
+      </label>
+    </div>
+    <p class="err" id="form-error" role="alert"></p>
+    <button id="place-order" type="submit">Place order</button>
+  </form>
+
+  <section id="confirmation" data-order-id="" aria-live="polite">
+    <h2>Order confirmed</h2>
+    <p class="note" id="confirmation-copy"></p>
+  </section>
+</div>
+
+<script>
+  function money(cents) {
+    return "$" + (cents / 100).toFixed(2);
+  }
+
+  // Read the pinned total from the query string. Anything non-numeric or
+  // negative becomes 0 rather than a guessed amount.
+  function pinnedTotalCents() {
+    var raw = new URLSearchParams(window.location.search).get("total_cents");
+    var n = parseInt(raw || "0", 10);
+    return Number.isFinite(n) && n > 0 ? n : 0;
+  }
+
+  var TOTAL_CENTS = pinnedTotalCents();
+  var totalEl = document.getElementById("order-total");
+  totalEl.setAttribute("data-total-cents", String(TOTAL_CENTS));
+  totalEl.textContent = money(TOTAL_CENTS);
+
+  // Deterministic-ish order id in the ORD-<digits> shape the shopper can also
+  // recover by regex from the confirmation copy if the attribute is ever missing.
+  function newOrderId() {
+    var stamp = Date.now().toString().slice(-6);
+    var rand = Math.floor(Math.random() * 900 + 100).toString();
+    return "ORD-" + stamp + rand;
+  }
+
+  var form = document.getElementById("checkout-form");
+  var errEl = document.getElementById("form-error");
+
+  form.addEventListener("submit", function (event) {
+    event.preventDefault();
+
+    var digits = function (id) {
+      return (document.getElementById(id).value || "").replace(/\D+/g, "");
+    };
+    var pan = digits("card-number");
+    var month = digits("expiry-month");
+    var year = digits("expiry-year");
+    var cvv = digits("cvv");
+
+    // Shape-only validation. This is a demo surface: it must refuse an empty or
+    // obviously malformed card so a silent success can never be mistaken for a
+    // real authorization, but it deliberately does NOT judge the card's
+    // legitimacy — Prava owns that.
+    if (pan.length < 12 || pan.length > 19) {
+      errEl.textContent = "Enter the full card number.";
+      return;
+    }
+    if (month.length < 1 || month.length > 2 || Number(month) < 1 || Number(month) > 12) {
+      errEl.textContent = "Expiry month must be 1-12.";
+      return;
+    }
+    if (year.length !== 2 && year.length !== 4) {
+      errEl.textContent = "Expiry year must be YY or YYYY.";
+      return;
+    }
+    if (cvv.length < 3 || cvv.length > 4) {
+      errEl.textContent = "CVV must be 3-4 digits.";
+      return;
+    }
+    errEl.textContent = "";
+
+    var orderId = newOrderId();
+    var confirmation = document.getElementById("confirmation");
+    // Set the id BEFORE revealing the panel: the shopper waits on
+    // #confirmation.show and then immediately reads data-order-id, so revealing
+    // first would race it into reading an empty attribute.
+    confirmation.setAttribute("data-order-id", orderId);
+    document.getElementById("confirmation-copy").textContent =
+      "Order " + orderId + " placed for " + money(TOTAL_CENTS) +
+      " at Northwind Provisions. Card ending " + pan.slice(-4) +
+      ". Demonstration only — nothing was charged and nothing ships.";
+    confirmation.classList.add("show");
+  });
+</script>
+</body>
+</html>

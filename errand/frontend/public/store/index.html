@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="robots" content="noindex, nofollow" />
+<title>Northwind Provisions — pantry supply</title>
+<!--
+  Northwind Provisions — the demonstration storefront the Errand agent shops.
+
+  WHY THIS FILE EXISTS. The spend policy in Senso names its approved vendor as
+  https://demo-pantry.example.com. example.com is IANA-reserved: it resolves to a
+  placeholder and can never be a store, so build_cart found no products and NO
+  errand could ever complete. Prava does not ship a sandbox storefront either —
+  its REST API is sessions/payment-result/report-status/cards/mandates only, and
+  its UCP + Browser Harness reach REAL Shopify merchants over the LIVE API with
+  real cards. So the reachable, non-spending target is this page.
+
+  It is deliberately a static page under the Next public/ dir: it deploys with
+  the existing Cloudflare Worker, so it is a real HTTPS origin that Cloudflare's
+  REMOTE browser can fetch (a localhost store would force the local browser path
+  and never exercise the deployed shopper).
+
+  THE DOM HERE IS A CONTRACT with app/brokers/shopper.py. Do not rename these
+  hooks casually — the shopper reads exactly:
+    [data-product-id]  with data-brand and data-price-cents
+    [data-name]        product name, inside each product
+    button[data-add="<id>"]
+    #cart-total        with data-total-cents
+  Prices are integer CENTS to avoid float drift; the total is recomputed from
+  them, never parsed back out of the rendered string.
+-->
+<style>
+  :root {
+    color-scheme: dark;
+    --ink: #0b0f0d;
+    --panel: #121a16;
+    --line: rgba(150, 220, 185, 0.14);
+    --text: #e8f5ee;
+    --muted: #9fb6a9;
+    --accent: #5ff2b6;
+    --accent-ink: #06170f;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--ink);
+    color: var(--text);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  .wrap { max-width: 960px; margin: 0 auto; padding: 28px 20px 64px; }
+  header { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+  h1 { font-size: 22px; margin: 0; letter-spacing: 0.01em; }
+  .note { margin: 6px 0 0; color: var(--muted); font-size: 13px; }
+  .demo {
+    margin: 22px 0 0; padding: 12px 14px; border: 1px solid var(--line);
+    border-radius: 10px; color: var(--muted); font-size: 13px; background: var(--panel);
+  }
+  .grid {
+    display: grid; gap: 12px; margin-top: 22px;
+    grid-template-columns: repeat(auto-fill, minmax(232px, 1fr));
+  }
+  .product {
+    border: 1px solid var(--line); border-radius: 12px; padding: 14px;
+    background: var(--panel); display: flex; flex-direction: column; gap: 6px;
+  }
+  .brand { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.07em; }
+  .name { font-size: 15px; font-weight: 600; }
+  .price { font-variant-numeric: tabular-nums; color: var(--muted); font-size: 14px; }
+  button {
+    margin-top: 6px; font: inherit; font-weight: 600; cursor: pointer;
+    background: var(--accent); color: var(--accent-ink);
+    border: 0; border-radius: 8px; padding: 9px 12px;
+  }
+  button:hover { background: #7ff5c7; }
+  .cart {
+    margin-top: 26px; border: 1px solid var(--line); border-radius: 12px;
+    padding: 16px; background: var(--panel);
+  }
+  .cart h2 { font-size: 15px; margin: 0 0 10px; }
+  #cart-lines { list-style: none; margin: 0 0 12px; padding: 0; display: grid; gap: 6px; }
+  #cart-lines li { display: flex; justify-content: space-between; gap: 12px; font-size: 14px; }
+  #cart-lines .qty { color: var(--muted); }
+  .total-row { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; border-top: 1px solid var(--line); padding-top: 12px; }
+  #cart-total { font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .empty { color: var(--muted); font-size: 14px; }
+  a.checkout { display: inline-block; margin-top: 14px; color: var(--accent); font-weight: 600; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div>
+      <h1>Northwind Provisions</h1>
+      <p class="note">Pantry &amp; office supply</p>
+    </div>
+    <p class="note">Ships next business day</p>
+  </header>
+
+  <p class="demo">
+    Demonstration storefront for the Errand agent. No real inventory and no real
+    money: checkout accepts only Prava <strong>sandbox</strong> test cards.
+  </p>
+
+  <div class="grid" id="catalog"></div>
+
+  <section class="cart" aria-live="polite">
+    <h2>Cart</h2>
+    <ul id="cart-lines"></ul>
+    <p class="empty" id="cart-empty">Nothing added yet.</p>
+    <div class="total-row">
+      <span>Total</span>
+      <!-- data-total-cents is what the shopper reads; the text is for humans. -->
+      <span id="cart-total" data-total-cents="0">$0.00</span>
+    </div>
+    <a class="checkout" id="to-checkout" href="checkout.html">Continue to checkout →</a>
+  </section>
+</div>
+
+<script>
+  // Catalog. Brands match the preferred brands in the seeded Senso policy
+  // (Blue Bottle / Clif / LaCroix) so the agent's brand preference is visible,
+  // and one energy drink is present precisely so the policy's negative rule
+  // ("no energy drinks") has something real to exclude.
+  var CATALOG = [
+    { id: "oat-milk-1l",     brand: "Minor Figures", name: "Oat milk 1L",                 price_cents: 390 },
+    { id: "beans-blue-1kg",  brand: "Blue Bottle",   name: "Dark roast beans 1kg",        price_cents: 2800 },
+    { id: "lacroix-24",      brand: "LaCroix",       name: "Sparkling water 24 x 330ml",  price_cents: 1960 },
+    { id: "clif-bars-12",    brand: "Clif",          name: "Energy-free snack bars x12",  price_cents: 1740 },
+    { id: "tea-english-40",  brand: "Twinings",      name: "English breakfast tea x40",   price_cents: 720 },
+    { id: "energy-drink-6",  brand: "Voltjolt",      name: "Energy drinks 6 x 250ml",     price_cents: 1150 }
+  ];
+
+  var cart = Object.create(null);
+
+  function money(cents) {
+    return "$" + (cents / 100).toFixed(2);
+  }
+
+  function renderCatalog() {
+    var host = document.getElementById("catalog");
+    host.textContent = "";
+    CATALOG.forEach(function (p) {
+      var card = document.createElement("div");
+      // The shopper's readiness probe waits for [data-product-id], and reads
+      // brand + price straight off these attributes.
+      card.className = "product";
+      card.setAttribute("data-product-id", p.id);
+      card.setAttribute("data-brand", p.brand);
+      card.setAttribute("data-price-cents", String(p.price_cents));
+
+      var brand = document.createElement("div");
+      brand.className = "brand";
+      brand.textContent = p.brand;
+
+      var name = document.createElement("div");
+      name.className = "name";
+      // [data-name] is the exact node the shopper reads the product name from.
+      name.setAttribute("data-name", "");
+      name.textContent = p.name;
+
+      var price = document.createElement("div");
+      price.className = "price";
+      price.textContent = money(p.price_cents);
+
+      var add = document.createElement("button");
+      add.type = "button";
+      add.setAttribute("data-add", p.id);
+      add.textContent = "Add to cart";
+      add.addEventListener("click", function () { addToCart(p.id); });
+
+      card.appendChild(brand);
+      card.appendChild(name);
+      card.appendChild(price);
+      card.appendChild(add);
+      host.appendChild(card);
+    });
+  }
+
+  function addToCart(id) {
+    cart[id] = (cart[id] || 0) + 1;
+    renderCart();
+  }
+
+  function totalCents() {
+    return CATALOG.reduce(function (sum, p) {
+      return sum + (cart[p.id] || 0) * p.price_cents;
+    }, 0);
+  }
+
+  function renderCart() {
+    var lines = document.getElementById("cart-lines");
+    var empty = document.getElementById("cart-empty");
+    lines.textContent = "";
+
+    var any = false;
+    CATALOG.forEach(function (p) {
+      var qty = cart[p.id] || 0;
+      if (!qty) return;
+      any = true;
+      var li = document.createElement("li");
+      var left = document.createElement("span");
+      left.textContent = p.name;
+      var right = document.createElement("span");
+      right.className = "qty";
+      right.textContent = "x" + qty + "  " + money(qty * p.price_cents);
+      li.appendChild(left);
+      li.appendChild(right);
+      lines.appendChild(li);
+    });
+    empty.style.display = any ? "none" : "";
+
+    var total = totalCents();
+    var el = document.getElementById("cart-total");
+    // Both are updated together: the attribute is the machine-readable truth the
+    // shopper reads, the text is what a human sees. Letting them disagree would
+    // make the audit trail lie about what was charged.
+    el.setAttribute("data-total-cents", String(total));
+    el.textContent = money(total);
+
+    // Carry the total to checkout, so a relaunched checkout page (a fresh
+    // browser context with no shared storage) still renders the real amount.
+    // This mirrors _checkout_url_for in app/brokers/shopper.py.
+    document.getElementById("to-checkout").setAttribute(
+      "href", "checkout.html?total_cents=" + total
+    );
+  }
+
+  renderCatalog();
+  renderCart();
+</script>
+</body>
+</html>

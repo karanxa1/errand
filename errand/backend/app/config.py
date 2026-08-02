@@ -33,6 +33,36 @@ class Settings(BaseSettings):
     senso_api_key: str = ""
     senso_api_base: str = "https://apiv2.senso.ai/api/v1"
 
+    # Unroutable-merchant resolution.
+    #
+    # The seeded Senso policy names its approved vendor as
+    # https://demo-pantry.example.com. `example.com` is RESERVED by IANA
+    # (RFC 2606 / RFC 6761) for documentation and can never host a real store, so
+    # handing it to the shopper meant build_cart found no products and NO errand
+    # could complete. Prava does not offer a substitute: its REST API has no
+    # storefront, and its UCP/Browser Harness reach REAL Shopify merchants over
+    # the LIVE API with real cards.
+    #
+    # So a policy host listed here is resolved to `demo_store_url` — the
+    # demonstration storefront served from the frontend Worker, whose DOM matches
+    # the shopper's contract. This is deliberately NARROW: only these exact hosts
+    # are ever rewritten, Senso remains the source of truth for the merchant's
+    # NAME, budget and rules, and every substitution emits a
+    # `context.merchant_resolved` audit event so the record never implies Senso
+    # named a URL it did not. Clear `unroutable_merchant_hosts` to disable.
+    demo_store_url: str = (
+        "https://errand-frontend.rough-cell-383c.workers.dev/store/index.html"
+    )
+    unroutable_merchant_hosts: str = "demo-pantry.example.com"
+
+    @property
+    def unroutable_hosts(self) -> set[str]:
+        return {
+            h.strip().lower()
+            for h in self.unroutable_merchant_hosts.split(",")
+            if h.strip()
+        }
+
     # Deepgram
     deepgram_api_key: str = ""
 

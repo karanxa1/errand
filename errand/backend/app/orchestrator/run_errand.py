@@ -11,10 +11,14 @@ import time
 from datetime import datetime, timezone
 from typing import Awaitable, Callable
 
+from urllib.parse import urlparse
+
 from app.brokers import Brokers
+from app.config import settings
 from app.contracts import (
     AuditEvent,
     CreateSessionInput,
+    Merchant,
     PollCompleted,
     PollFailed,
     ProfileKind,
@@ -41,6 +45,28 @@ ApprovalFn = Callable[[dict], Awaitable[ApprovalDecision]]
 DEFAULT_MAX_STEPS = 40
 DEFAULT_CREDENTIAL_WAIT_S = 90.0
 _POLL_INTERVAL_S = 3.0
+
+
+def resolve_merchant(merchant: Merchant) -> tuple[Merchant, str | None]:
+    """Swap an unroutable policy URL for the demonstration storefront.
+
+    Returns ``(merchant, original_url_or_None)``. The second element is non-None
+    ONLY when a substitution happened, so the caller can record it.
+
+    The seeded policy's vendor URL is on `example.com`, which IANA reserves for
+    documentation — it can never serve a storefront, so the shopper found no
+    products and no errand could ever complete. Only the hosts named in
+    `settings.unroutable_merchant_hosts` are ever rewritten, and the merchant's
+    NAME is left exactly as Senso stated it: this changes where we shop, never
+    who the policy says is approved.
+    """
+    host = (urlparse(merchant.url).hostname or "").lower()
+    if host not in settings.unroutable_hosts:
+        return merchant, None
+    return (
+        Merchant(name=merchant.name, url=settings.demo_store_url),
+        merchant.url,
+    )
 
 
 def _now() -> str:
@@ -89,6 +115,26 @@ async def run_errand(
             await rec("context.no_merchant", "No approved merchant; stopping.")
             return {"kind": "aborted", "reason": "No approved merchant in context."}
         merchant = ctx.approved_merchants[0]
+
+        # The policy's vendor URL may be unroutable (see resolve_merchant). If it
+        # is swapped, SAY SO in the audit trail: the record must never imply the
+        # policy named the URL we actually shopped. The Prava session below is
+        # pinned to this resolved merchant, so the substitution is also what the
+        # card is scoped to — which makes silence here a misstatement about spend.
+        merchant, substituted_from = resolve_merchant(merchant)
+        if substituted_from is not None:
+            await rec(
+                "context.merchant_resolved",
+                (
+                    f"Policy vendor URL {substituted_from} is not routable; "
+                    f"shopping the demonstration storefront instead."
+                ),
+                {
+                    "merchant_name": merchant.name,
+                    "policy_url": substituted_from,
+                    "resolved_url": merchant.url,
+                },
+            )
 
         # 2. Shop; park on checkout.
         await guard("cart.built")
