@@ -598,6 +598,20 @@ async def chat(
         async def on_frame(step: str, detail: str, shot: bytes | None) -> None:
             nonlocal last_frame_at
             if not shot:
+                # No page to screenshot (the wallet/real-merchant path drives no
+                # browser we own) — surface the step as an audit line so the
+                # thread still shows live progress, then stop. Not a browser.frame:
+                # a frame with no image would blank the live view.
+                await emit_errand(
+                    AuditEvent(
+                        at=datetime.now(timezone.utc).isoformat(),
+                        step=step,
+                        detail=detail,
+                        data={},
+                    ),
+                    run_id,
+                )
+                collected.append({"type": step, "run_id": run_id, "detail": detail})
                 return
             now = time.monotonic()
             if now - last_frame_at < 0.5:

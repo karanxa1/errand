@@ -555,6 +555,85 @@ def test_a_price_that_moved_is_refused_rather_than_charged() -> None:
     assert len([c for c in wallet.calls if c[0] == "/v1/wallet/shop/checkout"]) == 1
 
 
+# ── agentic (LLM-driven) variant selection on the real wallet path ────────────
+
+def _decide_pick(product_id: str):
+    """A decide() that always picks a specific variant id."""
+    async def decide(**_kwargs) -> dict:
+        return {"action": "add", "product_id": product_id}
+    return decide
+
+
+def test_agentic_build_cart_honours_the_models_choice() -> None:
+    """The model may steer WHICH allowed variant to buy — not just the cheapest.
+    Here it picks the expensive one (still in budget), and that is what is quoted."""
+    wallet = _FakeWallet(
+        {
+            "/v1/wallet/shop/search": _search_hit(),
+            "/v1/wallet/shop/product": _product([_variant("v-expensive", 4999), _variant("v-cheap", 1999)]),
+            "/v1/wallet/shop/quote": _quote(),
+        }
+    )
+    broker = PravaShopBroker(wallet)  # type: ignore[arg-type]
+    cart = asyncio.run(
+        broker.agentic_build_cart(
+            "https://bonescoffee.com", "buy coffee", _context(),
+            decide=_decide_pick("v-expensive"),
+        )
+    )
+    quoted = [body for path, body in wallet.calls if path == "/v1/wallet/shop/quote"]
+    assert quoted[0]["variant_id"] == "v-expensive", "the model's choice must be quoted"
+    assert cart.total_cents == 2798
+
+
+def test_agentic_build_cart_cannot_pick_a_banned_or_missing_variant() -> None:
+    """The model can only choose from the policy+budget-filtered candidates. A
+    pick that is not in that list (banned, over budget, hallucinated) falls back
+    to the top-ranked allowed variant — it can never smuggle one past the filter."""
+    wallet = _FakeWallet(
+        {
+            "/v1/wallet/shop/search": _search_hit(),
+            "/v1/wallet/shop/product": _product([_variant("v-cheap", 1999)]),
+            "/v1/wallet/shop/quote": _quote(),
+        }
+    )
+    broker = PravaShopBroker(wallet)  # type: ignore[arg-type]
+    cart = asyncio.run(
+        broker.agentic_build_cart(
+            "https://bonescoffee.com", "buy coffee", _context(),
+            decide=_decide_pick("v-does-not-exist"),
+        )
+    )
+    quoted = [body for path, body in wallet.calls if path == "/v1/wallet/shop/quote"]
+    assert quoted[0]["variant_id"] == "v-cheap", "an invalid pick falls back to an allowed one"
+    assert cart.total_cents == 2798
+
+
+def test_agentic_build_cart_streams_step_captions() -> None:
+    """The live view on the real path is text captions (no page we drive). Each
+    step must report through on_frame so the thread shows progress."""
+    wallet = _FakeWallet(
+        {
+            "/v1/wallet/shop/search": _search_hit(),
+            "/v1/wallet/shop/product": _product([_variant("v-cheap", 1999)]),
+            "/v1/wallet/shop/quote": _quote(),
+        }
+    )
+    broker = PravaShopBroker(wallet)  # type: ignore[arg-type]
+    steps: list[str] = []
+
+    async def on_frame(step, detail, shot):
+        steps.append(step)
+
+    asyncio.run(
+        broker.agentic_build_cart(
+            "https://bonescoffee.com", "buy coffee", _context(),
+            decide=_decide_pick("v-cheap"), on_frame=on_frame,
+        )
+    )
+    assert "shop.search" in steps and "shop.select" in steps and "shop.quote" in steps
+
+
 def _run_all() -> None:
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

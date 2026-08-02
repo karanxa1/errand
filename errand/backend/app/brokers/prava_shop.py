@@ -255,6 +255,98 @@ class PravaShopBroker:
             "build_cart", "Could not price any candidate: " + "; ".join(failures[:2])
         )
 
+    async def agentic_build_cart(
+        self,
+        merchant_url: str,
+        intent: str,
+        context: PurchaseContext,
+        *,
+        decide,
+        on_frame=None,
+        max_actions: int = 8,  # unused here; kept for signature parity with the demo shopper
+    ) -> CartResult:
+        """LLM-driven variant selection on a REAL merchant, then a quote.
+
+        The demo store lets the model add/remove across a shelf; the wallet has no
+        multi-item basket (quote/checkout are single-variant), so here the model's
+        job is to CHOOSE which real product/variant to buy from what the catalog
+        actually returned — the user steering "the 12oz whole bean, not the
+        ground" — instead of the fixed cheapest-preferred rank. Everything after
+        the choice is unchanged: the same policy + budget filter builds the
+        candidate list (the model can only pick from allowed, in-budget variants,
+        so it cannot select a banned or unaffordable one), the same quote is
+        parked, and the human still approves + pays. Falls back to the
+        cheapest-preferred candidate if the model declines to choose.
+
+        `on_frame(step, detail, None)` streams a text caption per step — there is
+        no page we drive here, so there is no screenshot, and the live view is the
+        audit timeline (documented in the design).
+        """
+        domain = merchant_domain(merchant_url)
+        if not domain:
+            raise PravaShopError("build_cart", f"{merchant_url!r} has no usable host.")
+
+        async def note(step: str, detail: str) -> None:
+            if on_frame is not None:
+                await on_frame(step, detail, None)
+
+        await note("shop.search", f"Searching {domain} for {search_query(intent)!r}.")
+        results = await self._search(intent, domain)
+        if not results:
+            raise PravaShopError(
+                "build_cart",
+                f"Prava's catalog returned nothing for {search_query(intent)!r} at "
+                f"{domain}. The policy approves that merchant, so this stops rather "
+                f"than buying somewhere the policy did not name.",
+            )
+
+        candidates = await self._rank_variants(results, domain, context)
+        if not candidates:
+            raise PravaShopError(
+                "build_cart",
+                f"No orderable variant at {domain} fits the policy "
+                f"(budget ${context.budget_cents / 100:.2f}, {len(context.rules)} rules).",
+            )
+
+        # Let the model pick from the ALLOWED, in-budget candidates only. It can
+        # steer WHICH product; it cannot escape the policy/budget filter that built
+        # this list. A malformed or unknown pick falls back to the top-ranked one.
+        chosen = candidates[0]
+        try:
+            decision = await decide(
+                intent=intent,
+                catalog=[
+                    {
+                        "id": c["variant_id"],
+                        "name": c["title"],
+                        "brand": c["label"],
+                        "price_cents": c["price_cents"],
+                    }
+                    for c in candidates
+                ],
+                cart={},
+                spent_cents=0,
+                budget_cents=context.budget_cents,
+                last_refusal=None,
+            )
+            pick = str((decision or {}).get("product_id") or "")
+            match = next((c for c in candidates if c["variant_id"] == pick), None)
+            if match is not None:
+                chosen = match
+        except Exception:  # noqa: BLE001 — a bad decision falls back, never fails the errand
+            chosen = candidates[0]
+
+        await note(
+            "shop.select",
+            f"Chose {chosen['title']} ({chosen['label']}) — ${chosen['price_cents']/100:.2f}.",
+        )
+        cart = await self._quote(chosen, domain, context)
+        await note(
+            "shop.quote",
+            f"Quoted ${cart.total_cents/100:.2f} at {domain}, pending your approval.",
+        )
+        return cart
+
     async def complete_checkout(
         self, checkout: CheckoutState, credential: PaymentCredential
     ) -> OrderResult:

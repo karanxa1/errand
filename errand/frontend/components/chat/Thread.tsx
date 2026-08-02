@@ -224,6 +224,22 @@ function renderEntry(
 
   if (SILENT.has(e.step)) return null;
 
+  // Agentic shop-loop progress notes (both the demo store and the real wallet
+  // path emit these). Quiet status lines, not full cards — the cart/approval
+  // cards carry the substance; these are the running commentary beside them.
+  if (e.step.startsWith("shop.")) {
+    const tone =
+      e.step === "shop.refused" || e.step === "shop.invalid" ? "warn" : "ok";
+    return (
+      <StatusLine
+        key={key}
+        icon={tone === "warn" ? <AlertIcon size={14} /> : <CartIcon size={14} />}
+        tone={tone}
+        text={e.detail || humanize(e.step)}
+      />
+    );
+  }
+
   switch (e.step) {
     case "inbox.ready":
       return (

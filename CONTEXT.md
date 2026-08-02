@@ -123,8 +123,17 @@ invariant downstream is unchanged. A user spend cap arrives as `max_cents` on th
 `run_errand` tool. Live browser view streams as `browser.frame` SSE frames
 (throttled JPEG); the reducer keeps only the latest (`browserFrame`) and the
 `BrowserView` card renders it. Design: `docs/superpowers/specs/2026-08-03-live-agentic-browser-design.md`.
-Real-merchant agentic shopping (behind `USE_PRAVA_SHOP`) is not built yet — the
-wallet shopper falls back to its own `build_cart`.
+Real-merchant agentic shopping (behind `USE_PRAVA_SHOP`) IS now wired:
+`PravaShopBroker.agentic_build_cart` lets the LLM choose which real product/
+variant to buy from Prava's catalog, bounded by the same policy + budget filter
+(it can only pick from allowed, in-budget candidates; a bad pick falls back to
+the top-ranked one). The wallet is single-variant per checkout — there is no
+multi-item basket — so this is a *select* loop, not the demo store's add/remove.
+It drives no page we own, so there is no screenshot: steps stream as audit lines
+(rendered as `shop.*` StatusLines), not `browser.frame`s. Unverified live: it
+needs the Prava agent linked (`scripts/prava_link.py`, human-approved in the
+wallet) and a real card — a live purchase is human-gated and cannot be
+auto-tested. Pinned by the agentic tests in `tests/test_prava_wallet.py`.
 
 ### Voice binds the same conversation id as a typed turn
 The voice relay socket carries only `model`/`profile`/`ticket` — no conversation id — so a
