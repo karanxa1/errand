@@ -64,13 +64,37 @@ DEEPGRAM_AGENT_URL = "wss://agent.deepgram.com/v1/agent/converse"
 # other policy close, and 1008 is indistinguishable from a generic refusal.
 WS_UNAUTHORIZED = 4401
 
-# ?model=sol|terra|luna -> the BYO OpenAI think model id.
+# ?model=sol|terra|luna. Retained because the browser still sends it and the chat
+# path still uses it, but see VOICE_THINK_MODEL: the VOICE think model is no
+# longer selected by it.
 _MODEL_MAP = {
     "sol": "gpt-5.6-sol",
     "terra": "gpt-5.6-terra",
     "luna": "gpt-5.6-luna",
 }
 _DEFAULT_MODEL = "sol"
+
+# ── Voice provider contract (doc-verified; do not extrapolate) ────────────────
+# THINK: Deepgram-managed Anthropic. `claude-sonnet-5` is listed verbatim in
+# Deepgram's supported Anthropic model table (Advanced tier). Because it is
+# MANAGED, `agent.think.endpoint` is omitted and no Anthropic key is needed.
+# Consequence, stated plainly: the sol/terra/luna selector no longer changes the
+# voice LLM — voice always thinks with claude-sonnet-5, while the TEXT chat path
+# (app/routers/chat.py) still honours the selector against gpt-5.6-*. Deepgram's
+# managed Anthropic list does not contain the gpt-5.6 family, so one selector
+# cannot address both.
+# https://developers.deepgram.com/docs/voice-agent-llm-models
+VOICE_THINK_PROVIDER = "anthropic"
+VOICE_THINK_MODEL = "claude-sonnet-5"
+
+# SPEAK: Deepgram-managed Cartesia. `sonic-2` and the voice id below are the
+# values in Deepgram's own managed-Cartesia example. Cartesia is keyed by
+# `model_id` + a {mode,id} voice object, NOT the `model` string Deepgram/OpenAI
+# use. `speed` accepts slowest|slow|normal|fast|fastest or a number.
+# https://developers.deepgram.com/docs/voice-agent-tts-models
+VOICE_SPEAK_PROVIDER = "cartesia"
+VOICE_SPEAK_MODEL_ID = "sonic-2"
+VOICE_SPEAK_VOICE_ID = "a167e0f3-df7e-4d52-a9c3-f949145efdab"
 
 # Human-in-the-loop gate timeout (seconds) for a voice-driven errand.
 APPROVAL_TIMEOUT_S = 300
@@ -192,8 +216,12 @@ def _think_functions() -> list[dict]:
 
 
 def _settings_message(model_id: str) -> dict:
-    """The first message on the Deepgram WS. BYO OpenAI endpoint lets us use the
-    gpt-5.6-{sol,terra,luna} models the managed list doesn't expose."""
+    """The first message on the Deepgram WS.
+
+    THINK is Deepgram-managed Anthropic; SPEAK is Deepgram-managed Cartesia.
+    `model_id` is accepted for signature compatibility with the chat path's
+    sol/terra/luna selector but is deliberately NOT sent: see VOICE_THINK_MODEL.
+    """
     return {
         "type": "Settings",
         "audio": {
@@ -205,35 +233,44 @@ def _settings_message(model_id: str) -> dict:
             "listen": {"provider": {"type": "deepgram", "model": "nova-3"}},
             "think": {
                 "provider": {
-                    "type": "open_ai",
-                    "model": model_id,
-                    # Deepgram forwards this to the BYO endpoint as OpenAI's
-                    # `reasoning_effort`. gpt-5.6 defaults to "medium", and
-                    # OpenAI documents medium-with-function-tools on
-                    # /v1/chat/completions as unsupported for this family — the
-                    # same incompatibility the text path already handles. Without
-                    # it the agent's tool calls fail at the LLM hop, which is
-                    # exactly the surface that can spend money.
-                    # Deepgram's enum for this field is none|minimal|low|medium|
-                    # high; gpt-5.6 accepts none|low|medium|high|xhigh|max, so
-                    # the reachable intersection is none|low|medium|high.
-                    # https://developers.deepgram.com/reference/voice-agent/voice-agent
-                    # https://developers.openai.com/api/docs/guides/upgrading-to-gpt-5p6-sol
-                    "reasoning_mode": "none",
+                    "type": VOICE_THINK_PROVIDER,
+                    "model": VOICE_THINK_MODEL,
+                    # NOTE: `reasoning_mode` is deliberately ABSENT.
+                    # Deepgram documents it as OpenAI-only ("Only supported with
+                    # OpenAI reasoning models") and its accepted values are
+                    # low|medium|high — so the "none" this used to send was not
+                    # even in the documented enum, and it is meaningless for an
+                    # anthropic provider. Sending an unknown provider field is
+                    # the crash-class 4xx this repo has already been bitten by.
+                    # https://developers.deepgram.com/docs/configure-voice-agent
                 },
-                "endpoint": {
-                    # The full request path, not the API base. Deepgram POSTs
-                    # this URL directly; its own OpenAI bring-your-own example is
-                    # ".../v1/chat/completions", and every other BYO example on
-                    # that page is likewise a complete path.
-                    # https://developers.deepgram.com/docs/voice-agent-llm-models
-                    "url": "https://api.openai.com/v1/chat/completions",
-                    "headers": {"Authorization": f"Bearer {settings.openai_api_key}"},
-                },
+                # NOTE: no `endpoint`. Deepgram documents `agent.think.endpoint`
+                # as OPTIONAL for `anthropic` because it provides a managed
+                # Anthropic LLM ("For open_ai, anthropic, google, and nvidia, the
+                # endpoint field is optional because Deepgram provides managed
+                # LLMs"). Omitting it means Deepgram bills/authenticates the LLM
+                # hop, so no Anthropic API key is required on our side.
+                # https://developers.deepgram.com/docs/voice-agent-llm-models
                 "prompt": SYSTEM_PROMPT,
                 "functions": _think_functions(),
             },
-            "speak": {"provider": {"type": "deepgram", "model": "aura-2-thalia-en"}},
+            "speak": {
+                "provider": {
+                    "type": VOICE_SPEAK_PROVIDER,
+                    # Cartesia takes `model_id` (NOT `model`, which is the
+                    # Deepgram/OpenAI field) plus a voice object.
+                    "model_id": VOICE_SPEAK_MODEL_ID,
+                    "voice": {"mode": "id", "id": VOICE_SPEAK_VOICE_ID},
+                    "speed": "normal",
+                }
+                # NOTE: no `endpoint`. This is the DEEPGRAM-MANAGED Cartesia form
+                # from the "Deepgram-managed Cartesia TTS models" section, whose
+                # own example carries no endpoint and no x-api-key — Cartesia is
+                # billed through Deepgram's Standard tier. The BYO Cartesia form
+                # lower on that page requires endpoint + CARTESIA_API_KEY, which
+                # we do not hold.
+                # https://developers.deepgram.com/docs/voice-agent-tts-models
+            },
             "greeting": GREETING,
         },
     }

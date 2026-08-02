@@ -41,22 +41,60 @@ _FAKE_SECRET = "sk_test_placeholder_never_sent"
 
 # ── Deepgram Voice Agent Settings ────────────────────────────────────────────
 
-def test_think_provider_sends_reasoning_mode_none() -> None:
-    """gpt-5.6 rejects function-tool calls at any effective reasoning above
-    "none" with an HTTP 400, and Deepgram forwards this field to the BYO endpoint
-    as OpenAI's reasoning_effort. Dropping it fails at the LLM hop — which is the
-    hop that decides whether run_errand gets called at all."""
-    settings_msg = _settings_message("gpt-5.6-sol")
-    think = settings_msg["agent"]["think"]
-    assert think["provider"]["reasoning_mode"] == "none", think["provider"]
+def test_voice_thinks_with_deepgram_managed_anthropic() -> None:
+    """The voice LLM is Deepgram-managed `anthropic` / `claude-sonnet-5`.
+
+    `claude-sonnet-5` appears verbatim in Deepgram's supported Anthropic model
+    table, and a model string outside a managed provider's list is rejected —
+    which would leave the agent able to hear but never answer.
+    https://developers.deepgram.com/docs/voice-agent-llm-models
+    """
+    provider = _settings_message("gpt-5.6-sol")["agent"]["think"]["provider"]
+    assert provider["type"] == "anthropic", provider
+    assert provider["model"] == "claude-sonnet-5", provider
 
 
-def test_think_endpoint_is_a_full_request_path() -> None:
-    """Deepgram POSTs this URL verbatim rather than appending a route to it, so an
-    API *base* here means every think request lands on a path that does not
-    exist and the agent can hear but never answer."""
-    url = _settings_message("gpt-5.6-sol")["agent"]["think"]["endpoint"]["url"]
-    assert url.endswith("/chat/completions"), url
+def test_voice_think_omits_endpoint_and_openai_only_reasoning_mode() -> None:
+    """Two absences, both load-bearing.
+
+    `endpoint` is omitted because Deepgram documents it as optional for
+    `anthropic` (it manages that LLM), so sending one would require an Anthropic
+    key we do not hold. `reasoning_mode` is omitted because Deepgram documents it
+    as OpenAI-only with values low|medium|high — the "none" this used to send was
+    not in the documented enum at all, and an unknown provider field is the
+    crash-class 4xx this repo has already been bitten by.
+    https://developers.deepgram.com/docs/configure-voice-agent
+    """
+    think = _settings_message("gpt-5.6-sol")["agent"]["think"]
+    assert "endpoint" not in think, think
+    assert "reasoning_mode" not in think["provider"], think["provider"]
+
+
+def test_voice_speaks_with_deepgram_managed_cartesia() -> None:
+    """TTS is Deepgram-managed Cartesia, keyed by `model_id` + a {mode,id} voice.
+
+    Cartesia does NOT take the `model` string that Deepgram/OpenAI use, and the
+    managed form carries no endpoint (Cartesia is billed through Deepgram's
+    Standard tier); the BYO form would need a Cartesia key we do not hold.
+    https://developers.deepgram.com/docs/voice-agent-tts-models
+    """
+    speak = _settings_message("gpt-5.6-sol")["agent"]["speak"]
+    provider = speak["provider"]
+    assert provider["type"] == "cartesia", provider
+    assert provider["model_id"] == "sonic-2", provider
+    assert "model" not in provider, provider
+    assert provider["voice"]["mode"] == "id", provider
+    assert provider["voice"]["id"], provider
+    assert "endpoint" not in speak, speak
+
+
+def test_voice_think_model_is_not_driven_by_the_chat_selector() -> None:
+    """Deepgram's managed Anthropic list contains no gpt-5.6 model, so the
+    sol/terra/luna selector cannot address the voice LLM. Pinned so nobody
+    "restores" the selector by feeding it into a provider that will reject it."""
+    for key in ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"):
+        provider = _settings_message(key)["agent"]["think"]["provider"]
+        assert provider["model"] == "claude-sonnet-5", (key, provider)
 
 
 def test_session_ceiling_matches_the_documented_two_hours() -> None:

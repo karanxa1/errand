@@ -28,3 +28,8 @@ Newest at the bottom.
 - A test written to pin a fix is what caught that the fix was incomplete — write the pin even when the change looks obviously right.
 - Before screenshotting a rebuild, confirm the OLD preview server actually died; EADDRINUSE means you are looking at stale output and will 'verify' the wrong thing.
 - Measure type against the font's real ascent/descent (canvas TextMetrics) rather than guessing line-height; the ERRAND wordmark's ink sat 25px past the cut.
+- 2026-08-02 (user): voice must use Deepgram-managed Cartesia TTS (`model_id` + {mode,id} voice, no endpoint) and Deepgram-managed Anthropic `claude-sonnet-5`; `reasoning_mode` is OpenAI-ONLY (low|medium|high) so it must be dropped, not translated — the old `"none"` was never in the documented enum.
+- Deepgram-managed Anthropic means the sol/terra/luna selector can no longer drive the VOICE model (its managed list has no gpt-5.6); the text path keeps the selector.
+- Senso's SEEDED policy itself names `https://demo-pantry.example.com` — an IANA-reserved host that can never be a store. Our fallback was never the cause; probe the provider before blaming our parser.
+- Prava ships NO test storefront: its REST API is sessions/payment-result/report-status/cards/mandates only. UCP + Browser Harness reach REAL Shopify merchants via CLI/MCP against the LIVE API with real cards, so they cannot stand in for a sandbox store.
+- Prava sandbox test card: 4622 9431 2313 7789, CVV 757, exp 12/27; test OTP 456789 (sandbox hosts only).
