@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import styles from "./Composer.module.css";
 
 export default function Composer({
@@ -11,8 +11,11 @@ export default function Composer({
   listening,
   onToggleMic,
   micSupported,
+  micDisabled,
+  micSlot,
   hint,
   error,
+  sendLabel,
 }: {
   value: string;
   onChange: (v: string) => void;
@@ -21,8 +24,17 @@ export default function Composer({
   listening: boolean;
   onToggleMic: () => void;
   micSupported: boolean;
+  // Independently disable ONLY the mic control. The orb must stay tappable to
+  // STOP a live voice session even while the textarea + send are locked.
+  micDisabled?: boolean;
+  // Optional custom mic control (the VoiceOrb). When given, it replaces the
+  // default round mic button so the signature orb IS the tap-to-talk control.
+  micSlot?: ReactNode;
   hint?: string;
   error?: string | null;
+  // When set, the send button shows a label + arrow (empty-state hero). When
+  // omitted, send is a compact circular icon action (in-thread composer).
+  sendLabel?: string;
 }) {
   const [focus, setFocus] = useState(false);
   const taRef = useRef<HTMLTextAreaElement | null>(null);
@@ -67,43 +79,84 @@ export default function Composer({
         </div>
 
         <div className={styles.actions}>
-          {micSupported && (
+          {micSupported &&
+            (micSlot ? (
+              <button
+                type="button"
+                className={styles.micSlot}
+                onClick={onToggleMic}
+                disabled={micDisabled}
+                aria-pressed={listening}
+                aria-label={listening ? "Stop listening" : "Speak your errand"}
+                title={listening ? "Stop listening" : "Speak your errand"}
+              >
+                {micSlot}
+              </button>
+            ) : (
+              <button
+                type="button"
+                className={`${styles.mic} ${listening ? styles.micLive : ""}`}
+                onClick={onToggleMic}
+                disabled={micDisabled}
+                aria-pressed={listening}
+                aria-label={listening ? "Stop listening" : "Speak your errand"}
+                title={listening ? "Stop listening" : "Speak your errand"}
+              >
+                <MicGlyph />
+              </button>
+            ))}
+          {sendLabel ? (
             <button
               type="button"
-              className={`${styles.mic} ${listening ? styles.micLive : ""}`}
-              onClick={onToggleMic}
-              disabled={disabled}
-              aria-pressed={listening}
-              aria-label={listening ? "Stop listening" : "Speak your errand"}
-              title={listening ? "Stop listening" : "Speak your errand"}
+              className={styles.send}
+              onClick={() => canSend && onSubmit()}
+              disabled={!canSend}
             >
-              <MicGlyph />
+              {sendLabel}
+              <svg
+                className={styles.sendArrow}
+                width="16"
+                height="16"
+                viewBox="0 0 16 16"
+                fill="none"
+                aria-hidden="true"
+              >
+                <path
+                  d="M4 12L12 4M12 4H6M12 4V10"
+                  stroke="currentColor"
+                  strokeWidth="1.9"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+              </svg>
+            </button>
+          ) : (
+            <button
+              type="button"
+              className={styles.sendRound}
+              onClick={() => canSend && onSubmit()}
+              disabled={!canSend}
+              aria-label="Run errand"
+              title="Run errand"
+            >
+              <svg
+                className={styles.sendArrow}
+                width="17"
+                height="17"
+                viewBox="0 0 16 16"
+                fill="none"
+                aria-hidden="true"
+              >
+                <path
+                  d="M4 12L12 4M12 4H6M12 4V10"
+                  stroke="currentColor"
+                  strokeWidth="1.9"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+              </svg>
             </button>
           )}
-          <button
-            type="button"
-            className={styles.send}
-            onClick={() => canSend && onSubmit()}
-            disabled={!canSend}
-          >
-            Run errand
-            <svg
-              className={styles.sendArrow}
-              width="16"
-              height="16"
-              viewBox="0 0 16 16"
-              fill="none"
-              aria-hidden="true"
-            >
-              <path
-                d="M4 12L12 4M12 4H6M12 4V10"
-                stroke="currentColor"
-                strokeWidth="1.9"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              />
-            </svg>
-          </button>
         </div>
       </div>
     </div>

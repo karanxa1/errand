@@ -6,6 +6,21 @@
 //
 // Frame grammar (text/event-stream): frames are separated by a blank line; each
 // frame has an `event: <name>` line and one or more `data: <json>` lines.
+//
+// RESILIENCE (client-only; no server resume token exists yet):
+//   A run is a POST SSE, so every re-POST would START A NEW RUN server-side and
+//   could DOUBLE-CHARGE. We therefore split the failure surface in two:
+//   * BEFORE any frame has arrived (the run hasn't started on the server): a
+//     transient connect failure is safe to retry with bounded exponential
+//     backoff, because no run exists yet. `onReconnecting` fires per attempt so
+//     the UI (the orb) can show a "reconnecting" motion instead of a hard error.
+//   * AFTER the first frame (a run IS live on the server): a drop is NOT
+//     auto-retried — re-POSTing would spawn a duplicate run. Instead we surface
+//     `onConnectionLost` so the UI can degrade gracefully: keep every event/audit
+//     already received visible and offer a manual retry the operator controls.
+//   Only a real terminal error (retries exhausted with zero frames) reaches
+//   `onError`. A clean end after a terminal event (`run.done`/`run.error`) is
+//   `onDone` and never triggers reconnect.
 
 import type { RawFrame } from "./types";
 
@@ -13,6 +28,12 @@ export interface RunStreamHandlers {
   onFrame: (frame: RawFrame) => void;
   onError?: (message: string) => void;
   onDone?: () => void;
+  // A transient connect failure is being retried (no run started yet). `attempt`
+  // is 1-based; `delayMs` is how long we wait before the next try.
+  onReconnecting?: (attempt: number, delayMs: number) => void;
+  // The live stream dropped mid-run. We do NOT auto-reconnect (would duplicate
+  // the run); the UI should show a manual-retry affordance and keep what it has.
+  onConnectionLost?: (message: string) => void;
 }
 
 export interface RunStreamOptions {
@@ -27,6 +48,30 @@ export interface RunStreamController {
   abort: () => void;
 }
 
+// Bounded backoff: a small number of quick tries, capped, only for the
+// pre-run-start window where retrying is safe.
+const MAX_CONNECT_ATTEMPTS = 3;
+const BACKOFF_BASE_MS = 500;
+const BACKOFF_MAX_MS = 4000;
+
+function backoffDelay(attempt: number): number {
+  return Math.min(BACKOFF_MAX_MS, BACKOFF_BASE_MS * 2 ** (attempt - 1));
+}
+
+function sleep(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    const id = setTimeout(resolve, ms);
+    signal.addEventListener(
+      "abort",
+      () => {
+        clearTimeout(id);
+        resolve();
+      },
+      { once: true },
+    );
+  });
+}
+
 export function startErrandStream(
   url: string,
   options: RunStreamOptions,
@@ -35,55 +80,102 @@ export function startErrandStream(
   const controller = new AbortController();
 
   (async () => {
-    let res: Response;
-    try {
-      res = await fetch(url, {
+    // These persist ACROSS reconnect attempts. Once we've seen a single frame,
+    // a run is live on the server and re-POSTing is forbidden (double-charge).
+    let receivedAnyFrame = false;
+    let sawTerminal = false;
+    let attempt = 0;
+
+    // Consume one fetch+reader lifecycle. Returns "clean" if the body ended
+    // normally, or throws on a network/read failure so the caller can decide
+    // whether reconnecting is safe.
+    async function consumeOnce(): Promise<"clean"> {
+      const res = await fetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(options),
         signal: controller.signal,
       });
-    } catch (err) {
-      if (!controller.signal.aborted) {
-        handlers.onError?.(
-          `Could not reach the agent backend. ${(err as Error).message}`,
-        );
+
+      if (!res.ok || !res.body) {
+        // A non-2xx is a definite backend refusal, not a transient blip — but
+        // only fatal if no run has started. If a run is already live this path
+        // can't happen (we hold one open stream), so treat as connect failure.
+        throw new Error(`Backend responded ${res.status}.`);
       }
-      return;
-    }
 
-    if (!res.ok || !res.body) {
-      handlers.onError?.(`Backend responded ${res.status}.`);
-      return;
-    }
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
 
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
-
-    try {
       // eslint-disable-next-line no-constant-condition
       while (true) {
         const { value, done } = await reader.read();
         if (done) break;
         buffer += decoder.decode(value, { stream: true });
 
-        // Split complete frames on the blank-line delimiter.
+        // Split complete frames on the blank-line delimiter (handles \n\n and
+        // \r\n\r\n).
         let sep: number;
-        // Handle both \n\n and \r\n\r\n.
-        while (
-          (sep = indexOfFrameBoundary(buffer)) !== -1
-        ) {
+        while ((sep = indexOfFrameBoundary(buffer)) !== -1) {
           const rawFrame = buffer.slice(0, sep);
           buffer = buffer.slice(sep).replace(/^(\r?\n){2}/, "");
           const parsed = parseFrame(rawFrame);
-          if (parsed) handlers.onFrame(parsed);
+          if (parsed) {
+            receivedAnyFrame = true;
+            if (parsed.event === "run.done" || parsed.event === "run.error") {
+              sawTerminal = true;
+            }
+            handlers.onFrame(parsed);
+          }
         }
       }
-      handlers.onDone?.();
-    } catch (err) {
-      if (!controller.signal.aborted) {
-        handlers.onError?.((err as Error).message);
+      return "clean";
+    }
+
+    while (true) {
+      attempt += 1;
+      try {
+        await consumeOnce();
+        // Body ended. If we reached a terminal event (or any frames at all with
+        // a clean close), the run is over — signal done and stop.
+        handlers.onDone?.();
+        return;
+      } catch (err) {
+        if (controller.signal.aborted) return;
+
+        const message = (err as Error).message || "Stream connection failed.";
+
+        if (receivedAnyFrame && !sawTerminal) {
+          // A run is LIVE on the server and the stream dropped mid-flight.
+          // Re-POSTing would start a second run (double-charge), so we do NOT
+          // auto-reconnect. Degrade gracefully: the UI keeps every received
+          // event/audit and offers a manual retry the operator owns.
+          handlers.onConnectionLost?.(
+            "The live connection to the running errand dropped. " +
+              "Everything received so far is preserved below.",
+          );
+          return;
+        }
+
+        if (sawTerminal) {
+          // Terminal event already delivered; a trailing drop is harmless.
+          handlers.onDone?.();
+          return;
+        }
+
+        // No frame yet → no server-side run exists → retrying is safe.
+        if (attempt >= MAX_CONNECT_ATTEMPTS) {
+          handlers.onError?.(
+            `Could not reach the agent backend after ${attempt} attempts. ${message}`,
+          );
+          return;
+        }
+        const delay = backoffDelay(attempt);
+        handlers.onReconnecting?.(attempt, delay);
+        await sleep(delay, controller.signal);
+        if (controller.signal.aborted) return;
+        // loop → try again
       }
     }
   })();

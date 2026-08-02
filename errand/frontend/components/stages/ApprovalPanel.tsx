@@ -1,31 +1,66 @@
 "use client";
 
 import { useState } from "react";
-import type { ApprovalRequest } from "@/lib/types";
+import type {
+  ApprovalRequest,
+  ApprovalResult,
+  ToolCardProps,
+} from "@/lib/types";
 import { money } from "@/lib/format";
 import s from "./ApprovalPanel.module.css";
 
-/* ApprovalPanel — the emotional peak. Shows the cart total + merchant, mounts
-   the Prava passkey iframe (session.iframe_url), and gates the spend on the
-   operator's explicit Approve, which POSTs /approve {approved:true}.
+/* ApprovalPanel — the emotional peak, and the first typed tool card.
 
-   Demo note: the Prava iframe is shown for the passkey MOMENT; the run's
-   approval gate is resolved by the POST. If the iframe URL can't render (sandbox
-   blocks embedding), a clear fallback with the live link is shown so the moment
-   still reads as "authorise on Prava". */
+   It implements the tool-card contract ToolCardProps<ApprovalRequest,
+   ApprovalResult> (shape borrowed from assistant-ui's tool-UI pattern — the
+   INTERFACE only, not the library): it renders from its inbound `args`, its
+   `result` (null until the operator decides), an explicit `status`
+   (pending → resolving → resolved), and a single `resolve` callback that both
+   the Approve and the (now live) "Not now" decline route through.
+
+   Shows the cart total + merchant, mounts the Prava passkey iframe
+   (session.iframe_url), and gates the spend on the operator's explicit verdict,
+   which POSTs /approve { approved, reason? }. If the iframe can't render
+   (sandbox blocks embedding), a clear fallback with the live link is shown so
+   the moment still reads as "authorise on Prava". */
 
 export default function ApprovalPanel({
-  approval,
-  onApprove,
-  approving,
-}: {
-  approval: ApprovalRequest;
-  onApprove: () => void;
-  approving: boolean;
-}) {
+  args: approval,
+  result,
+  status,
+  resolve,
+}: ToolCardProps<ApprovalRequest, ApprovalResult>) {
   const [frameFailed, setFrameFailed] = useState(false);
   const { cart, session, context } = approval;
   const merchant = context.approved_merchants[0];
+
+  const resolving = status === "resolving";
+  const declined = status === "resolved" && result?.approved === false;
+
+  // Resolved-declined: the card holds its place with a clear, calm terminal
+  // state instead of vanishing — the decision stays on the record.
+  if (declined) {
+    return (
+      <div className={s.wrap}>
+        <span className={`${s.badge} ${s.badgeDeclined}`}>
+          <span className={s.badgeDot} />
+          Spend declined
+        </span>
+        <h2 className={s.headline}>You declined this spend</h2>
+        <p className={s.lede}>
+          Nothing was charged. The card session pinned to{" "}
+          <span className={s.toName}>{merchant?.name ?? "the merchant"}</span>{" "}
+          for {money(cart.total_cents)} was released.
+        </p>
+        {result?.reason && (
+          <div className={s.reason}>
+            <span className={s.reasonKey}>Reason</span>
+            <span className={s.reasonVal}>{result.reason}</span>
+          </div>
+        )}
+      </div>
+    );
+  }
 
   return (
     <div className={s.wrap}>
@@ -101,10 +136,10 @@ export default function ApprovalPanel({
       <div className={s.actions}>
         <button
           className={s.approve}
-          onClick={onApprove}
-          disabled={approving}
+          onClick={() => resolve({ approved: true })}
+          disabled={resolving}
         >
-          {approving ? (
+          {resolving ? (
             <>
               <span className={s.spinner} />
               Approving…
@@ -116,7 +151,12 @@ export default function ApprovalPanel({
             </>
           )}
         </button>
-        <button className={s.decline} disabled={approving} type="button">
+        <button
+          className={s.decline}
+          disabled={resolving}
+          type="button"
+          onClick={() => resolve({ approved: false })}
+        >
           Not now
         </button>
         <span className={s.note}>Session {session.session_id.slice(0, 14)}…</span>

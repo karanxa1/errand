@@ -15,28 +15,34 @@ from __future__ import annotations
 import asyncio
 import uuid
 
-from fastapi import FastAPI
+from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from app.brokers import build_brokers
 from app.config import settings
+from app.orchestrator.guards import ApprovalDecision
 from app.orchestrator.run_errand import run_errand
 from app.orchestrator.stream import EventStream
+from app.voice.relay import voice_ws
 
 app = FastAPI(title="Errand Backend")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=settings.cors_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # In-memory approval gates keyed by run id. Each run awaits its Future until the
-# frontend POSTs /approve (after the operator confirms + passkey).
-_approvals: dict[str, asyncio.Future[bool]] = {}
+# frontend POSTs /approve (after the operator confirms + passkey). The Future
+# resolves with a typed ApprovalDecision (approved / declined+reason / timeout).
+_approvals: dict[str, asyncio.Future[ApprovalDecision]] = {}
+
+# Human-in-the-loop gate timeout (seconds). Expiry emits `approval.timeout`.
+APPROVAL_TIMEOUT_S = 300
 
 
 MODELS = [
@@ -49,6 +55,13 @@ MODELS = [
 @app.get("/health")
 async def health() -> dict:
     return {"status": "ok"}
+
+
+@app.websocket("/api/voice/ws")
+async def voice_ws_route(websocket: WebSocket) -> None:
+    # Deepgram Voice Agent relay + tool bridge. The backend holds the Deepgram
+    # WS (browser tokens are FORBIDDEN on our key) and relays audio/events.
+    await voice_ws(websocket)
 
 
 @app.get("/api/models")
@@ -73,19 +86,41 @@ class ErrandRequest(BaseModel):
 @app.post("/api/errand/stream")
 async def errand_stream(req: ErrandRequest) -> StreamingResponse:
     run_id = uuid.uuid4().hex
+    approval_id = uuid.uuid4().hex  # distinct from run_id; correlates the gate.
     stream = EventStream()
     brokers = build_brokers()
 
-    fut: asyncio.Future[bool] = asyncio.get_event_loop().create_future()
+    fut: asyncio.Future[ApprovalDecision] = asyncio.get_running_loop().create_future()
     _approvals[run_id] = fut
 
-    async def approve(_payload: dict) -> bool:
+    # Cancel token: lets the SSE generator abort an in-flight run cleanly when
+    # the client disconnects (loop/hang safety).
+    cancel = asyncio.Event()
+
+    async def approve(_payload: dict) -> ApprovalDecision:
         # Emit the approval request to the client, then block until /approve.
-        await stream.emit_raw("approval.request", {"run_id": run_id, **_payload})
+        await stream.emit_raw(
+            "approval.request", {"run_id": run_id, "approval_id": approval_id, **_payload}
+        )
         try:
-            return await asyncio.wait_for(fut, timeout=300)
+            decision = await asyncio.wait_for(fut, timeout=APPROVAL_TIMEOUT_S)
         except asyncio.TimeoutError:
-            return False
+            await stream.emit_raw(
+                "approval.timeout",
+                {
+                    "run_id": run_id,
+                    "approval_id": approval_id,
+                    "timeout_s": APPROVAL_TIMEOUT_S,
+                },
+            )
+            return ApprovalDecision(approved=False, approval_id=approval_id, timed_out=True)
+        # Stamp the run's approval_id onto whatever /approve resolved with.
+        return ApprovalDecision(
+            approved=decision.approved,
+            approval_id=approval_id,
+            reason=decision.reason,
+            timed_out=decision.timed_out,
+        )
 
     async def run() -> None:
         # Announce run id first so the client can target /approve.
@@ -99,8 +134,13 @@ async def errand_stream(req: ErrandRequest) -> StreamingResponse:
                 user_email_fallback=req.user_email,
                 emit=stream.emit,
                 approve=approve,
+                cancel=cancel,
             )
             await stream.emit_raw("run.done", outcome)
+        except asyncio.CancelledError:
+            # Cooperative cancellation (client gone / server shutdown).
+            await stream.emit_raw("run.error", {"message": "run cancelled"})
+            raise
         except Exception as e:  # surface errors as a stream event, never 500 mid-stream
             await stream.emit_raw("run.error", {"message": str(e)})
         finally:
@@ -110,9 +150,24 @@ async def errand_stream(req: ErrandRequest) -> StreamingResponse:
     task = asyncio.create_task(run())
 
     async def body():
-        async for frame in stream.drain():
-            yield frame
-        await task  # ensure cleanup
+        try:
+            async for frame in stream.drain():
+                yield frame
+        finally:
+            # Always tear down: signal cancel, unblock any pending gate, and
+            # ensure the background task is finished so nothing leaks.
+            cancel.set()
+            pending = _approvals.pop(run_id, None)
+            if pending is not None and not pending.done():
+                pending.set_result(
+                    ApprovalDecision(approved=False, approval_id=approval_id, reason="stream closed")
+                )
+            if not task.done():
+                task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
 
     return StreamingResponse(
         body(),
@@ -123,6 +178,7 @@ async def errand_stream(req: ErrandRequest) -> StreamingResponse:
 
 class ApproveRequest(BaseModel):
     approved: bool = True
+    reason: str | None = None
 
 
 @app.post("/api/errand/{run_id}/approve")
@@ -130,5 +186,9 @@ async def approve_errand(run_id: str, req: ApproveRequest) -> dict:
     fut = _approvals.get(run_id)
     if fut is None or fut.done():
         return {"ok": False, "reason": "no pending approval for this run"}
-    fut.set_result(req.approved)
-    return {"ok": True}
+    # approval_id is stamped by the stream's approve() wrapper; pass a decision
+    # carrying the operator's verdict + optional typed decline reason.
+    fut.set_result(
+        ApprovalDecision(approved=req.approved, approval_id=run_id, reason=req.reason)
+    )
+    return {"ok": True, "approved": req.approved}

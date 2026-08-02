@@ -140,3 +140,61 @@ Decide during backend build; (b) is the no-extra-permission fallback and fits th
 - Models on this key: `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna` (all respond).
 - Selector: Sol (flagship, default) / Terra (balanced) / Luna (fast).
 - Used both as Deepgram `think` provider model AND for the text chat route.
+
+---
+
+## Linkup (web search) — VERIFIED LIVE
+- Base: `https://api.linkup.so/v1`
+- Auth: `Authorization: Bearer <LINKUP_API_KEY>` (in .env)
+- Python SDK: `pip install linkup-sdk` → `LinkupClient(api_key=...).search(query=, depth=, output_type=)`
+- HTTP: `POST /v1/search` JSON `{ "q": "<query>", "depth": "standard"|"deep", "outputType": "sourcedAnswer" }`
+  → `{ "answer": "<grounded answer>", "sources": [{ name, url, snippet, favicon }, ...] }`
+- Verified: q="best rated standing desk under $400 2026" → answer + 20 sources.
+- Use `depth:"standard"` for fast, `"deep"` for multi-iteration.
+
+## Deepgram Voice Agent — think model for Sol/Terra/Luna (gpt-5.6)
+- Managed `open_ai` list tops out at gpt-5.5. To use our gpt-5.6-{sol,terra,luna},
+  use BYO endpoint override (docs-supported):
+  think.provider = { type:"open_ai", model:"gpt-5.6-sol" }
+  think.endpoint = { url:"https://api.openai.com/v1", headers:{ Authorization:"Bearer <OPENAI_API_KEY>" } }
+- reasoning_mode (low|medium|high) supported on gpt-5 family.
+
+---
+
+## Errand Voice Relay + Tool Bridge — INTERNAL CONTRACT (backend WS the browser talks to)
+Deepgram browser tokens are FORBIDDEN on this key, so the BACKEND holds the
+Deepgram Voice Agent WS and relays to the browser. The browser talks to OUR
+backend WS, never to Deepgram directly.
+
+### Browser <-> Backend WebSocket:  `ws://localhost:8787/api/voice/ws?model=sol&profile=business`
+- Browser → backend: binary audio frames (linear16, 48kHz mono mic PCM) as they capture.
+- Browser → backend (JSON control): `{ "type":"start" }`, `{ "type":"stop" }`,
+  `{ "type":"approve", "run_id":"...", "approved":true, "reason":"" }`.
+- Backend → browser (binary): agent TTS audio frames (linear16, 16kHz) to play.
+- Backend → browser (JSON events), superset of the SSE errand events plus voice events:
+  - `voice.state` { state: "listening"|"thinking"|"speaking"|"idle" }
+  - `voice.user_transcript` { text, is_final }
+  - `voice.agent_transcript` { text }        (what the agent says)
+  - `tool.call` { name, args }               (agent invoked a tool)
+  - `tool.result` { name, summary }          (tool finished)
+  - ALL errand SSE events (run.started, context.loaded, cart.built,
+    approval.request, ... run.done) — emitted when the errand subagent tool runs,
+    so the chat thread shows everything the voice agent is doing.
+  - `websearch.result` { query, answer, sources:[{name,url,snippet}] }
+
+### Deepgram think.functions (the voice agent's tools) — 2 tools
+1. `run_errand` — the CHAT/ERRAND AGENT AS A SUBAGENT. args: { intent:string,
+   profile?"business"|"personal" }. Handler runs the existing run_errand
+   orchestrator; every orchestrator AuditEvent is forwarded to the browser as the
+   same-named event (so voice-driven runs render in the chat thread). The approval
+   gate surfaces `approval.request` to the browser; the browser's `approve`
+   control resolves it. Returns a short spoken summary (order id + total, or the
+   reason it stopped) as the FunctionCallResponse content.
+2. `web_search` — Linkup. args: { query:string, depth?"standard"|"deep" }.
+   Handler calls Linkup, emits `websearch.result` to the browser, returns the
+   grounded answer (+ top source titles) as FunctionCallResponse content.
+
+### Deepgram FunctionCallRequest/Response (wire)
+- Server → us: `{ type:"FunctionCallRequest", functions:[{ id, name, arguments(JSON string), client_side }] }`
+- We reply: `{ type:"FunctionCallResponse", id, name, content:"<stringified result>" }`
+- Backend executes both tools server-side (client_side handling in backend, not browser).

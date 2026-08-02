@@ -39,6 +39,10 @@ class Settings(BaseSettings):
     # OpenAI
     openai_api_key: str = ""
 
+    # Linkup (web search)
+    linkup_api_key: str = ""
+    linkup_api_base: str = "https://api.linkup.so/v1"
+
     # Feature flags: use mock brokers until real ones verified per-broker.
     # Context + Payment are verified real (Senso, Prava). Shopper + Mail stay
     # mock until their parallel-agent implementations land.
@@ -46,6 +50,23 @@ class Settings(BaseSettings):
     use_mock_mail: bool = False
     use_mock_context: bool = False
     use_mock_payment: bool = False
+
+    # CORS: comma-separated list of allowed browser origins for the HTTP/SSE
+    # API. Local dev defaults are always included; in production set
+    # ALLOWED_ORIGINS to the deployed frontend origin(s), e.g.
+    # "https://errand-frontend.<subdomain>.workers.dev". (WebSocket connections
+    # are not subject to CORS, so the voice relay works cross-origin regardless.)
+    allowed_origins: str = ""
+
+    @property
+    def cors_origins(self) -> list[str]:
+        defaults = ["http://localhost:3000", "http://127.0.0.1:3000"]
+        extra = [o.strip() for o in self.allowed_origins.split(",") if o.strip()]
+        # Preserve order, drop dups.
+        seen: dict[str, None] = {}
+        for o in [*defaults, *extra]:
+            seen.setdefault(o, None)
+        return list(seen.keys())
 
 
 settings = Settings()

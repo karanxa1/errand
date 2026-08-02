@@ -1,0 +1,188 @@
+/* ToolCard — card surface + collapsible body. Elevation from tone and a
+   self-colored top lip; no all-around drop shadow, no drawn contrasting border,
+   no icon tile. */
+
+.card {
+  background: linear-gradient(180deg, var(--ink-100), var(--ink-050));
+  border-radius: var(--radius);
+  box-shadow:
+    inset 0 1px 0 rgba(160, 240, 200, 0.06),
+    inset 0 0 0 1px var(--edge);
+  overflow: hidden;
+}
+
+/* Warn / error tones shift the top lip + edge warmth, not a loud fill. */
+.warn {
+  box-shadow:
+    inset 0 1px 0 rgba(232, 180, 95, 0.16),
+    inset 0 0 0 1px rgba(232, 180, 95, 0.2);
+}
+
+.error {
+  box-shadow:
+    inset 0 1px 0 rgba(255, 122, 107, 0.16),
+    inset 0 0 0 1px rgba(255, 122, 107, 0.22);
+}
+
+/* ── Header row ──────────────────────────────────────────────────────────── */
+.header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: none;
+  color: var(--text);
+  padding: 14px 16px;
+}
+
+/* Bare mark, tinted by tone — no tile behind it. */
+.icon {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--green);
+}
+
+.warn .icon {
+  color: var(--brass);
+}
+
+.error .icon {
+  color: var(--danger);
+}
+
+.titleWrap {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-hi);
+  letter-spacing: 0.01em;
+  line-height: 1.25;
+}
+
+.meta {
+  font-size: 12px;
+  color: var(--text-mid);
+  line-height: 1.3;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ── Status chip ─────────────────────────────────────────────────────────── */
+.chip {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 22px;
+  padding: 0 7px;
+  border-radius: 999px;
+}
+
+.chipDone {
+  width: 22px;
+  padding: 0;
+  color: #04150d;
+  background: var(--green);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.22);
+}
+
+.chipError {
+  width: 22px;
+  padding: 0;
+  color: var(--danger);
+  background: rgba(255, 122, 107, 0.12);
+  box-shadow: inset 0 0 0 1px rgba(255, 122, 107, 0.28);
+}
+
+.chipRunning {
+  background: var(--ink-200);
+  box-shadow: inset 0 0 0 1px var(--edge);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+/* Text shimmer — a light sweep across the label, gated by reduced-motion. */
+.shimmer {
+  background: linear-gradient(
+    90deg,
+    var(--text-low) 0%,
+    var(--text-low) 35%,
+    var(--green-soft) 50%,
+    var(--text-low) 65%,
+    var(--text-low) 100%
+  );
+  background-size: 220% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  color: transparent;
+  animation: sweep 1.6s ease-in-out infinite;
+}
+
+@keyframes sweep {
+  0% {
+    background-position: 120% 0;
+  }
+  100% {
+    background-position: -120% 0;
+  }
+}
+
+.chev {
+  flex: none;
+  color: var(--text-low);
+  transition: transform 0.2s ease;
+}
+
+.chevOpen {
+  transform: rotate(180deg);
+}
+
+/* ── Collapsible body — pure CSS grid-rows. Content is always in the DOM; the
+   reveal never depends on a JS animation firing. ─────────────────────────── */
+.bodyGrid {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows 0.2s ease;
+}
+
+.bodyOpen {
+  grid-template-rows: 1fr;
+}
+
+.bodyInner {
+  min-height: 0;
+  overflow: hidden;
+}
+
+.body {
+  padding: 0 16px 16px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .bodyGrid {
+    transition: none;
+  }
+  .shimmer {
+    animation: none;
+    background: none;
+    -webkit-text-fill-color: currentColor;
+    color: var(--text-mid);
+  }
+}

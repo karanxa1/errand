@@ -1,0 +1,47 @@
+.thread {
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+  width: 100%;
+}
+
+/* ── User turn — a right-aligned bubble, tonal (not the accent). ──────────── */
+.userRow {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.userBubble {
+  max-width: 84%;
+  padding: 12px 16px;
+  border-radius: 16px 16px 4px 16px;
+  background: linear-gradient(180deg, var(--ink-200), var(--ink-150));
+  box-shadow:
+    inset 0 1px 0 rgba(160, 240, 200, 0.08),
+    inset 0 0 0 1px var(--edge);
+  color: var(--text-hi);
+  font-size: 14.5px;
+  line-height: 1.5;
+}
+
+/* The forming (interim) spoken utterance — a quieter, in-progress user bubble. */
+.userForming {
+  color: var(--text-mid);
+  box-shadow:
+    inset 0 1px 0 rgba(160, 240, 200, 0.05),
+    inset 0 0 0 1px var(--edge);
+  background: linear-gradient(180deg, var(--ink-150), var(--ink-100));
+}
+
+/* ── Assistant turn — the sequence of tool cards + lines + closing bubble. ── */
+.assistant {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+/* Voice turns interleave user bubbles into the assistant column; give them room
+   to breathe against the cards around them. */
+.assistant .userRow {
+  margin: 4px 0;
+}

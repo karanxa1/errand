@@ -26,13 +26,20 @@ Implements the ShopperBroker Protocol from app.contracts exactly:
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
+import logging
 import os
 import re
-from typing import AsyncIterator, Literal
+from typing import AsyncIterator, Awaitable, Literal, TypeVar
 from urllib.parse import urlparse, urlsplit, urlunsplit, parse_qsl, urlencode
 
-from playwright.async_api import Page, async_playwright
+from playwright.async_api import (
+    Error as PlaywrightError,
+    Page,
+    TimeoutError as PlaywrightTimeoutError,
+    async_playwright,
+)
 
 from app.contracts import (
     CartItem,
@@ -43,7 +50,75 @@ from app.contracts import (
     PurchaseContext,
 )
 
+logger = logging.getLogger(__name__)
+
 BrowserMode = Literal["cloudflare", "local"]
+T = TypeVar("T")
+
+# ── Resilience knobs ────────────────────────────────────────────────────────────
+# Every browser action gets an explicit timeout so a stuck page can never hang the
+# SSE stream. Values are milliseconds (Playwright's unit) unless suffixed _S.
+_NAV_TIMEOUT_MS = 30_000        # page.goto / page.reload
+_SELECTOR_TIMEOUT_MS = 10_000   # wait_for_selector readiness probe
+_ACTION_TIMEOUT_MS = 10_000     # click / fill / eval
+_CONFIRMATION_TIMEOUT_MS = 15_000  # wait for the order confirmation to render
+_CONNECT_TIMEOUT_MS = 30_000    # CDP connect / local launch
+
+# Empty-DOM / not-ready ladder (browser-use service.py:514-544): after navigating,
+# if the expected element isn't there, wait → reload → wait, bounded, then raise a
+# structured error. Attempt 1 = initial nav; later attempts pause then reload.
+_MAX_READY_ATTEMPTS = 3
+_EMPTY_DOM_WAIT_S = 3.0   # pause before the first reload
+_RELOAD_WAIT_S = 5.0      # pause before any subsequent reload
+
+
+class ShopperError(RuntimeError):
+    """Structured, human-readable failure the orchestrator can surface directly.
+
+    Carries which ``step`` failed (e.g. "build_cart") and, when relevant, the URL
+    involved, so a ``cart.failed`` audit event reads cleanly instead of leaking a
+    raw Playwright stack trace.
+    """
+
+    def __init__(self, step: str, message: str, *, url: str | None = None) -> None:
+        self.step = step
+        self.url = url
+        detail = f"[shopper:{step}] {message}"
+        if url:
+            detail = f"{detail} (url={url})"
+        super().__init__(detail)
+
+
+def _short(exc: BaseException, limit: int = 200) -> str:
+    """One-line, length-bounded rendering of an exception for error messages."""
+    text = f"{type(exc).__name__}: {exc}".splitlines()[0]
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+_warned: set[str] = set()
+
+
+def _warn_once(key: str, msg: str) -> None:
+    """De-dupe warnings so a bounded retry loop can't spam the logs."""
+    if key in _warned:
+        return
+    _warned.add(key)
+    logger.warning(msg)
+
+
+async def _page_appears_empty(page: Page) -> bool:
+    """Empty-DOM health check: True when the page rendered no real content.
+
+    Mirrors browser-use's ``_page_appears_empty`` (service.py:514-544): a
+    navigation can "succeed" yet leave a blank document (SPA not hydrated,
+    anti-bot interstitial). Stripping tags and checking for any text is a robust
+    proxy for their DOM ``llm_representation()`` check.
+    """
+    try:
+        html = await asyncio.wait_for(page.content(), timeout=_ACTION_TIMEOUT_MS / 1000)
+    except (asyncio.TimeoutError, PlaywrightTimeoutError, PlaywrightError):
+        return True
+    return not re.sub(r"<[^>]+>", " ", html).strip()
 
 
 def _settings_get(name: str) -> str:
@@ -111,6 +186,13 @@ class CloudflareShopperBroker:
         api_token: str | None = None,
         *,
         force_local: bool = False,
+        nav_timeout_ms: int = _NAV_TIMEOUT_MS,
+        selector_timeout_ms: int = _SELECTOR_TIMEOUT_MS,
+        action_timeout_ms: int = _ACTION_TIMEOUT_MS,
+        confirmation_timeout_ms: int = _CONFIRMATION_TIMEOUT_MS,
+        empty_dom_wait_s: float = _EMPTY_DOM_WAIT_S,
+        reload_wait_s: float = _RELOAD_WAIT_S,
+        max_ready_attempts: int = _MAX_READY_ATTEMPTS,
     ) -> None:
         self._account_id = (
             account_id
@@ -123,6 +205,16 @@ class CloudflareShopperBroker:
             or _settings_get("cloudflare_api_token")
         )
         self._force_local = force_local
+        # Per-action timeouts (ms) and the not-ready ladder's waits (s). Defaults
+        # match the module constants; overridable so tests can run the failure
+        # ladder fast instead of waiting the full production budget.
+        self._nav_timeout_ms = nav_timeout_ms
+        self._selector_timeout_ms = selector_timeout_ms
+        self._action_timeout_ms = action_timeout_ms
+        self._confirmation_timeout_ms = confirmation_timeout_ms
+        self._empty_dom_wait_s = empty_dom_wait_s
+        self._reload_wait_s = reload_wait_s
+        self._max_ready_attempts = max(1, max_ready_attempts)
 
     # ── browser session management ────────────────────────────────────────────
 
@@ -144,7 +236,9 @@ class CloudflareShopperBroker:
             if mode == "cloudflare":
                 ws = _CF_WS_TEMPLATE.format(account_id=self._account_id)
                 browser = await pw.chromium.connect_over_cdp(
-                    ws, headers={"Authorization": f"Bearer {self._api_token}"}
+                    ws,
+                    headers={"Authorization": f"Bearer {self._api_token}"},
+                    timeout=_CONNECT_TIMEOUT_MS,
                 )
                 # Cloudflare hands back a live context; reuse it.
                 context = browser.contexts[0] if browser.contexts else await browser.new_context()
@@ -166,6 +260,71 @@ class CloudflareShopperBroker:
                     with contextlib.suppress(Exception):
                         await browser.close()
 
+    # ── resilience primitives ─────────────────────────────────────────────────
+
+    async def _guard(self, step: str, what: str, coro: Awaitable[T], *, url: str | None = None) -> T:
+        """Run one browser action under an explicit timeout, wrapping failures.
+
+        A per-action ``asyncio.wait_for`` backstops Playwright's own timeout so a
+        stuck action can never hang the SSE stream; any timeout/exception becomes a
+        structured ``ShopperError`` naming the step and action instead of a raw
+        Playwright stack.
+        """
+        budget_s = self._action_timeout_ms / 1000 + 5.0  # cushion over PW's own timeout
+        try:
+            return await asyncio.wait_for(coro, timeout=budget_s)
+        except (asyncio.TimeoutError, PlaywrightTimeoutError) as exc:
+            raise ShopperError(step, f"timed out while {what}", url=url) from exc
+        except ShopperError:
+            raise
+        except PlaywrightError as exc:
+            raise ShopperError(step, f"failed while {what}: {_short(exc)}", url=url) from exc
+
+    async def _goto_ready(self, page: Page, url: str, ready_selector: str, step: str) -> None:
+        """Navigate to ``url`` and confirm ``ready_selector`` renders.
+
+        Empty-DOM / not-ready ladder (browser-use service.py:514-544): navigate,
+        then up to ``_max_ready_attempts`` times try to see the expected element;
+        on empty/missing DOM, wait → reload → wait and retry. If it never appears,
+        raise a structured ``ShopperError`` — never hang, never a bare stack.
+        """
+        for attempt in range(1, self._max_ready_attempts + 1):
+            if attempt == 1:
+                await self._guard(
+                    step, f"navigating to {url}",
+                    page.goto(url, wait_until="networkidle", timeout=self._nav_timeout_ms),
+                    url=url,
+                )
+            else:
+                # not ready yet: pause, then reload and re-probe.
+                pause = self._empty_dom_wait_s if attempt == 2 else self._reload_wait_s
+                _warn_once(
+                    f"{step}:{url}:{attempt}",
+                    f"[shopper:{step}] {ready_selector!r} not ready on {url}; "
+                    f"waiting {pause}s then reload (attempt {attempt}/{self._max_ready_attempts})",
+                )
+                await asyncio.sleep(pause)
+                with contextlib.suppress(asyncio.TimeoutError, PlaywrightTimeoutError, PlaywrightError):
+                    await asyncio.wait_for(
+                        page.reload(wait_until="networkidle", timeout=self._nav_timeout_ms),
+                        timeout=self._nav_timeout_ms / 1000 + 5.0,
+                    )
+
+            # readiness probe: is the expected element actually there?
+            try:
+                await page.wait_for_selector(ready_selector, timeout=self._selector_timeout_ms)
+                if not await _page_appears_empty(page):
+                    return  # ready
+            except (PlaywrightTimeoutError, PlaywrightError):
+                pass  # fall through to the next ladder rung
+
+        raise ShopperError(
+            step,
+            f"page loaded but expected element {ready_selector!r} never rendered "
+            f"after {self._max_ready_attempts} attempts (empty DOM / not ready)",
+            url=url,
+        )
+
     # ── ShopperBroker Protocol ────────────────────────────────────────────────
 
     async def build_cart(
@@ -175,44 +334,72 @@ class CloudflareShopperBroker:
         real DOM total, and return a resumable CheckoutState."""
         preferred = _preferred_brands(context.rules)
 
-        async with self._page(merchant_url) as (page, _mode):
-            await page.goto(merchant_url, wait_until="networkidle")
-            await page.wait_for_selector("[data-product-id]")
+        try:
+            async with self._page(merchant_url) as (page, _mode):
+                # navigate + not-ready ladder: guarantees products rendered.
+                await self._goto_ready(page, merchant_url, "[data-product-id]", "build_cart")
 
-            products = await page.eval_on_selector_all(
-                "[data-product-id]",
-                """(nodes) => nodes.map((n) => ({
-                    id: n.dataset.productId,
-                    brand: n.dataset.brand || '',
-                    price_cents: parseInt(n.dataset.priceCents || '0', 10),
-                    name: (n.querySelector('[data-name]') || {}).textContent || ''
-                }))""",
-            )
-
-            plan = _select_items(
-                products, context.budget_cents, preferred, context.rules
-            )
-
-            # Actually click the add-to-cart buttons — real browser interaction.
-            for prod_id, qty in plan:
-                for _ in range(qty):
-                    await page.click(f'button[data-add="{prod_id}"]')
-
-            # Read the authoritative total straight from the DOM.
-            total_cents = await page.eval_on_selector(
-                "#cart-total", "(el) => parseInt(el.dataset.totalCents || '0', 10)"
-            )
-
-            # Build the item list from what actually landed in the cart.
-            id_to_prod = {p["id"]: p for p in products}
-            items: list[CartItem] = []
-            for prod_id, qty in plan:
-                if qty <= 0:
-                    continue
-                p = id_to_prod[prod_id]
-                items.append(
-                    CartItem(name=p["name"].strip(), qty=qty, price_cents=int(p["price_cents"]))
+                products = await self._guard(
+                    "build_cart", "reading the product catalog",
+                    page.eval_on_selector_all(
+                        "[data-product-id]",
+                        """(nodes) => nodes.map((n) => ({
+                            id: n.dataset.productId,
+                            brand: n.dataset.brand || '',
+                            price_cents: parseInt(n.dataset.priceCents || '0', 10),
+                            name: (n.querySelector('[data-name]') || {}).textContent || ''
+                        }))""",
+                    ),
+                    url=merchant_url,
                 )
+                if not products:
+                    raise ShopperError(
+                        "build_cart", "no products found on the storefront", url=merchant_url
+                    )
+
+                plan = _select_items(
+                    products, context.budget_cents, preferred, context.rules
+                )
+
+                # Actually click the add-to-cart buttons — real browser interaction.
+                for prod_id, qty in plan:
+                    for _ in range(qty):
+                        await self._guard(
+                            "build_cart", f"adding {prod_id} to cart",
+                            page.click(
+                                f'button[data-add="{prod_id}"]',
+                                timeout=self._action_timeout_ms,
+                            ),
+                            url=merchant_url,
+                        )
+
+                # Read the authoritative total straight from the DOM.
+                total_cents = await self._guard(
+                    "build_cart", "reading the cart total",
+                    page.eval_on_selector(
+                        "#cart-total", "(el) => parseInt(el.dataset.totalCents || '0', 10)"
+                    ),
+                    url=merchant_url,
+                )
+
+                # Build the item list from what actually landed in the cart.
+                id_to_prod = {p["id"]: p for p in products}
+                items: list[CartItem] = []
+                for prod_id, qty in plan:
+                    if qty <= 0:
+                        continue
+                    p = id_to_prod[prod_id]
+                    items.append(
+                        CartItem(name=p["name"].strip(), qty=qty, price_cents=int(p["price_cents"]))
+                    )
+        except ShopperError:
+            raise
+        except (asyncio.TimeoutError, PlaywrightTimeoutError) as exc:
+            raise ShopperError("build_cart", "browser session timed out", url=merchant_url) from exc
+        except PlaywrightError as exc:
+            raise ShopperError(
+                "build_cart", f"browser session failed: {_short(exc)}", url=merchant_url
+            ) from exc
 
         session_ref = _checkout_url_for(merchant_url, total_cents)
         return CartResult(
@@ -233,33 +420,75 @@ class CloudflareShopperBroker:
             sum(i.qty * i.price_cents for i in checkout.items),
         )
 
-        async with self._page(checkout_url) as (page, _mode):
-            await page.goto(checkout_url, wait_until="networkidle")
-            await page.wait_for_selector("#checkout-form")
+        try:
+            async with self._page(checkout_url) as (page, _mode):
+                # navigate + not-ready ladder: guarantees the form rendered.
+                await self._goto_ready(page, checkout_url, "#checkout-form", "complete_checkout")
 
-            # Type the one-time Prava card credential into the real form fields.
-            await page.fill("#card-number", credential.token)
-            await page.fill("#expiry-month", credential.expiry_month)
-            await page.fill("#expiry-year", credential.expiry_year)
-            await page.fill("#cvv", credential.dynamic_cvv)
-
-            await page.click("#place-order")
-
-            # Wait for the confirmation to render, then scrape it.
-            await page.wait_for_selector("#confirmation.show", timeout=15000)
-            order_id = await page.eval_on_selector(
-                "#confirmation", "(el) => el.dataset.orderId || ''"
-            )
-            confirmation_text = (
-                await page.eval_on_selector(
-                    "#confirmation", "(el) => el.innerText"
+                # Type the one-time Prava card credential into the real form fields.
+                fields = (
+                    ("#card-number", credential.token, "card number"),
+                    ("#expiry-month", credential.expiry_month, "expiry month"),
+                    ("#expiry-year", credential.expiry_year, "expiry year"),
+                    ("#cvv", credential.dynamic_cvv, "CVV"),
                 )
-            ).strip()
+                for selector, value, label in fields:
+                    await self._guard(
+                        "complete_checkout", f"filling the {label} field",
+                        page.fill(selector, value, timeout=self._action_timeout_ms),
+                        url=checkout_url,
+                    )
+
+                await self._guard(
+                    "complete_checkout", "clicking place-order",
+                    page.click("#place-order", timeout=self._action_timeout_ms),
+                    url=checkout_url,
+                )
+
+                # Wait for the confirmation to render, then scrape it.
+                await self._guard(
+                    "complete_checkout", "waiting for the order confirmation",
+                    page.wait_for_selector(
+                        "#confirmation.show", timeout=self._confirmation_timeout_ms
+                    ),
+                    url=checkout_url,
+                )
+                order_id = await self._guard(
+                    "complete_checkout", "reading the order id",
+                    page.eval_on_selector(
+                        "#confirmation", "(el) => el.dataset.orderId || ''"
+                    ),
+                    url=checkout_url,
+                )
+                confirmation_text = (
+                    await self._guard(
+                        "complete_checkout", "reading the confirmation text",
+                        page.eval_on_selector("#confirmation", "(el) => el.innerText"),
+                        url=checkout_url,
+                    )
+                ).strip()
+        except ShopperError:
+            raise
+        except (asyncio.TimeoutError, PlaywrightTimeoutError) as exc:
+            raise ShopperError(
+                "complete_checkout", "browser session timed out", url=checkout_url
+            ) from exc
+        except PlaywrightError as exc:
+            raise ShopperError(
+                "complete_checkout", f"browser session failed: {_short(exc)}", url=checkout_url
+            ) from exc
 
         if not order_id:
             # fall back to parsing the id out of the confirmation copy
             m = re.search(r"ORD-\d+", confirmation_text)
             order_id = m.group(0) if m else ""
+
+        if not order_id:
+            raise ShopperError(
+                "complete_checkout",
+                "order placed but no order id could be read from the confirmation",
+                url=checkout_url,
+            )
 
         return OrderResult(order_id=order_id, confirmation_text=confirmation_text)
 

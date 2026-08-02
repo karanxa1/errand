@@ -87,3 +87,27 @@ export interface RunDone {
   confirmation_order_id?: string;
   reason?: string;
 }
+
+// ── Typed tool-card contract ────────────────────────────────────────────────
+// Borrowed *shape* (not the library) from assistant-ui's tool-UI pattern: a card
+// is driven by its inbound `args`, its `result` (null until resolved), an
+// explicit `status`, and a single `resolve` callback that carries the human's
+// decision. This makes pending→resolved states explicit and gives every action
+// button (including decline) a real resolver instead of an inert onClick.
+
+export type ToolCardStatus = "pending" | "resolving" | "resolved";
+
+export interface ToolCardProps<Args, Result> {
+  args: Args;
+  result: Result | null;
+  status: ToolCardStatus;
+  resolve: (result: Result) => void;
+}
+
+// The operator's verdict on an approval gate. `approved:false` carries an
+// optional typed reason; the backend accepts { approved, reason? } at
+// POST /api/errand/{run_id}/approve.
+export interface ApprovalResult {
+  approved: boolean;
+  reason?: string;
+}

@@ -6,3 +6,11 @@ export const BACKEND_URL =
   "http://localhost:8787";
 
 export const api = (path: string) => `${BACKEND_URL}${path}`;
+
+// WebSocket URL for the same backend. The voice relay lives at
+// /api/voice/ws; we derive the ws(s):// origin from the http(s):// base so a
+// single NEXT_PUBLIC_BACKEND_URL configures both transports.
+export const wsApi = (path: string) => {
+  const wsBase = BACKEND_URL.replace(/^http/, "ws");
+  return `${wsBase}${path}`;
+};

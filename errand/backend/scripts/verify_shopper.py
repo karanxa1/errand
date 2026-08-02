@@ -29,9 +29,14 @@ import socketserver
 import threading
 from pathlib import Path
 
-from app.brokers.shopper import CloudflareShopperBroker, _CF_WS_TEMPLATE
+from app.brokers.shopper import (
+    CloudflareShopperBroker,
+    ShopperError,
+    _CF_WS_TEMPLATE,
+)
 from app.config import settings
 from app.contracts import (
+    CheckoutState,
     Citation,
     Merchant,
     PaymentCredential,
@@ -158,6 +163,66 @@ async def main() -> None:
         assert order.confirmation_text, "confirmation text must be present"
 
         print("\n✅ Shopper verification passed: real browser built a cart and completed checkout.")
+
+        # ── negative check: graceful STRUCTURED failure, no hang ──────────────
+        # Point the shopper at a real page that lacks the expected product markers.
+        # The not-ready ladder should exhaust its bounded retries and raise a
+        # ShopperError — and the whole thing must finish well inside a wall-clock
+        # budget (asyncio.wait_for), proving it never hangs the SSE stream.
+        print("\n=== negative check: graceful structured failure on a bad page ===")
+        bad_url = f"http://127.0.0.1:{port}/checkout.html"  # 200 OK, but no [data-product-id]
+        # Fast ladder so the bounded retries complete quickly during verification.
+        strict_broker = CloudflareShopperBroker(
+            force_local=True,
+            selector_timeout_ms=1500,
+            empty_dom_wait_s=0.4,
+            reload_wait_s=0.4,
+            max_ready_attempts=3,
+        )
+        budget_s = 20.0
+        raised: ShopperError | None = None
+        try:
+            await asyncio.wait_for(
+                strict_broker.build_cart(bad_url, "should fail", context),
+                timeout=budget_s,
+            )
+        except asyncio.TimeoutError:
+            raise AssertionError(
+                f"build_cart HUNG: no structured error within {budget_s}s on a bad page"
+            )
+        except ShopperError as exc:
+            raised = exc
+
+        assert raised is not None, "expected a ShopperError on a page with no products"
+        assert raised.step == "build_cart", f"error should name the failing step, got {raised.step!r}"
+        print(f"  ✓ build_cart raised ShopperError (no hang): {raised}")
+
+        # Also prove complete_checkout fails structurally against a page with no form.
+        bad_checkout = CheckoutState(
+            merchant_url=bad_url,
+            items=cart.items,
+            session_ref=f"http://127.0.0.1:{port}/nope-404.html",  # 404 → form never renders
+        )
+        raised = None
+        try:
+            await asyncio.wait_for(
+                strict_broker.complete_checkout(bad_checkout, credential),
+                timeout=budget_s,
+            )
+        except asyncio.TimeoutError:
+            raise AssertionError(
+                f"complete_checkout HUNG: no structured error within {budget_s}s on a bad page"
+            )
+        except ShopperError as exc:
+            raised = exc
+
+        assert raised is not None, "expected a ShopperError when the checkout form is missing"
+        assert raised.step == "complete_checkout", (
+            f"error should name the failing step, got {raised.step!r}"
+        )
+        print(f"  ✓ complete_checkout raised ShopperError (no hang): {raised}")
+
+        print("\n✅ Negative check passed: bad pages fail fast with a structured ShopperError.")
     finally:
         httpd.shutdown()
         httpd.server_close()

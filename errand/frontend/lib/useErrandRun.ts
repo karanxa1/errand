@@ -1,6 +1,6 @@
-// useErrandRun — owns the state machine for one errand run and turns the raw SSE
-// frames into typed UI state. Every frame ALSO becomes an audit entry, so the
-// audit log renders every event with its detail, timestamped, in arrival order.
+// useErrandRun — owns the state machine for one errand run over SSE and turns the
+// raw SSE frames into typed UI state via the SHARED reducer (lib/errandReducer),
+// so the text path and the voice path produce identical chat-thread cards.
 //
 // Two frame shapes exist on the wire (verified against the live backend):
 //   * audit events  -> { at, step, detail, data }   payload lives under .data
@@ -13,56 +13,17 @@
 import { useCallback, useRef, useState } from "react";
 import { api } from "./config";
 import { startErrandStream, type RunStreamController } from "./stream";
-import type {
-  ApprovalRequest,
-  AuditEntry,
-  CartResult,
-  PurchaseContext,
-  RunDone,
-} from "./types";
+import {
+  applyFrame,
+  initialRunState,
+  pushAuditEntry,
+  type RunState,
+} from "./errandReducer";
+import type { ApprovalResult } from "./types";
 
-export type RunPhase =
-  | "idle"
-  | "starting"
-  | "planning"
-  | "cart"
-  | "awaiting_approval"
-  | "approving"
-  | "working"
-  | "done"
-  | "error";
-
-export interface RunState {
-  phase: RunPhase;
-  runId: string | null;
-  model: string | null;
-  inboxAddress: string | null;
-  context: PurchaseContext | null;
-  cart: CartResult | null;
-  approval: ApprovalRequest | null;
-  credentialLast4: string | null;
-  orderId: string | null;
-  confirmationOrderId: string | null;
-  result: RunDone | null;
-  errorMessage: string | null;
-  audit: AuditEntry[];
-}
-
-const initialState: RunState = {
-  phase: "idle",
-  runId: null,
-  model: null,
-  inboxAddress: null,
-  context: null,
-  cart: null,
-  approval: null,
-  credentialLast4: null,
-  orderId: null,
-  confirmationOrderId: null,
-  result: null,
-  errorMessage: null,
-  audit: [],
-};
+// Re-export the shared state types so existing importers of useErrandRun keep
+// working unchanged.
+export type { RunPhase, ConnectionStatus, RunState } from "./errandReducer";
 
 interface StartArgs {
   profile: string;
@@ -73,201 +34,137 @@ interface StartArgs {
 }
 
 export function useErrandRun() {
-  const [state, setState] = useState<RunState>(initialState);
+  const [state, setState] = useState<RunState>(initialRunState);
   const ctrl = useRef<RunStreamController | null>(null);
-  const auditSeq = useRef(0);
-
-  const pushAudit = useCallback(
-    (at: string, step: string, detail: string, payload: unknown) => {
-      setState((s) => ({
-        ...s,
-        audit: [
-          ...s.audit,
-          {
-            id: auditSeq.current++,
-            at,
-            step,
-            detail,
-            payload: (payload as Record<string, unknown>) ?? null,
-          },
-        ],
-      }));
-    },
-    [],
-  );
+  // Remember the last start args so a manual "retry" after a lost connection can
+  // relaunch the same intent (a NEW run — retry is explicit and operator-owned).
+  const lastArgs = useRef<StartArgs | null>(null);
 
   const reset = useCallback(() => {
     ctrl.current?.abort();
     ctrl.current = null;
-    auditSeq.current = 0;
-    setState(initialState);
+    setState(initialRunState);
   }, []);
 
-  const start = useCallback(
-    ({ profile, intent, model, userId, userEmail }: StartArgs) => {
-      ctrl.current?.abort();
-      auditSeq.current = 0;
-      setState({ ...initialState, phase: "starting" });
+  const start = useCallback((args: StartArgs) => {
+    const { profile, intent, model, userId, userEmail } = args;
+    lastArgs.current = args;
+    ctrl.current?.abort();
+    setState({ ...initialRunState, phase: "starting", connection: "connecting" });
 
-      ctrl.current = startErrandStream(
-        api("/api/errand/stream"),
-        {
-          profile,
-          intent,
-          model,
-          user_id: userId || "u_demo",
-          user_email: userEmail || "operator@example.com",
+    ctrl.current = startErrandStream(
+      api("/api/errand/stream"),
+      {
+        profile,
+        intent,
+        model,
+        user_id: userId || "u_demo",
+        user_email: userEmail || "operator@example.com",
+      },
+      {
+        onFrame: (frame) => {
+          setState((s) => {
+            // First frame proves the connection is live and open.
+            const opened = s.connection === "open" ? s : { ...s, connection: "open" as const };
+            return applyFrame(opened, frame);
+          });
         },
-        {
-          onFrame: (frame) => {
-            const { event, data } = frame;
-
-            // Audit-wrapped events: { at, step, detail, data }.
-            const isWrapped =
-              typeof data.step === "string" && "detail" in data;
-            const at =
-              (isWrapped && typeof data.at === "string" && data.at) ||
-              new Date().toISOString();
-            const detail =
-              (isWrapped && typeof data.detail === "string" && data.detail) ||
-              "";
-            const payload = isWrapped ? (data.data ?? null) : data;
-
-            pushAudit(at, event, detail || humanize(event), payload);
-
-            switch (event) {
-              case "run.started":
-                setState((s) => ({
-                  ...s,
-                  phase: "planning",
-                  runId: (data.run_id as string) ?? null,
-                  model: (data.model as string) ?? null,
-                }));
-                break;
-              case "inbox.ready":
-                setState((s) => ({
-                  ...s,
-                  inboxAddress:
-                    ((payload as { address?: string })?.address as string) ??
-                    null,
-                }));
-                break;
-              case "context.loaded":
-                setState((s) => ({
-                  ...s,
-                  phase: "planning",
-                  context: payload as unknown as PurchaseContext,
-                }));
-                break;
-              case "cart.built":
-                setState((s) => ({
-                  ...s,
-                  phase: "cart",
-                  cart: payload as unknown as CartResult,
-                }));
-                break;
-              case "approval.request":
-                setState((s) => ({
-                  ...s,
-                  phase: "awaiting_approval",
-                  approval: data as unknown as ApprovalRequest,
-                }));
-                break;
-              case "approval.granted":
-                setState((s) => ({ ...s, phase: "working" }));
-                break;
-              case "payment.credential":
-                setState((s) => ({
-                  ...s,
-                  phase: "working",
-                  credentialLast4:
-                    ((payload as { last4?: string })?.last4 as string) ?? null,
-                }));
-                break;
-              case "checkout.completed":
-                setState((s) => ({
-                  ...s,
-                  orderId:
-                    ((payload as { order_id?: string })?.order_id as string) ??
-                    s.orderId,
-                }));
-                break;
-              case "mail.confirmation":
-                setState((s) => ({
-                  ...s,
-                  confirmationOrderId:
-                    ((payload as { order_id?: string })
-                      ?.order_id as string) ?? s.confirmationOrderId,
-                }));
-                break;
-              case "run.done": {
-                const done = data as unknown as RunDone;
-                setState((s) => ({
-                  ...s,
-                  phase: done.kind === "completed" ? "done" : "error",
-                  result: done,
-                  orderId: done.order_id ?? s.orderId,
-                  confirmationOrderId:
-                    done.confirmation_order_id ?? s.confirmationOrderId,
-                  errorMessage:
-                    done.kind === "completed"
-                      ? null
-                      : done.reason ?? "Run did not complete.",
-                }));
-                break;
-              }
-              case "run.error":
-                setState((s) => ({
-                  ...s,
-                  phase: "error",
-                  errorMessage:
-                    (data.message as string) ?? "The run failed.",
-                }));
-                break;
-              default:
-                break;
-            }
-          },
-          onError: (message) => {
-            pushAudit(new Date().toISOString(), "stream.error", message, {
+        onError: (message) => {
+          // Only reached when reconnect retries exhausted with zero frames —
+          // i.e. no run ever started. A genuine hard failure.
+          setState((s) => ({
+            ...pushAuditEntry(s, new Date().toISOString(), "stream.error", message, {
               message,
-            });
-            setState((s) => ({ ...s, phase: "error", errorMessage: message }));
-          },
+            }),
+            phase: "error",
+            connection: "lost",
+            errorMessage: message,
+          }));
         },
-      );
-    },
-    [pushAudit],
-  );
+        onReconnecting: (attempt, delayMs) => {
+          setState((s) => ({
+            ...pushAuditEntry(
+              s,
+              new Date().toISOString(),
+              "stream.reconnecting",
+              `Connection blip — retrying (attempt ${attempt}, in ${Math.round(
+                delayMs,
+              )}ms).`,
+              { attempt, delayMs },
+            ),
+            connection: "reconnecting",
+          }));
+        },
+        onConnectionLost: (message) => {
+          // The live run dropped mid-flight. Keep the run phase (so received
+          // panels/audit stay visible) and only flag the connection as lost.
+          setState((s) => ({
+            ...pushAuditEntry(
+              s,
+              new Date().toISOString(),
+              "stream.connection_lost",
+              message,
+              { message },
+            ),
+            connection: "lost",
+          }));
+        },
+        onDone: () => {
+          setState((s) =>
+            s.connection === "open" || s.connection === "connecting"
+              ? { ...s, connection: "idle" }
+              : s,
+          );
+        },
+      },
+    );
+  }, []);
 
-  // Approve the pending spend. The Prava passkey iframe is mounted in the UI for
-  // the passkey moment; the approval gate itself is resolved by this POST.
-  const approve = useCallback(async () => {
-    const runId = state.approval?.run_id ?? state.runId;
-    if (!runId) return;
-    setState((s) => ({ ...s, phase: "approving" }));
-    try {
-      await fetch(api(`/api/errand/${runId}/approve`), {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ approved: true }),
-      });
-      // Progress events continue arriving on the open SSE stream — we do NOT
-      // poll for them.
-    } catch (err) {
+  // Manual retry after a lost connection. Relaunches the same intent as a NEW
+  // run (there is no server resume token yet), which the operator triggers
+  // explicitly — never automatic, so a live run is never silently duplicated.
+  const retry = useCallback(() => {
+    if (lastArgs.current) start(lastArgs.current);
+  }, [start]);
+
+  // Resolve the human-in-the-loop approval gate with a typed verdict. POSTs
+  // { approved, reason? } to /approve; the run's terminal state then arrives on
+  // the open SSE stream (approval.granted → working, or approval.denied →
+  // declined). We never poll.
+  const resolveApproval = useCallback(
+    async (verdict: ApprovalResult) => {
+      const runId = state.approval?.run_id ?? state.runId;
+      if (!runId) return;
       setState((s) => ({
         ...s,
-        phase: "error",
-        errorMessage: `Approval failed to reach backend: ${
-          (err as Error).message
-        }`,
+        approvalResult: verdict,
+        phase: verdict.approved ? "approving" : s.phase,
       }));
-    }
-  }, [state.approval?.run_id, state.runId]);
+      try {
+        await fetch(api(`/api/errand/${runId}/approve`), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            approved: verdict.approved,
+            ...(verdict.reason ? { reason: verdict.reason } : {}),
+          }),
+        });
+      } catch (err) {
+        setState((s) => ({
+          ...s,
+          phase: "error",
+          connection: "lost",
+          errorMessage: `Approval failed to reach backend: ${(err as Error).message}`,
+        }));
+      }
+    },
+    [state.approval?.run_id, state.runId],
+  );
 
-  return { state, start, approve, reset };
-}
+  const approve = useCallback(
+    () => resolveApproval({ approved: true }),
+    [resolveApproval],
+  );
 
-function humanize(event: string): string {
-  return event.replace(/[._]/g, " ");
+  return { state, start, approve, resolveApproval, retry, reset };
 }

@@ -1,0 +1,474 @@
+// useVoiceAgent — the browser side of the Errand Voice Relay (docs/api-reference
+// "Errand Voice Relay + Tool Bridge — INTERNAL CONTRACT").
+//
+// Deepgram browser tokens are FORBIDDEN on our key, so the BACKEND holds the
+// Deepgram Voice Agent WS and relays. The browser talks only to OUR backend WS:
+//
+//   ws://<backend>/api/voice/ws?model=<sol|terra|luna>&profile=<business|personal>
+//
+//   browser → backend
+//     · binary  : mic PCM (linear16, 48 kHz mono), captured via Web Audio.
+//     · JSON    : {type:"start"} | {type:"stop"} |
+//                 {type:"approve", run_id, approved, reason?}
+//   backend → browser
+//     · binary  : agent TTS PCM (linear16, 16 kHz) → queued + played.
+//     · JSON    : voice.state / voice.user_transcript / voice.agent_transcript /
+//                 tool.call / tool.result / websearch.result / voice.error, PLUS
+//                 every errand event (run.started … run.done). All errand + tool
+//                 + turn frames are folded through the SHARED reducer
+//                 (lib/errandReducer.applyFrame), so a voice-driven run renders
+//                 the SAME chat-thread cards as a typed run.
+//
+// The signature VoiceOrb reads `level` + `band` (real mic amplitude from an
+// AnalyserNode) and `voicePhase` for its state→motion, exactly as before — the
+// orb is untouched, only its data source is now this relay.
+
+"use client";
+
+import { useCallback, useEffect, useRef, useState } from "react";
+import { wsApi } from "./config";
+import {
+  applyFrame,
+  initialRunState,
+  pushAuditEntry,
+  type RunState,
+} from "./errandReducer";
+import type { ApprovalResult, RawFrame } from "./types";
+
+export type VoicePhase = "idle" | "listening" | "thinking" | "speaking";
+
+export interface VoiceAgentApi {
+  state: RunState;
+  // Whether a voice session (WS + mic) is currently open.
+  active: boolean;
+  // The Deepgram-driven conversational phase (drives the orb + a live label).
+  voicePhase: VoicePhase;
+  // 0..1 smoothed mic amplitude, and 5 frequency bands — the orb's real fuel.
+  level: number;
+  band: Float32Array;
+  // The in-flight (not-yet-final) user utterance, shown as a forming bubble.
+  interim: string;
+  supported: boolean;
+  error: string | null;
+  start: (model: string, profile: string) => Promise<void>;
+  stop: () => void;
+  // Resolve an approval gate over the voice WS control channel (NOT the SSE
+  // /approve POST). Approve mounts the Prava iframe in the card; either verdict
+  // sends {type:"approve", run_id, approved, reason?}.
+  resolveApproval: (verdict: ApprovalResult) => void;
+}
+
+const BANDS = 5;
+const MIC_SAMPLE_RATE = 48000; // linear16 mic per Deepgram Settings.input
+const TTS_SAMPLE_RATE = 16000; // linear16 agent audio per Settings.output
+
+export function useVoiceAgent(): VoiceAgentApi {
+  const [state, setState] = useState<RunState>(initialRunState);
+  const [active, setActive] = useState(false);
+  const [voicePhase, setVoicePhase] = useState<VoicePhase>("idle");
+  const [level, setLevel] = useState(0);
+  const [interim, setInterim] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const bandRef = useRef<Float32Array>(new Float32Array(BANDS));
+  const [, force] = useState(0);
+
+  // Web Audio + WS handles.
+  const wsRef = useRef<WebSocket | null>(null);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const processorRef = useRef<ScriptProcessorNode | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const micSinkRef = useRef<GainNode | null>(null);
+  const playGainRef = useRef<GainNode | null>(null);
+  const rafRef = useRef<number | null>(null);
+  // Playback scheduling cursor (seconds, in the audio context clock).
+  const playCursorRef = useRef(0);
+  // The active run_id an approval belongs to (set by approval.request).
+  const approvalRunIdRef = useRef<string | null>(null);
+  // Guard against a manual stop being reported as a lost connection.
+  const stoppingRef = useRef(false);
+
+  const supported =
+    typeof window !== "undefined" &&
+    typeof navigator !== "undefined" &&
+    !!navigator.mediaDevices?.getUserMedia &&
+    (typeof AudioContext !== "undefined" ||
+      typeof (window as unknown as { webkitAudioContext?: unknown })
+        .webkitAudioContext !== "undefined");
+
+  // ── orb amplitude loop (real mic → level + bands) ───────────────────────────
+  const tick = useCallback(() => {
+    const analyser = analyserRef.current;
+    if (!analyser) return;
+    const bins = analyser.frequencyBinCount;
+    const freq = new Uint8Array(bins);
+    analyser.getByteFrequencyData(freq);
+
+    let sum = 0;
+    const lo = 2;
+    const hi = Math.min(bins, Math.floor(bins * 0.6));
+    for (let i = lo; i < hi; i++) sum += freq[i];
+    const avg = sum / (hi - lo) / 255;
+    setLevel((prev) => prev + (avg - prev) * 0.35);
+
+    const band = bandRef.current;
+    const step = Math.floor((hi - lo) / BANDS);
+    for (let b = 0; b < BANDS; b++) {
+      let s = 0;
+      const from = lo + b * step;
+      const to = b === BANDS - 1 ? hi : from + step;
+      for (let i = from; i < to; i++) s += freq[i];
+      const v = s / (to - from) / 255;
+      band[b] = band[b] + (v - band[b]) * 0.4;
+    }
+    force((n) => (n + 1) % 1000000);
+    rafRef.current = requestAnimationFrame(tick);
+  }, []);
+
+  // ── playback: 16 kHz linear16 mono → AudioBuffer, scheduled gapless ─────────
+  const playPcm = useCallback((buf: ArrayBuffer) => {
+    const ctx = audioCtxRef.current;
+    const gain = playGainRef.current;
+    if (!ctx || !gain || buf.byteLength === 0) return;
+    const pcm = new Int16Array(buf);
+    const frames = pcm.length;
+    if (frames === 0) return;
+    const audioBuf = ctx.createBuffer(1, frames, TTS_SAMPLE_RATE);
+    const ch = audioBuf.getChannelData(0);
+    for (let i = 0; i < frames; i++) ch[i] = pcm[i] / 32768;
+    const src = ctx.createBufferSource();
+    src.buffer = audioBuf;
+    src.connect(gain);
+    const now = ctx.currentTime;
+    // Keep a small lead so consecutive chunks butt together without gaps.
+    const startAt = Math.max(now + 0.02, playCursorRef.current);
+    src.start(startAt);
+    playCursorRef.current = startAt + audioBuf.duration;
+  }, []);
+
+  // ── JSON event routing ──────────────────────────────────────────────────────
+  const handleEvent = useCallback((msg: Record<string, unknown>) => {
+    const type = (msg.type as string) ?? "";
+
+    switch (type) {
+      case "voice.state": {
+        const st = (msg.state as string) ?? "idle";
+        setVoicePhase(
+          st === "listening" || st === "thinking" || st === "speaking"
+            ? (st as VoicePhase)
+            : "idle",
+        );
+        return;
+      }
+      case "voice.user_transcript": {
+        const text = ((msg.text as string) ?? "").trim();
+        const isFinal = msg.is_final !== false;
+        if (isFinal && text) {
+          setInterim("");
+          setState((s) => applyFrame(s, { event: "user.message", data: { text } }));
+        } else {
+          setInterim(text);
+        }
+        return;
+      }
+      case "voice.agent_transcript": {
+        const text = ((msg.text as string) ?? "").trim();
+        if (text) {
+          setState((s) => applyFrame(s, { event: "agent.message", data: { text } }));
+        }
+        return;
+      }
+      case "voice.error": {
+        const message = (msg.message as string) ?? "Voice error.";
+        setError(message);
+        setState((s) =>
+          pushAuditEntry(s, new Date().toISOString(), "voice.error", message, { message }),
+        );
+        return;
+      }
+      default: {
+        // approval.request carries the run_id the approve control must target.
+        if (type === "approval.request" && typeof msg.run_id === "string") {
+          approvalRunIdRef.current = msg.run_id;
+        }
+        // Everything else — tool.call, tool.result, websearch.result, and all
+        // errand events — folds through the shared reducer into the same audit
+        // timeline the chat thread renders.
+        const { type: _t, ...rest } = msg;
+        void _t;
+        const frame: RawFrame = { event: type, data: rest };
+        setState((s) => {
+          const opened = s.connection === "open" ? s : { ...s, connection: "open" as const };
+          return applyFrame(opened, frame);
+        });
+      }
+    }
+  }, []);
+
+  // ── teardown ────────────────────────────────────────────────────────────────
+  const teardown = useCallback(() => {
+    if (rafRef.current != null) cancelAnimationFrame(rafRef.current);
+    rafRef.current = null;
+    try {
+      processorRef.current?.disconnect();
+    } catch {
+      /* noop */
+    }
+    processorRef.current = null;
+    try {
+      analyserRef.current?.disconnect();
+    } catch {
+      /* noop */
+    }
+    analyserRef.current = null;
+    try {
+      sourceRef.current?.disconnect();
+    } catch {
+      /* noop */
+    }
+    sourceRef.current = null;
+    try {
+      micSinkRef.current?.disconnect();
+    } catch {
+      /* noop */
+    }
+    micSinkRef.current = null;
+    try {
+      playGainRef.current?.disconnect();
+    } catch {
+      /* noop */
+    }
+    playGainRef.current = null;
+    streamRef.current?.getTracks().forEach((t) => t.stop());
+    streamRef.current = null;
+    if (audioCtxRef.current && audioCtxRef.current.state !== "closed") {
+      void audioCtxRef.current.close();
+    }
+    audioCtxRef.current = null;
+    playCursorRef.current = 0;
+    bandRef.current = new Float32Array(BANDS);
+    setLevel(0);
+    setInterim("");
+    setVoicePhase("idle");
+    setActive(false);
+  }, []);
+
+  const stop = useCallback(() => {
+    stoppingRef.current = true;
+    const ws = wsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      try {
+        ws.send(JSON.stringify({ type: "stop" }));
+      } catch {
+        /* noop */
+      }
+    }
+    if (ws) {
+      try {
+        ws.close();
+      } catch {
+        /* noop */
+      }
+    }
+    wsRef.current = null;
+    teardown();
+  }, [teardown]);
+
+  // ── start: open the WS + mic, wire capture/playback/orb ─────────────────────
+  const start = useCallback(
+    async (model: string, profile: string) => {
+      if (!supported) {
+        setError("Voice isn't available in this browser.");
+        return;
+      }
+      setError(null);
+      stoppingRef.current = false;
+      // Fresh conversation state each session.
+      setState({ ...initialRunState, connection: "connecting" });
+
+      let stream: MediaStream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            channelCount: 1,
+            echoCancellation: true,
+            noiseSuppression: true,
+          },
+        });
+      } catch (err) {
+        setError(
+          (err as Error).name === "NotAllowedError"
+            ? "Microphone permission denied."
+            : `Could not start microphone: ${(err as Error).message}`,
+        );
+        return;
+      }
+      streamRef.current = stream;
+
+      // One AudioContext at the mic rate; the 16 kHz playback buffers are
+      // resampled by Web Audio on playback.
+      const AudioCtx =
+        window.AudioContext ||
+        (window as unknown as { webkitAudioContext: typeof AudioContext })
+          .webkitAudioContext;
+      let audioCtx: AudioContext;
+      try {
+        audioCtx = new AudioCtx({ sampleRate: MIC_SAMPLE_RATE });
+      } catch {
+        // Some browsers reject an explicit rate; fall back to default.
+        audioCtx = new AudioCtx();
+      }
+      audioCtxRef.current = audioCtx;
+      // Resume within the user gesture (the orb tap) to satisfy autoplay policy.
+      try {
+        await audioCtx.resume();
+      } catch {
+        /* noop */
+      }
+
+      const source = audioCtx.createMediaStreamSource(stream);
+      sourceRef.current = source;
+
+      // Analyser → orb amplitude (real mic).
+      const analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 1024;
+      analyser.smoothingTimeConstant = 0.7;
+      source.connect(analyser);
+      analyserRef.current = analyser;
+
+      // ScriptProcessor → int16 PCM frames sent to the backend. It must be
+      // connected to a destination to pull audio, so route through a silent gain
+      // (gain 0) — nothing of the mic is echoed to the speakers.
+      const processor = audioCtx.createScriptProcessor(4096, 1, 1);
+      const micSink = audioCtx.createGain();
+      micSink.gain.value = 0;
+      processor.onaudioprocess = (e) => {
+        const ws = wsRef.current;
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        const input = e.inputBuffer.getChannelData(0);
+        const pcm = new Int16Array(input.length);
+        for (let i = 0; i < input.length; i++) {
+          const s = Math.max(-1, Math.min(1, input[i]));
+          pcm[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+        }
+        try {
+          ws.send(pcm.buffer);
+        } catch {
+          /* transient send failure — the next frame will retry */
+        }
+      };
+      source.connect(processor);
+      processor.connect(micSink);
+      micSink.connect(audioCtx.destination);
+      processorRef.current = processor;
+      micSinkRef.current = micSink;
+
+      // Playback gain → speakers.
+      const playGain = audioCtx.createGain();
+      playGain.gain.value = 1;
+      playGain.connect(audioCtx.destination);
+      playGainRef.current = playGain;
+      playCursorRef.current = audioCtx.currentTime;
+
+      // Open the relay WS.
+      const url = wsApi(
+        `/api/voice/ws?model=${encodeURIComponent(model)}&profile=${encodeURIComponent(profile)}`,
+      );
+      const ws = new WebSocket(url);
+      ws.binaryType = "arraybuffer";
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        setActive(true);
+        setVoicePhase("listening");
+        setState((s) => ({ ...s, connection: "open" }));
+        try {
+          ws.send(JSON.stringify({ type: "start" }));
+        } catch {
+          /* noop */
+        }
+        rafRef.current = requestAnimationFrame(tick);
+      };
+      ws.onmessage = (ev) => {
+        if (typeof ev.data === "string") {
+          try {
+            handleEvent(JSON.parse(ev.data));
+          } catch {
+            /* ignore malformed frame */
+          }
+        } else if (ev.data instanceof ArrayBuffer) {
+          playPcm(ev.data);
+        }
+      };
+      ws.onerror = () => {
+        if (!stoppingRef.current) {
+          setError("Voice connection error.");
+        }
+      };
+      ws.onclose = () => {
+        if (!stoppingRef.current) {
+          // Dropped mid-session — keep the transcript/cards, flag the drop.
+          setState((s) =>
+            pushAuditEntry(
+              s,
+              new Date().toISOString(),
+              "stream.connection_lost",
+              "The voice connection dropped. Everything so far is preserved.",
+              {},
+            ),
+          );
+          setState((s) => ({ ...s, connection: "lost" }));
+        }
+        wsRef.current = null;
+        teardown();
+      };
+    },
+    [supported, tick, handleEvent, playPcm, teardown],
+  );
+
+  // Resolve the approval gate over the voice WS control channel.
+  const resolveApproval = useCallback((verdict: ApprovalResult) => {
+    const runId = approvalRunIdRef.current;
+    const ws = wsRef.current;
+    setState((s) => ({
+      ...s,
+      approvalResult: verdict,
+      phase: verdict.approved ? "approving" : s.phase,
+    }));
+    if (ws && ws.readyState === WebSocket.OPEN && runId) {
+      try {
+        ws.send(
+          JSON.stringify({
+            type: "approve",
+            run_id: runId,
+            approved: verdict.approved,
+            ...(verdict.reason ? { reason: verdict.reason } : {}),
+          }),
+        );
+      } catch {
+        setState((s) => ({
+          ...s,
+          phase: "error",
+          errorMessage: "Approval failed to reach the voice relay.",
+        }));
+      }
+    }
+  }, []);
+
+  useEffect(() => () => stop(), [stop]);
+
+  return {
+    state,
+    active,
+    voicePhase,
+    level,
+    band: bandRef.current,
+    interim,
+    supported,
+    error,
+    start,
+    stop,
+    resolveApproval,
+  };
+}

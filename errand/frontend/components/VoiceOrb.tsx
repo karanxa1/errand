@@ -15,11 +15,20 @@
 
 import { useEffect, useRef } from "react";
 
+export type OrbPhase =
+  | "idle"
+  | "listening"
+  | "thinking"
+  | "working"
+  | "done"
+  | "error"
+  | "reconnecting";
+
 interface Props {
   level: number; // 0..1 overall amplitude
   band: Float32Array; // per-band amplitudes 0..1
   active: boolean; // mic is live
-  phase?: "idle" | "listening" | "thinking" | "working" | "done" | "error";
+  phase?: OrbPhase;
   size?: number;
 }
 
@@ -64,13 +73,72 @@ export default function VoiceOrb({
 
     // Phase → accent tint. Kept in the green family with a warm shift for done
     // and a red shift for error, so the orb reads state without extra chrome.
+    // Reconnecting borrows the brand's brass/amber (secondary warmth) so a blip
+    // reads as "searching", never alarm.
     function tint(): { core: string; mid: string; rim: string } {
       const p = phaseRef.current;
       if (p === "error")
         return { core: "#ffd1c9", mid: "#ff7a6b", rim: "#6e3a34" };
+      if (p === "reconnecting")
+        return { core: "#fff2d8", mid: "#e8b45f", rim: "#7a5f34" };
       if (p === "done")
         return { core: "#eafff5", mid: "#5ff2b6", rim: "#2b6b52" };
       return { core: "#eafff5", mid: "#13ef93", rim: "#1c6b4d" };
+    }
+
+    // State → MOTION mapping (the idea borrowed from LiveKit's
+    // use-agent-audio-visualizer-wave state handling — the CONCEPT only, none of
+    // its shaders/deps). Each phase gets its own motion signature so the one
+    // signature artifact stays alive even when the mic is off and no audio flows:
+    //   idle          calm slow breathing, no autonomous energy
+    //   listening     audio-reactive (energy comes from the live mic path)
+    //   thinking      fast rotation + tight low-amplitude autonomous flutter
+    //   working       steadier, stronger autonomous pulse (agent is busy)
+    //   reconnecting  urgent double-pulse "search" cadence
+    //   done          settle: slow, gently damped
+    //   error         near-still, low energy
+    //
+    // Returns multipliers the draw loop folds into rotation speed, breathing
+    // amplitude, and a synthetic "pulse" that stands in for audio energy when
+    // the mic is off (`live` false).
+    function phaseMotion(): {
+      speedMul: number;
+      ampMul: number;
+      pulse: number; // 0..1 autonomous energy when not live
+    } {
+      const p = phaseRef.current;
+      const tt = t;
+      switch (p) {
+        case "thinking":
+          // 4×-ish rotation, tight flutter — a mind turning something over.
+          return {
+            speedMul: 3.4,
+            ampMul: 0.55,
+            pulse: 0.12 + ((Math.sin(tt * 0.09) + 1) / 2) * 0.16,
+          };
+        case "working":
+          // Steadier, more present pulse — the agent is executing.
+          return {
+            speedMul: 1.7,
+            ampMul: 0.9,
+            pulse: 0.22 + ((Math.sin(tt * 0.055) + 1) / 2) * 0.26,
+          };
+        case "reconnecting": {
+          // A quick double-beat then a hold — reads as "searching".
+          const beat = (Math.sin(tt * 0.16) + Math.sin(tt * 0.34)) / 2;
+          return { speedMul: 2.2, ampMul: 0.7, pulse: 0.16 + (beat + 1) / 2 * 0.3 };
+        }
+        case "done":
+          return { speedMul: 0.55, ampMul: 0.7, pulse: 0.06 };
+        case "error":
+          return { speedMul: 0.35, ampMul: 0.5, pulse: 0.03 };
+        case "listening":
+          // Audio drives energy; keep autonomous pulse at zero so the mic reads.
+          return { speedMul: 1.0, ampMul: 1.0, pulse: 0 };
+        case "idle":
+        default:
+          return { speedMul: 0.7, ampMul: 1.0, pulse: 0 };
+      }
     }
 
     function draw() {
@@ -81,16 +149,23 @@ export default function VoiceOrb({
       const bands = bandRef.current;
       const live = activeRef.current;
       const { core, mid, rim } = tint();
+      const motion = phaseMotion();
 
       ctx.clearRect(0, 0, px, px);
 
-      // Idle breathing baseline; audio adds energy on top.
+      // Idle breathing baseline; audio adds energy on top. When the mic is off,
+      // the phase's autonomous `pulse` substitutes for audio energy so the orb
+      // is alive during planning/working/reconnecting — not inert.
       const breathe = reduce ? 0 : (Math.sin(t * 0.018) + 1) / 2; // 0..1
-      const energy = live ? Math.min(1, lvl * 1.6) : 0;
+      const audioEnergy = live ? Math.min(1, lvl * 1.6) : 0;
+      const energy = reduce
+        ? Math.max(0.04, motion.pulse * 0.5)
+        : Math.min(1, live ? audioEnergy : motion.pulse);
       const base = px * 0.26;
-      const baseR = base * (1 + breathe * 0.03 + energy * 0.12);
+      const baseR =
+        base * (1 + breathe * 0.03 * motion.ampMul + energy * 0.12);
 
-      const rot = reduce ? 0 : t * 0.004;
+      const rot = reduce ? 0 : t * 0.004 * motion.speedMul;
 
       // ── Membrane: a closed liquid blob whose radius is modulated per-lobe by
       // the audio bands. This is the organism's outer body. ──────────────────
@@ -107,13 +182,23 @@ export default function VoiceOrb({
           (bands[bi] ?? 0) * (1 - frac) + (bands[bn] ?? 0) * frac;
         const wobble = reduce
           ? 0
-          : Math.sin(a * 3 + t * 0.03) * 0.012 +
-            Math.sin(a * 5 - t * 0.021) * 0.008;
+          : (Math.sin(a * 3 + t * 0.03 * motion.speedMul) * 0.012 +
+              Math.sin(a * 5 - t * 0.021 * motion.speedMul) * 0.008) *
+            motion.ampMul;
+        // When live, lobes are driven by the audio bands. When the mic is off,
+        // a phase-shifted synthetic lobe wave (scaled by the phase pulse) gives
+        // the membrane autonomous, per-phase movement.
+        const synthLobe = reduce
+          ? 0
+          : Math.sin(a * LOBES + t * 0.05 * motion.speedMul) *
+            energy *
+            0.14 *
+            motion.ampMul;
         const r =
           baseR *
           (1 +
             wobble +
-            (live ? bandAmp * 0.22 : 0) +
+            (live ? bandAmp * 0.22 : synthLobe) +
             energy * 0.03);
         const x = cx + Math.cos(a + rot) * r;
         const y = cy + Math.sin(a + rot) * r;

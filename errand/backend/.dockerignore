@@ -1,0 +1,11 @@
+# Keep the build context tiny + never ship local artifacts or secrets.
+.venv/
+.uvcache/
+__pycache__/
+*.pyc
+.env
+.env.*
+scripts/
+README.md
+Dockerfile
+.dockerignore
