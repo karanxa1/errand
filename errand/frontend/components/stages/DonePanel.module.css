@@ -1,0 +1,121 @@
+.wrap {
+  background:
+    radial-gradient(
+      130% 100% at 50% -30%,
+      rgba(19, 239, 147, 0.1),
+      transparent 62%
+    ),
+    linear-gradient(180deg, var(--ink-150), var(--ink-100));
+  border-radius: var(--radius-lg);
+  box-shadow:
+    inset 0 1px 0 rgba(160, 240, 200, 0.12),
+    inset 0 0 0 1px var(--edge-strong);
+  padding: 26px 24px;
+}
+
+.seal {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  color: var(--green);
+  font-size: 12px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  font-weight: 600;
+  margin-bottom: 14px;
+}
+
+.sealRing {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  background: var(--green);
+  color: #04150d;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.25);
+}
+
+.headline {
+  font-family: var(--display);
+  font-size: 32px;
+  line-height: 1.08;
+  color: var(--text-hi);
+  margin: 0 0 18px;
+  letter-spacing: 0.01em;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.stat {
+  background: var(--ink-050);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  box-shadow: inset 0 0 0 1px var(--edge);
+}
+
+.statLabel {
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-low);
+  margin-bottom: 6px;
+}
+
+.statValue {
+  font-family: var(--mono);
+  font-size: 17px;
+  color: var(--text-hi);
+}
+
+.statValueBig {
+  font-family: var(--display);
+  font-size: 26px;
+  color: var(--text-hi);
+}
+
+.inbox {
+  margin-top: 16px;
+  font-size: 12.5px;
+  color: var(--text-mid);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.inboxAddr {
+  font-family: var(--mono);
+  color: var(--green-soft);
+}
+
+/* error variant */
+.errWrap {
+  background: linear-gradient(180deg, var(--ink-150), var(--ink-100));
+  border-radius: var(--radius-lg);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 122, 107, 0.14),
+    inset 0 0 0 1px rgba(255, 122, 107, 0.2);
+  padding: 24px;
+}
+
+.errHead {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--danger);
+  font-weight: 600;
+  font-size: 15px;
+  margin-bottom: 8px;
+}
+
+.errBody {
+  color: var(--text-mid);
+  font-size: 13.5px;
+  line-height: 1.5;
+}

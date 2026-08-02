@@ -42,8 +42,8 @@ class Settings(BaseSettings):
     # Feature flags: use mock brokers until real ones verified per-broker.
     # Context + Payment are verified real (Senso, Prava). Shopper + Mail stay
     # mock until their parallel-agent implementations land.
-    use_mock_shopper: bool = True
-    use_mock_mail: bool = True
+    use_mock_shopper: bool = False
+    use_mock_mail: bool = False
     use_mock_context: bool = False
     use_mock_payment: bool = False
 

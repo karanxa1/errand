@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Demo Pantry Co — Checkout</title>
+  <style>
+    :root {
+      --ink: #1c1a17;
+      --paper: #f4f1ea;
+      --line: #d8d2c4;
+      --accent: #2f5d3a;
+      --muted: #6b6559;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, system-ui, "Segoe UI", Roboto, sans-serif;
+      color: var(--ink);
+      background: var(--paper);
+      line-height: 1.5;
+    }
+    header {
+      padding: 28px 32px;
+      border-bottom: 1px solid var(--line);
+    }
+    header h1 { margin: 0; font-size: 22px; letter-spacing: 0.5px; }
+    main { max-width: 560px; margin: 0 auto; padding: 32px; }
+    .summary {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 18px;
+      background: #fbfaf6;
+      margin-bottom: 24px;
+      display: flex;
+      justify-content: space-between;
+      font-size: 17px;
+      font-weight: 600;
+    }
+    form { display: flex; flex-direction: column; gap: 16px; }
+    label { display: flex; flex-direction: column; gap: 6px; font-size: 13px; color: var(--muted); }
+    input {
+      padding: 11px 12px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      font-size: 15px;
+      background: #fff;
+      color: var(--ink);
+    }
+    .row { display: flex; gap: 14px; }
+    .row label { flex: 1; }
+    button[type="submit"] {
+      margin-top: 8px;
+      padding: 13px 18px;
+      border: 1px solid var(--accent);
+      background: var(--accent);
+      color: #fff;
+      border-radius: 8px;
+      font-size: 15px;
+      cursor: pointer;
+    }
+    .confirmation {
+      margin-top: 24px;
+      padding: 22px;
+      border: 1px solid var(--accent);
+      border-radius: 10px;
+      background: #eef4ee;
+      display: none;
+    }
+    .confirmation.show { display: block; }
+    .confirmation h2 { margin: 0 0 8px; font-size: 18px; color: var(--accent); }
+    .error { color: #a33; font-size: 13px; min-height: 16px; }
+  </style>
+</head>
+<body>
+  <header><h1>Demo Pantry Co — Checkout</h1></header>
+  <main>
+    <div class="summary">
+      <span>Order total</span>
+      <span id="order-total" data-total-cents="0">$0.00</span>
+    </div>
+
+    <form id="checkout-form" autocomplete="off">
+      <label for="card-number">Card number
+        <input id="card-number" name="card_number" inputmode="numeric" placeholder="4111 1111 1111 1111" />
+      </label>
+      <div class="row">
+        <label for="expiry-month">Expiry month
+          <input id="expiry-month" name="expiry_month" placeholder="MM" />
+        </label>
+        <label for="expiry-year">Expiry year
+          <input id="expiry-year" name="expiry_year" placeholder="YYYY" />
+        </label>
+        <label for="cvv">CVV
+          <input id="cvv" name="cvv" placeholder="123" />
+        </label>
+      </div>
+      <div class="error" id="form-error"></div>
+      <button type="submit" id="place-order">Place order</button>
+    </form>
+
+    <section class="confirmation" id="confirmation">
+      <h2 id="confirmation-title"></h2>
+      <p id="confirmation-text"></p>
+    </section>
+  </main>
+
+  <script>
+    function fmt(cents) { return "$" + (cents / 100).toFixed(2); }
+
+    // Total is passed via query param so a relaunched checkout page (fresh
+    // browser context, no shared localStorage) still shows the real amount.
+    function totalCentsFromUrl() {
+      const q = new URLSearchParams(window.location.search);
+      const v = parseInt(q.get("total_cents") || "", 10);
+      if (!Number.isNaN(v) && v > 0) return v;
+      try {
+        const cart = JSON.parse(localStorage.getItem("demo_cart") || "{}");
+        // no catalog here; fall back to 0 if nothing in the url
+      } catch (e) {}
+      return 0;
+    }
+
+    const totalCents = totalCentsFromUrl();
+    const totalEl = document.getElementById("order-total");
+    totalEl.dataset.totalCents = String(totalCents);
+    totalEl.textContent = fmt(totalCents);
+
+    function randomOrderId() {
+      const n = Math.floor(100000 + Math.random() * 900000);
+      return "ORD-" + n;
+    }
+
+    document.getElementById("checkout-form").addEventListener("submit", function (e) {
+      e.preventDefault();
+      const err = document.getElementById("form-error");
+      err.textContent = "";
+
+      const card = document.getElementById("card-number").value.replace(/\s+/g, "");
+      const mm = document.getElementById("expiry-month").value.trim();
+      const yyyy = document.getElementById("expiry-year").value.trim();
+      const cvv = document.getElementById("cvv").value.trim();
+
+      if (card.length < 12) { err.textContent = "Enter a valid card number."; return; }
+      if (!/^\d{1,2}$/.test(mm)) { err.textContent = "Enter a valid expiry month."; return; }
+      if (!/^\d{4}$/.test(yyyy)) { err.textContent = "Enter a valid expiry year."; return; }
+      if (!/^\d{3,4}$/.test(cvv)) { err.textContent = "Enter a valid CVV."; return; }
+
+      const orderId = randomOrderId();
+      const box = document.getElementById("confirmation");
+      document.getElementById("confirmation-title").textContent = "Order " + orderId + " confirmed";
+      document.getElementById("confirmation-text").textContent =
+        "Thank you. Order " + orderId + " for " + fmt(totalCents) +
+        " has been placed with Demo Pantry Co. A receipt will be emailed to you.";
+      box.classList.add("show");
+      box.dataset.orderId = orderId;
+
+      // hide the form so the confirmation is the clear final state
+      document.getElementById("checkout-form").style.display = "none";
+    });
+  </script>
+</body>
+</html>

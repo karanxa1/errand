@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Demo Pantry Co — Store</title>
+  <style>
+    :root {
+      --ink: #1c1a17;
+      --paper: #f4f1ea;
+      --line: #d8d2c4;
+      --accent: #2f5d3a;
+      --muted: #6b6559;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, system-ui, "Segoe UI", Roboto, sans-serif;
+      color: var(--ink);
+      background: var(--paper);
+      line-height: 1.5;
+    }
+    header {
+      padding: 28px 32px;
+      border-bottom: 1px solid var(--line);
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+    }
+    header h1 { margin: 0; font-size: 22px; letter-spacing: 0.5px; }
+    header .tag { color: var(--muted); font-size: 13px; }
+    main { max-width: 860px; margin: 0 auto; padding: 32px; }
+    .products { display: grid; grid-template-columns: repeat(2, 1fr); gap: 18px; }
+    .product {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 18px;
+      background: #fbfaf6;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .product .name { font-weight: 600; font-size: 16px; }
+    .product .brand { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.6px; }
+    .product .price { font-size: 18px; }
+    .product button {
+      margin-top: auto;
+      padding: 9px 14px;
+      border: 1px solid var(--accent);
+      background: var(--accent);
+      color: #fff;
+      border-radius: 8px;
+      font-size: 14px;
+      cursor: pointer;
+    }
+    .product button:active { transform: none; }
+    .cart {
+      margin-top: 32px;
+      padding: 20px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #fbfaf6;
+    }
+    .cart h2 { margin: 0 0 12px; font-size: 16px; }
+    .cart .line { display: flex; justify-content: space-between; padding: 4px 0; font-size: 14px; }
+    .cart .total { display: flex; justify-content: space-between; margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); font-weight: 700; font-size: 17px; }
+    .cart-actions { margin-top: 16px; }
+    .cart-actions a {
+      display: inline-block;
+      padding: 10px 18px;
+      background: var(--ink);
+      color: var(--paper);
+      text-decoration: none;
+      border-radius: 8px;
+      font-size: 14px;
+    }
+    .empty { color: var(--muted); font-size: 14px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Demo Pantry Co</h1>
+    <span class="tag">controlled demo storefront</span>
+  </header>
+  <main>
+    <section class="products" id="products">
+      <!-- product cards injected by JS from a data list so selectors stay stable -->
+    </section>
+
+    <section class="cart" id="cart">
+      <h2>Cart</h2>
+      <div id="cart-lines"><p class="empty" id="cart-empty">Cart is empty.</p></div>
+      <div class="total">
+        <span>Total</span>
+        <span id="cart-total" data-total-cents="0">$0.00</span>
+      </div>
+      <div class="cart-actions">
+        <a id="checkout-link" href="checkout.html">Go to checkout</a>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    // Catalog. price_cents keeps money integer-clean end to end.
+    const CATALOG = [
+      { id: "blue-bottle",  name: "Blue Bottle Coffee 12oz",         brand: "Blue Bottle", price_cents: 1800 },
+      { id: "clif-bars",    name: "Clif Bars (12 pack)",             brand: "Clif",        price_cents: 1500 },
+      { id: "lacroix",      name: "LaCroix Sparkling Water (24)",    brand: "LaCroix",     price_cents: 1200 },
+      { id: "oat-milk",     name: "Oatly Oat Milk (6 pack)",         brand: "Oatly",       price_cents: 2100 },
+      { id: "dark-roast",   name: "Peet's Dark Roast 12oz",          brand: "Peets",       price_cents: 1600 },
+      { id: "energy-drink", name: "Volt Energy Drink (12)",          brand: "Volt",        price_cents: 2400 }
+    ];
+
+    const cart = {}; // id -> qty
+
+    function fmt(cents) { return "$" + (cents / 100).toFixed(2); }
+
+    function renderProducts() {
+      const root = document.getElementById("products");
+      root.innerHTML = "";
+      for (const p of CATALOG) {
+        const card = document.createElement("div");
+        card.className = "product";
+        card.dataset.productId = p.id;
+        card.dataset.brand = p.brand;
+        card.dataset.priceCents = String(p.price_cents);
+        card.innerHTML =
+          '<span class="brand">' + p.brand + '</span>' +
+          '<span class="name" data-name>' + p.name + '</span>' +
+          '<span class="price" data-price>' + fmt(p.price_cents) + '</span>';
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.textContent = "Add to cart";
+        btn.dataset.add = p.id;
+        btn.addEventListener("click", () => addToCart(p.id));
+        card.appendChild(btn);
+        root.appendChild(card);
+      }
+    }
+
+    function addToCart(id) {
+      cart[id] = (cart[id] || 0) + 1;
+      persist();
+      renderCart();
+    }
+
+    function renderCart() {
+      const lines = document.getElementById("cart-lines");
+      const ids = Object.keys(cart).filter((id) => cart[id] > 0);
+      let total = 0;
+      if (ids.length === 0) {
+        lines.innerHTML = '<p class="empty" id="cart-empty">Cart is empty.</p>';
+      } else {
+        lines.innerHTML = "";
+        for (const id of ids) {
+          const p = CATALOG.find((c) => c.id === id);
+          const sub = p.price_cents * cart[id];
+          total += sub;
+          const row = document.createElement("div");
+          row.className = "line";
+          row.dataset.lineId = id;
+          row.innerHTML =
+            '<span>' + p.name + ' \u00d7 ' + cart[id] + '</span>' +
+            '<span>' + fmt(sub) + '</span>';
+          lines.appendChild(row);
+        }
+      }
+      const totalEl = document.getElementById("cart-total");
+      totalEl.dataset.totalCents = String(total);
+      totalEl.textContent = fmt(total);
+
+      const link = document.getElementById("checkout-link");
+      link.href = "checkout.html?total_cents=" + total;
+    }
+
+    function persist() {
+      try { localStorage.setItem("demo_cart", JSON.stringify(cart)); } catch (e) {}
+    }
+
+    renderProducts();
+    renderCart();
+  </script>
+</body>
+</html>
