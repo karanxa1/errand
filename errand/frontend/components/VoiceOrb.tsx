@@ -305,7 +305,10 @@ export default function VoiceOrb({
     <canvas
       ref={canvasRef}
       aria-hidden="true"
-      style={{ display: "block", filter: "saturate(1.05)" }}
+      className="block"
+      // Painting parameter, not layout: kept inline so the canvas render path
+      // is untouched by the utility migration.
+      style={{ filter: "saturate(1.05)" }}
     />
   );
 }

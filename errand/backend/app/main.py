@@ -75,9 +75,19 @@ app.include_router(conversations_router.router)
 app.include_router(chat_router.router)
 app.include_router(voice_router.router)
 
-# In-memory approval gates keyed by run id. Each run awaits its Future until the
-# frontend POSTs /approve (after the operator confirms + passkey). The Future
-# resolves with a typed ApprovalDecision (approved / declined+reason / timeout).
+# In-memory approval gates keyed by (owner user id, run id). Each run awaits its
+# Future until the frontend POSTs /approve (after the operator confirms +
+# passkey). The Future resolves with a typed ApprovalDecision (approved /
+# declined+reason / timeout).
+#
+# ⚠️ THE USER ID IS PART OF THE KEY, AND THAT IS THE AUTHORIZATION.
+# Authenticating /approve is necessary but not sufficient: with a run_id-only key
+# ANY signed-in account that learned a run_id could resolve someone else's spend
+# gate — approve a stranger's purchase, or decline it. Since the key carries the
+# owner, a lookup performed with the caller's own id simply cannot reach another
+# user's run, so a leaked run_id is inert in anyone else's hands. This mirrors
+# app.routers.chat._approvals, which is keyed (conversation_id, run_id) for the
+# same reason.
 #
 # ⚠️ SCALING CONSTRAINT — THIS REQUIRES EXACTLY ONE PROCESS.
 # The Future lives in THIS process's heap. The SSE stream that awaits it and the
@@ -96,7 +106,7 @@ app.include_router(voice_router.router)
 # is correct as deployed. Making this horizontally scalable needs a shared
 # rendezvous (Redis pub/sub, LISTEN/NOTIFY, or a DB-backed approvals table with
 # the stream polling it) — deliberately NOT done here.
-_approvals: dict[str, asyncio.Future[ApprovalDecision]] = {}
+_approvals: dict[tuple[str, str], asyncio.Future[ApprovalDecision]] = {}
 
 # Human-in-the-loop gate timeout (seconds). Expiry emits `approval.timeout`.
 APPROVAL_TIMEOUT_S = 300
@@ -166,8 +176,11 @@ async def errand_stream(
     stream = EventStream()
     brokers = build_brokers()
 
+    # The gate is owned by the caller who started the run; only they can resolve
+    # it. See the _approvals comment above for why the id is in the key.
+    gate_key = (user.id, run_id)
     fut: asyncio.Future[ApprovalDecision] = asyncio.get_running_loop().create_future()
-    _approvals[run_id] = fut
+    _approvals[gate_key] = fut
 
     # Cancel token: lets the SSE generator abort an in-flight run cleanly when
     # the client disconnects (loop/hang safety).
@@ -220,7 +233,7 @@ async def errand_stream(
         except Exception as e:  # surface errors as a stream event, never 500 mid-stream
             await stream.emit_raw("run.error", {"message": str(e)})
         finally:
-            _approvals.pop(run_id, None)
+            _approvals.pop(gate_key, None)
             await stream.close()
 
     task = asyncio.create_task(run())
@@ -233,7 +246,7 @@ async def errand_stream(
             # Always tear down: signal cancel, unblock any pending gate, and
             # ensure the background task is finished so nothing leaks.
             cancel.set()
-            pending = _approvals.pop(run_id, None)
+            pending = _approvals.pop(gate_key, None)
             if pending is not None and not pending.done():
                 pending.set_result(
                     ApprovalDecision(approved=False, approval_id=approval_id, reason="stream closed")
@@ -259,11 +272,15 @@ class ApproveRequest(BaseModel):
 
 @app.post("/api/errand/{run_id}/approve")
 async def approve_errand(
-    run_id: str, req: ApproveRequest, _user: User = Depends(get_current_user)
+    run_id: str, req: ApproveRequest, user: User = Depends(get_current_user)
 ) -> dict:
-    # AUTH REQUIRED: this resolves a spend approval gate. Previously anyone who
-    # learned a run_id could approve (or decline) someone else's purchase.
-    fut = _approvals.get(run_id)
+    # AUTH REQUIRED, AND SCOPED TO THE CALLER. The gate is looked up under the
+    # caller's OWN user id, so a run_id belonging to someone else resolves to no
+    # gate at all. Authenticating alone would not have been enough: it would still
+    # have let any signed-in account approve a stranger's purchase with nothing
+    # but a leaked run_id. The response for "not yours" is deliberately identical
+    # to "no such run", so this cannot be used to probe which runs exist.
+    fut = _approvals.get((user.id, run_id))
     if fut is None or fut.done():
         return {"ok": False, "reason": "no pending approval for this run"}
     # approval_id is stamped by the stream's approve() wrapper; pass a decision

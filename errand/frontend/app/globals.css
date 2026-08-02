@@ -1,13 +1,22 @@
 /* ============================================================================
-   Errand — brand foundation
+   Errand — brand foundation, expressed as a Tailwind v4 theme.
    ----------------------------------------------------------------------------
-   Palette is built deliberately for this brand, NOT a default kit theme and NOT
-   the cool blue-charcoal dark slop. The base is a warm green-black ink (a near-
-   black with a green undertone that belongs to the Deepgram accent), lifted to
-   warmer panels. The single saturated accent (#13EF93, Deepgram green) is used
-   with restraint; a quiet brass/amber is the secondary for budget + warmth so
-   we are never a one-hue page. Text clears its background by a real value gap.
+   The palette is built deliberately for this brand: NOT a default kit theme and
+   NOT the cool blue-charcoal that every dark product defaults to. The base is a
+   warm green-black ink (a near-black with a green undertone), lifted to warmer
+   panels by tone rather than by drawn borders. The single saturated accent
+   (#13EF93) is used with restraint, mostly through its desaturated tonal steps;
+   a quiet brass is the secondary for budget and human moments, so the page is
+   never one hue. Every text tone clears its background by a real value gap.
+
+   Tokens are declared in @theme, which is what turns them into utilities:
+   --color-ink-100 -> bg-ink-100 / text-ink-100 / border-ink-100
+   --font-display   -> font-display
+   They are also emitted as plain custom properties, so the few places that need
+   a raw value (canvas painting, colour-mixed shadows) can still read them.
    ========================================================================== */
+
+@import "tailwindcss";
 
 @font-face {
   font-family: "Gambarino";
@@ -17,123 +26,120 @@
   font-display: swap;
 }
 
-:root {
+@theme {
   /* Ink — warm green-black, layered for tonal elevation (no drawn borders). */
-  --ink-000: #070b09; /* deepest base */
-  --ink-050: #0b110e;
-  --ink-100: #0f1713; /* panel */
-  --ink-150: #142019; /* raised panel */
-  --ink-200: #1b2a21; /* hover / active surface */
-  --ink-250: #23362b;
-  --edge: rgba(160, 240, 200, 0.09); /* self-colored hairline lip */
-  --edge-strong: rgba(160, 240, 200, 0.16);
+  --color-ink-000: #070b09; /* deepest base */
+  --color-ink-050: #0b110e;
+  --color-ink-100: #0f1713; /* panel */
+  --color-ink-150: #142019; /* raised panel */
+  --color-ink-200: #1b2a21; /* hover / active surface */
+  --color-ink-250: #23362b;
 
-  /* Accent — Deepgram green, plus tonal steps (not all one saturated swatch). */
-  --green: #13ef93;
-  --green-soft: #5ff2b6;
-  --green-dim: #2b6b52; /* desaturated tonal accent */
-  --green-glow: rgba(19, 239, 147, 0.14);
+  /* Self-coloured hairline lips. An edge you sense, not a line you see. */
+  --color-edge: rgba(160, 240, 200, 0.09);
+  --color-edge-strong: rgba(160, 240, 200, 0.16);
 
-  /* Secondary warmth — brass/amber, used sparingly for budget + human moments. */
-  --brass: #e8b45f;
-  --brass-dim: #7a5f34;
+  /* Accent, in tonal steps — the page is never one saturated swatch. */
+  --color-green: #13ef93;
+  --color-green-soft: #5ff2b6;
+  --color-green-dim: #2b6b52;
+  --color-green-glow: rgba(19, 239, 147, 0.14);
+
+  /* Secondary warmth — used sparingly for budget and human moments. */
+  --color-brass: #e8b45f;
+  --color-brass-dim: #7a5f34;
 
   /* Signal */
-  --danger: #ff7a6b;
-  --danger-dim: #6e3a34;
+  --color-danger: #ff7a6b;
+  --color-danger-dim: #6e3a34;
 
-  /* Text — warm off-white to green-gray, all clearing their surface. */
-  --text-hi: #eefcf4;
-  --text: #cfe3d8;
-  --text-mid: #9bb3a6;
-  --text-low: #6d857a;
+  /* Text — warm off-white down to green-gray, all clearing their surface. */
+  --color-hi: #eefcf4;
+  --color-body: #cfe3d8;
+  --color-mid: #9bb3a6;
+  --color-low: #6d857a;
 
-  --radius: 14px;
-  --radius-sm: 9px;
-  --radius-lg: 22px;
+  /* Ink for text sitting ON the accent. Dark enough to read at any size. */
+  --color-on-accent: #04150d;
 
-  --mono: ui-monospace, "SF Mono", "SFMono-Regular", Menlo, "Cascadia Mono",
+  --font-display: "Gambarino", "Iowan Old Style", Georgia, serif;
+  --font-body: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "SFMono-Regular", Menlo, "Cascadia Mono",
     "Roboto Mono", monospace;
-  --body: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-  --display: "Gambarino", "Iowan Old Style", Georgia, serif;
 
-  --maxw: 1180px;
+  --radius-chip: 9px;
+  --radius-card: 14px;
+  --radius-panel: 22px;
+
+  --container-page: 1180px;
 }
 
-* {
-  box-sizing: border-box;
-}
+@layer base {
+  html,
+  body {
+    margin: 0;
+    padding: 0;
+  }
 
-html,
-body {
-  margin: 0;
-  padding: 0;
-}
+  body {
+    background-color: var(--color-ink-000);
+    /* Atmosphere: two soft, off-axis directional washes (warm green, faint
+       brass) with real falloff, plus fine grain on the substrate. Authored
+       light — not a centred radial halo, and not drifting blobs. */
+    background-image:
+      radial-gradient(120% 80% at 82% -8%, rgba(19, 239, 147, 0.1), transparent 60%),
+      radial-gradient(90% 70% at -10% 108%, rgba(232, 180, 95, 0.05), transparent 55%),
+      linear-gradient(180deg, #070b09 0%, #060a08 100%);
+    background-attachment: fixed;
+    color: var(--color-body);
+    font-family: var(--font-body);
+    font-size: 15px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+    min-height: 100vh;
+  }
 
-body {
-  background-color: var(--ink-000);
-  /* Atmosphere: two soft, off-axis directional washes (warm green + faint
-     brass), plus a fine grain on the substrate. This is authored light with
-     falloff, not a centered radial halo and not drifting blobs. */
-  background-image:
-    radial-gradient(
-      120% 80% at 82% -8%,
-      rgba(19, 239, 147, 0.1),
-      transparent 60%
-    ),
-    radial-gradient(
-      90% 70% at -10% 108%,
-      rgba(232, 180, 95, 0.05),
-      transparent 55%
-    ),
-    linear-gradient(180deg, #070b09 0%, #060a08 100%);
-  background-attachment: fixed;
-  color: var(--text);
-  font-family: var(--body);
-  font-size: 15px;
-  line-height: 1.5;
-  -webkit-font-smoothing: antialiased;
-  text-rendering: optimizeLegibility;
-  min-height: 100vh;
-}
+  /* Grain lives on the substrate, behind all content — never over text. */
+  body::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    z-index: 0;
+    pointer-events: none;
+    opacity: 0.04;
+    mix-blend-mode: soft-light;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  }
 
-/* Grain lives on the substrate, behind all content, never over text. */
-body::before {
-  content: "";
-  position: fixed;
-  inset: 0;
-  z-index: 0;
-  pointer-events: none;
-  opacity: 0.04;
-  mix-blend-mode: soft-light;
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
-}
+  button {
+    font-family: inherit;
+    cursor: pointer;
+  }
 
-button {
-  font-family: inherit;
-  cursor: pointer;
-}
+  a {
+    color: inherit;
+  }
 
-a {
-  color: inherit;
-}
+  ::selection {
+    background: var(--color-green);
+    color: var(--color-on-accent);
+  }
 
-::selection {
-  background: var(--green);
-  color: #04150d;
-}
+  :focus-visible {
+    outline: 2px solid var(--color-green-soft);
+    outline-offset: 2px;
+    border-radius: 6px;
+  }
 
-:focus-visible {
-  outline: 2px solid var(--green-soft);
-  outline-offset: 2px;
-  border-radius: 6px;
-}
-
-/* Respect reduced motion everywhere the orb / transitions live. */
-@media (prefers-reduced-motion: reduce) {
-  * {
-    animation-duration: 0.001ms !important;
-    animation-iteration-count: 1 !important;
-    transition-duration: 0.001ms !important;
+  /* Respect reduced motion everywhere the orb and transitions live. */
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.001ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.001ms !important;
+    }
   }
 }

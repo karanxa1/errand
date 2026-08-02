@@ -7,3 +7,7 @@ errand/.env*
 
 # Local-only context handoff (never commit)
 errand-handoff.md
+
+# Local verification artifacts (never commit)
+.playwright-mcp/
+errand/backend/local-verify.db

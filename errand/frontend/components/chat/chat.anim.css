@@ -1,0 +1,13 @@
+/* Keyframes only. Utilities cannot express @keyframes, so the chat cards'
+   text-shimmer sweep lives here and is driven from ToolCard with
+   `animate-[sweep_1.6s_ease-in-out_infinite]`. Nothing else belongs in this
+   file. */
+
+@keyframes sweep {
+  0% {
+    background-position: 120% 0;
+  }
+  100% {
+    background-position: -120% 0;
+  }
+}

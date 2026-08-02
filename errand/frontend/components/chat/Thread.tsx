@@ -44,7 +44,17 @@ import {
 } from "./ToolIcons";
 import ApprovalCard from "./ApprovalCard";
 import StatusLine from "./StatusLine";
-import t from "./Thread.module.css";
+
+/* User turn — a right-aligned bubble, tonal (not the accent). Voice turns
+   interleave user bubbles into the assistant column, where they get a little
+   room to breathe against the cards around them (USER_ROW_INLINE). */
+const USER_ROW = "flex justify-end";
+const USER_ROW_INLINE = "my-1 flex justify-end";
+const USER_BUBBLE =
+  "max-w-[84%] rounded-[16px_16px_4px_16px] bg-[linear-gradient(180deg,var(--color-ink-200),var(--color-ink-150))] px-4 py-3 text-[14.5px] leading-[1.5] text-hi shadow-[inset_0_1px_0_rgba(160,240,200,0.08),inset_0_0_0_1px_var(--color-edge)]";
+// The forming (interim) spoken utterance — a quieter, in-progress user bubble.
+const USER_BUBBLE_FORMING =
+  "max-w-[84%] rounded-[16px_16px_4px_16px] bg-[linear-gradient(180deg,var(--color-ink-150),var(--color-ink-100))] px-4 py-3 text-[14.5px] leading-[1.5] text-mid shadow-[inset_0_1px_0_rgba(160,240,200,0.05),inset_0_0_0_1px_var(--color-edge)]";
 
 // Events that carry no card of their own — the surrounding cards/bubble tell the
 // story, so rendering them again would be noise.
@@ -108,22 +118,22 @@ export default function Thread({
   const forming = (interim ?? "").trim();
 
   return (
-    <div className={t.thread}>
+    <div className="flex w-full flex-col gap-[22px]">
       {/* Leading user turn (text path). Voice turns arrive in the audit stream. */}
       {intent ? (
-        <div className={t.userRow}>
-          <div className={t.userBubble}>{intent}</div>
+        <div className={USER_ROW}>
+          <div className={USER_BUBBLE}>{intent}</div>
         </div>
       ) : null}
 
       {/* Assistant turn — one item per event, in arrival order. User/agent turns
           are interleaved for the voice path. */}
-      <div className={t.assistant}>
+      <div className="flex flex-col gap-3">
         {state.audit.map((e) => renderEntry(e, state, onResolveApproval))}
 
         {forming && (
-          <div className={t.userRow}>
-            <div className={`${t.userBubble} ${t.userForming}`}>{forming}</div>
+          <div className={USER_ROW_INLINE}>
+            <div className={USER_BUBBLE_FORMING}>{forming}</div>
           </div>
         )}
 
@@ -168,8 +178,8 @@ function renderEntry(
     const text = (p.text as string) ?? e.detail;
     if (!text) return null;
     return (
-      <div key={key} className={t.userRow}>
-        <div className={t.userBubble}>{text}</div>
+      <div key={key} className={USER_ROW_INLINE}>
+        <div className={USER_BUBBLE}>{text}</div>
       </div>
     );
   }

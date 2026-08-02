@@ -11,9 +11,23 @@ import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { useAuth } from "@/lib/auth";
 import { ErrandMark } from "@/components/Marks";
-import styles from "./AuthForm.module.css";
 
 type Mode = "login" | "register";
+
+// One field shape for every input: dark well, self-colored lip, and a focus
+// state that firms the lip and lays a thin accent ring around it.
+const INPUT =
+  "w-full bg-ink-000 border-0 shadow-[inset_0_0_0_1px_var(--color-edge)] rounded-chip " +
+  "text-hi font-body text-[15px] leading-[1.4] px-3.5 py-3 " +
+  "transition-[box-shadow,background-color] duration-[180ms] ease-[ease] " +
+  "placeholder:text-low focus:outline-none focus:bg-ink-050 " +
+  "focus:shadow-[inset_0_0_0_1px_var(--color-edge-strong),0_0_0_3px_var(--color-green-glow)] " +
+  "disabled:opacity-60";
+
+const LABEL =
+  "text-[11px] tracking-[0.09em] uppercase text-mid font-semibold";
+
+const FIELD = "flex flex-col gap-[7px]";
 
 export default function AuthForm({ mode }: { mode: Mode }) {
   const router = useRouter();
@@ -59,16 +73,21 @@ export default function AuthForm({ mode }: { mode: Mode }) {
   };
 
   return (
-    <main className={styles.page}>
-      <div className={styles.panel}>
-        <div className={styles.brand}>
-          <span className={styles.brandMark}>
+    <main className="relative z-[1] min-h-[100dvh] flex items-center justify-center py-8 px-[clamp(18px,5vw,40px)]">
+      <div className="w-full max-w-[420px] bg-[linear-gradient(180deg,var(--color-ink-100),var(--color-ink-050))] rounded-panel shadow-[inset_0_1px_0_rgba(160,240,200,0.08),inset_0_0_0_1px_var(--color-edge),0_26px_60px_-30px_rgba(0,0,0,0.8)] p-[clamp(26px,5vw,38px)]">
+        <div className="inline-flex items-center gap-[11px] text-hi mb-[26px]">
+          {/* Bare mark — no tile behind it; the drawn mark carries its own weight. */}
+          <span className="text-green inline-flex">
             <ErrandMark size={30} />
           </span>
-          <span className={styles.brandName}>Errand</span>
+          <span className="font-display text-[22px] tracking-[0.02em] text-hi">
+            Errand
+          </span>
         </div>
 
-        <h1 className={styles.title}>
+        {/* Tonal emphasis on the accented word — a lighter green step, never a
+            saturated pop or a gradient. */}
+        <h1 className="font-display text-[clamp(26px,5vw,34px)] leading-[1.12] text-hi mb-2.5 tracking-[0.01em] [&_em]:italic [&_em]:text-green-soft">
           {isRegister ? (
             <>
               Create your <em>Errand</em>.
@@ -79,18 +98,18 @@ export default function AuthForm({ mode }: { mode: Mode }) {
             </>
           )}
         </h1>
-        <p className={styles.lede}>
+        <p className="text-mid text-sm leading-[1.55] mb-[26px]">
           {isRegister
             ? "One account keeps your chats, carts, and approvals in one place."
             : "Sign in to pick up your conversations and pending approvals."}
         </p>
 
-        <form className={styles.form} onSubmit={onSubmit} noValidate>
+        <form className="flex flex-col gap-[15px]" onSubmit={onSubmit} noValidate>
           {isRegister && (
-            <label className={styles.field}>
-              <span className={styles.label}>Name</span>
+            <label className={FIELD}>
+              <span className={LABEL}>Name</span>
               <input
-                className={styles.input}
+                className={INPUT}
                 type="text"
                 name="name"
                 autoComplete="name"
@@ -102,10 +121,10 @@ export default function AuthForm({ mode }: { mode: Mode }) {
             </label>
           )}
 
-          <label className={styles.field}>
-            <span className={styles.label}>Email</span>
+          <label className={FIELD}>
+            <span className={LABEL}>Email</span>
             <input
-              className={styles.input}
+              className={INPUT}
               type="email"
               name="email"
               autoComplete="email"
@@ -118,10 +137,10 @@ export default function AuthForm({ mode }: { mode: Mode }) {
             />
           </label>
 
-          <label className={styles.field}>
-            <span className={styles.label}>Password</span>
+          <label className={FIELD}>
+            <span className={LABEL}>Password</span>
             <input
-              className={styles.input}
+              className={INPUT}
               type="password"
               name="password"
               autoComplete={isRegister ? "new-password" : "current-password"}
@@ -135,12 +154,18 @@ export default function AuthForm({ mode }: { mode: Mode }) {
           </label>
 
           {error && (
-            <p className={styles.error} role="alert">
+            <p className="mt-0.5 text-[13px] leading-[1.45] text-danger" role="alert">
               {error}
             </p>
           )}
 
-          <button className={styles.submit} type="submit" disabled={busy}>
+          {/* Primary action — solid green, dark legible label, custom up-right
+              dispatch arrow. A clean tonal shift on hover; no lift, no glow. */}
+          <button
+            className="mt-1.5 h-12 border-0 rounded-chip bg-green text-on-accent [font-weight:650] text-[15px] inline-flex items-center justify-center gap-[9px] shadow-[inset_0_1px_0_rgba(255,255,255,0.22)] transition-[background-color] duration-[180ms] ease-[ease] [&:hover:not(:disabled)]:bg-green-soft disabled:bg-ink-200 disabled:text-low disabled:shadow-[inset_0_0_0_1px_var(--color-edge)] disabled:cursor-default"
+            type="submit"
+            disabled={busy}
+          >
             {busy
               ? isRegister
                 ? "Creating account…"
@@ -149,7 +174,7 @@ export default function AuthForm({ mode }: { mode: Mode }) {
                 ? "Create account"
                 : "Sign in"}
             <svg
-              className={styles.submitArrow}
+              className="transition-transform duration-200 ease-[ease] [button:hover:not(:disabled)_&]:translate-x-0.5 [button:hover:not(:disabled)_&]:-translate-y-0.5"
               width="16"
               height="16"
               viewBox="0 0 16 16"
@@ -167,18 +192,24 @@ export default function AuthForm({ mode }: { mode: Mode }) {
           </button>
         </form>
 
-        <p className={styles.switch}>
+        <p className="mt-[22px] text-[13.5px] text-mid text-center">
           {isRegister ? (
             <>
               Already have an account?{" "}
-              <Link className={styles.switchLink} href="/login">
+              <Link
+                className="text-green-soft no-underline font-semibold hover:text-green hover:underline hover:underline-offset-2"
+                href="/login"
+              >
                 Sign in
               </Link>
             </>
           ) : (
             <>
               New to Errand?{" "}
-              <Link className={styles.switchLink} href="/register">
+              <Link
+                className="text-green-soft no-underline font-semibold hover:text-green hover:underline hover:underline-offset-2"
+                href="/register"
+              >
                 Create an account
               </Link>
             </>

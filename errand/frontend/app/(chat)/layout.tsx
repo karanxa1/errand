@@ -20,8 +20,6 @@ import { ChatShellProvider, conversationIdFromPath } from "@/lib/chatShell";
 import Sidebar from "@/components/Sidebar";
 import { ErrandMark } from "@/components/Marks";
 
-import css from "./chat.module.css";
-
 export default function ChatLayout({ children }: { children: React.ReactNode }) {
   const router = useRouter();
   const pathname = usePathname();
@@ -88,11 +86,15 @@ export default function ChatLayout({ children }: { children: React.ReactNode }) 
     // show yet. The redirect fires from the auth-aware route, not from here, so
     // this never sits on screen indefinitely.
     return (
-      <div className={css.boot} role="status" aria-live="polite">
-        <span className={css.bootMark}>
+      <div
+        className="relative z-[1] h-dvh flex flex-col items-center justify-center gap-4"
+        role="status"
+        aria-live="polite"
+      >
+        <span className="inline-flex text-green">
           <ErrandMark size={40} />
         </span>
-        <span className={css.bootText}>
+        <span className="text-[14px] tracking-[0.01em] text-mid">
           {authLoading ? "Restoring your session…" : "Redirecting to sign in…"}
         </span>
       </div>
@@ -101,16 +103,22 @@ export default function ChatLayout({ children }: { children: React.ReactNode }) 
 
   return (
     <ChatShellProvider value={shell}>
-      <div className={css.shell}>
+      <div className="relative z-[1] grid h-dvh grid-cols-[264px_1fr] overflow-hidden [@media(max-width:860px)]:grid-cols-[1fr]">
         {drawerOpen && (
           <button
-            className={css.scrim}
+            className="hidden border-none bg-[rgba(4,8,6,0.6)] [@media(max-width:860px)]:block [@media(max-width:860px)]:fixed [@media(max-width:860px)]:inset-0 [@media(max-width:860px)]:z-[35]"
             aria-label="Close conversation list"
             onClick={() => setDrawerOpen(false)}
           />
         )}
 
-        <div className={`${css.rail} ${drawerOpen ? css.railOpen : ""}`}>
+        <div
+          className={`min-h-0 h-full [@media(max-width:860px)]:fixed [@media(max-width:860px)]:top-0 [@media(max-width:860px)]:left-0 [@media(max-width:860px)]:bottom-0 [@media(max-width:860px)]:z-40 [@media(max-width:860px)]:w-[280px] [@media(max-width:860px)]:shadow-[18px_0_46px_-26px_rgba(4,8,6,0.9)] [@media(max-width:860px)]:transition-transform [@media(max-width:860px)]:duration-[240ms] [@media(max-width:860px)]:ease-[cubic-bezier(0.22,0.8,0.28,1)] ${
+            drawerOpen
+              ? "[@media(max-width:860px)]:[transform:translateX(0)]"
+              : "[@media(max-width:860px)]:[transform:translateX(-102%)]"
+          }`}
+        >
           <Sidebar
             conversations={conversations.conversations}
             activeId={activeId}
@@ -124,7 +132,7 @@ export default function ChatLayout({ children }: { children: React.ReactNode }) 
           />
         </div>
 
-        <div className={css.main}>{children}</div>
+        <div className="relative flex min-w-0 flex-col overflow-hidden">{children}</div>
       </div>
     </ChatShellProvider>
   );

@@ -7,7 +7,7 @@ import type {
   ToolCardProps,
 } from "@/lib/types";
 import { money } from "@/lib/format";
-import s from "./ApprovalPanel.module.css";
+import "./stages.anim.css";
 
 /* ApprovalPanel — the emotional peak, and the first typed tool card.
 
@@ -23,6 +23,15 @@ import s from "./ApprovalPanel.module.css";
    which POSTs /approve { approved, reason? }. If the iframe can't render
    (sandbox blocks embedding), a clear fallback with the live link is shown so
    the moment still reads as "authorise on Prava". */
+
+const WRAP =
+  "relative rounded-panel p-[22px] bg-[image:radial-gradient(120%_90%_at_50%_-20%,rgba(232,180,95,0.08),transparent_60%),linear-gradient(180deg,var(--color-ink-150),var(--color-ink-100))] shadow-[inset_0_1px_0_rgba(232,180,95,0.14),inset_0_0_0_1px_var(--color-edge-strong)]";
+const BADGE =
+  "inline-flex items-center gap-[7px] text-[11px] tracking-[0.1em] uppercase font-semibold mb-3";
+const HEADLINE =
+  "font-display text-[27px] leading-[1.12] text-hi mt-0 mx-0 mb-1.5 tracking-[0.01em]";
+const LEDE = "text-mid text-[14px] mt-0 mx-0 mb-5 max-w-[52ch]";
+const TO_NAME = "text-hi font-semibold";
 
 export default function ApprovalPanel({
   args: approval,
@@ -41,21 +50,26 @@ export default function ApprovalPanel({
   // state instead of vanishing — the decision stays on the record.
   if (declined) {
     return (
-      <div className={s.wrap}>
-        <span className={`${s.badge} ${s.badgeDeclined}`}>
-          <span className={s.badgeDot} />
+      <div className={WRAP}>
+        {/* Resolved-declined badge — a quiet, neutral close (not an error red). */}
+        <span className={`${BADGE} text-mid`}>
+          <span className="w-[7px] h-[7px] rounded-full bg-low" />
           Spend declined
         </span>
-        <h2 className={s.headline}>You declined this spend</h2>
-        <p className={s.lede}>
+        <h2 className={HEADLINE}>You declined this spend</h2>
+        <p className={LEDE}>
           Nothing was charged. The card session pinned to{" "}
-          <span className={s.toName}>{merchant?.name ?? "the merchant"}</span>{" "}
+          <span className={TO_NAME}>{merchant?.name ?? "the merchant"}</span>{" "}
           for {money(cart.total_cents)} was released.
         </p>
         {result?.reason && (
-          <div className={s.reason}>
-            <span className={s.reasonKey}>Reason</span>
-            <span className={s.reasonVal}>{result.reason}</span>
+          <div className="flex flex-col gap-[3px] mt-[14px] px-[14px] py-3 rounded-chip bg-ink-050 shadow-[inset_0_0_0_1px_var(--color-edge)]">
+            <span className="text-[10.5px] tracking-[0.12em] uppercase text-low font-semibold">
+              Reason
+            </span>
+            <span className="text-[13.5px] text-body leading-[1.45]">
+              {result.reason}
+            </span>
           </div>
         )}
       </div>
@@ -63,48 +77,57 @@ export default function ApprovalPanel({
   }
 
   return (
-    <div className={s.wrap}>
-      <span className={s.badge}>
-        <span className={s.badgeDot} />
+    <div className={WRAP}>
+      <span className={`${BADGE} text-brass`}>
+        <span className="w-[7px] h-[7px] rounded-full bg-brass" />
         Human approval required
       </span>
 
-      <h2 className={s.headline}>Authorise this spend</h2>
-      <p className={s.lede}>
+      <h2 className={HEADLINE}>Authorise this spend</h2>
+      <p className={LEDE}>
         The agent has a card session pinned to this exact merchant and amount.
         Confirm the passkey, then approve — nothing is charged until you do.
       </p>
 
-      <div className={s.figure}>
-        <span className={s.amount}>{money(cart.total_cents)}</span>
-        <span className={s.to}>
-          to <span className={s.toName}>{merchant?.name ?? "merchant"}</span>
+      <div className="flex items-baseline gap-[14px] mb-[18px] flex-wrap">
+        <span className="font-display text-[46px] leading-none text-hi tracking-[0.01em]">
+          {money(cart.total_cents)}
+        </span>
+        <span className="text-[13px] text-mid">
+          to <span className={TO_NAME}>{merchant?.name ?? "merchant"}</span>
           {" · "}
           {cart.items.length} item{cart.items.length === 1 ? "" : "s"}
         </span>
       </div>
 
-      <div className={s.frameLabel}>
+      <div className="text-[11px] tracking-[0.12em] uppercase text-low mt-1 mb-[9px] flex items-center gap-2 font-semibold">
         <LockGlyph />
         Prava · passkey verification
       </div>
 
       {!frameFailed ? (
-        <div className={s.frameStage}>
+        /* The frame sits on a labelled substrate so it never reads as an empty
+           void before/if the cross-origin Prava page paints. */
+        <div className="relative w-full min-h-[220px] rounded-card overflow-hidden shadow-[inset_0_0_0_1px_var(--color-edge)] bg-ink-000">
           {/* Labelled substrate behind the frame — visible until (or if) the
               cross-origin Prava page paints, so this is never a blank void. */}
-          <div className={s.frameSubstrate} aria-hidden="true">
-            <span className={s.substrateRing}>
+          <div
+            className="absolute inset-0 flex flex-col items-center justify-center gap-3 text-center p-6 z-0"
+            aria-hidden="true"
+          >
+            <span className="w-[46px] h-[46px] rounded-full bg-ink-150 text-green inline-flex items-center justify-center shadow-[inset_0_0_0_1px_var(--color-edge)]">
               <LockGlyph />
             </span>
-            <span className={s.substrateTitle}>Prava secure session</span>
-            <span className={s.substrateBody}>
+            <span className="text-[13px] text-body font-semibold">
+              Prava secure session
+            </span>
+            <span className="text-[12px] text-low max-w-[40ch] leading-[1.5]">
               Card entry and passkey happen inside Prava&apos;s hosted frame,
               pinned to this merchant and amount.
             </span>
           </div>
           <iframe
-            className={s.frame}
+            className="relative z-[1] w-full h-[320px] border-none rounded-card bg-transparent block"
             src={session.iframe_url}
             title="Prava passkey verification"
             onError={() => setFrameFailed(true)}
@@ -113,17 +136,17 @@ export default function ApprovalPanel({
           />
         </div>
       ) : (
-        <div className={s.frameFallback}>
-          <div className={s.fbHead}>
+        <div className="w-full min-h-[200px] rounded-card bg-ink-050 shadow-[inset_0_0_0_1px_var(--color-edge)] p-[18px] flex flex-col gap-3 justify-center">
+          <div className="flex items-center gap-[9px] text-hi font-semibold text-[14px]">
             <LockGlyph />
             Verify on Prava
           </div>
-          <div className={s.fbBody}>
+          <div className="text-[12.5px] text-mid leading-[1.5]">
             The passkey step opens in Prava&apos;s secure session for this
             purchase.
           </div>
           <a
-            className={s.fbLink}
+            className="font-mono text-[11.5px] text-green-soft break-all"
             href={session.iframe_url}
             target="_blank"
             rel="noopener noreferrer"
@@ -133,15 +156,18 @@ export default function ApprovalPanel({
         </div>
       )}
 
-      <div className={s.actions}>
+      <div className="flex items-center gap-[14px] mt-5 flex-wrap">
+        {/* Approve — a single decisive action (not a filled+outline pair).
+            Decline is a quiet text button, clearly subordinate, not a mirrored
+            outline button. */}
         <button
-          className={s.approve}
+          className="border-none bg-green text-on-accent [font-weight:680] text-[15px] px-[26px] py-[14px] rounded-xl inline-flex items-center gap-2.5 shadow-[inset_0_1px_0_rgba(255,255,255,0.24)] transition-[background] duration-[180ms] ease-[ease] enabled:hover:bg-green-soft disabled:bg-ink-200 disabled:text-low disabled:shadow-[inset_0_0_0_1px_var(--color-edge)] disabled:cursor-default"
           onClick={() => resolve({ approved: true })}
           disabled={resolving}
         >
           {resolving ? (
             <>
-              <span className={s.spinner} />
+              <span className="w-[15px] h-[15px] rounded-full border-2 border-[rgba(4,21,13,0.35)] border-t-[#04150d] animate-[errand-spin_0.7s_linear_infinite]" />
               Approving…
             </>
           ) : (
@@ -152,14 +178,16 @@ export default function ApprovalPanel({
           )}
         </button>
         <button
-          className={s.decline}
+          className="bg-transparent border-none text-low text-[13px] px-1 py-1.5 hover:text-body"
           disabled={resolving}
           type="button"
           onClick={() => resolve({ approved: false })}
         >
           Not now
         </button>
-        <span className={s.note}>Session {session.session_id.slice(0, 14)}…</span>
+        <span className="text-[12px] text-low ml-auto">
+          Session {session.session_id.slice(0, 14)}…
+        </span>
       </div>
     </div>
   );
@@ -167,7 +195,13 @@ export default function ApprovalPanel({
 
 function LockGlyph() {
   return (
-    <svg className={s.lock} width="14" height="14" viewBox="0 0 16 16" fill="none">
+    <svg
+      className="text-green"
+      width="14"
+      height="14"
+      viewBox="0 0 16 16"
+      fill="none"
+    >
       <rect
         x="3.5"
         y="7"

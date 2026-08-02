@@ -16,8 +16,10 @@ tests/test_spend_endpoint_auth.py`) if not.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
+import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -192,6 +194,58 @@ def test_valid_token_passes_auth_on_approve() -> None:
                 "ok": False,
                 "reason": "no pending approval for this run",
             }, res.text
+
+    run_async(scenario())
+
+
+def test_approve_is_scoped_to_the_run_owner() -> None:
+    """A stranger with a valid token must not be able to resolve someone else's
+    spend gate, and the owner must still be able to resolve their own.
+
+    Authenticating /approve is necessary but not sufficient — the gate is keyed
+    (user_id, run_id) precisely so that a leaked run_id is inert in anyone else's
+    hands. Both halves are asserted here: without the second one, keying the gate
+    to nobody at all would also pass.
+
+    No errand is started: a bare Future is parked in the registry exactly the way
+    errand_stream would, so nothing outbound can fire either way.
+    """
+
+    async def scenario() -> None:
+        async with api_client() as client:
+            owner, owner_headers = await register_user(client)
+            _intruder, intruder_headers = await register_user(client)
+
+            run_id = uuid.uuid4().hex
+            gate: asyncio.Future = asyncio.get_running_loop().create_future()
+            main_module._approvals[(owner["id"], run_id)] = gate
+            try:
+                res = await client.post(
+                    f"/api/errand/{run_id}/approve",
+                    json={"approved": True},
+                    headers=intruder_headers,
+                )
+                assert not gate.done(), (
+                    "a stranger resolved someone else's spend approval gate"
+                )
+                assert res.json().get("ok") is not True, res.text
+                # Indistinguishable from a run that never existed, so this cannot
+                # be used to probe which run ids are live.
+                assert res.json() == {
+                    "ok": False,
+                    "reason": "no pending approval for this run",
+                }, res.text
+
+                res = await client.post(
+                    f"/api/errand/{run_id}/approve",
+                    json={"approved": True},
+                    headers=owner_headers,
+                )
+                assert res.json() == {"ok": True, "approved": True}, res.text
+                assert gate.done(), "the run's owner could not resolve their own gate"
+                assert gate.result().approved is True
+            finally:
+                main_module._approvals.pop((owner["id"], run_id), None)
 
     run_async(scenario())
 

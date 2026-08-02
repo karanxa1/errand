@@ -29,8 +29,13 @@ import Composer from "@/components/Composer";
 import Thread from "@/components/chat/Thread";
 import { AgentBubble } from "@/components/chat/bodies";
 
-import css from "./chat.module.css";
-import t from "@/components/chat/Thread.module.css";
+import "./chat.anim.css";
+
+// The user-turn row + bubble, matched to the same treatment Thread renders for
+// its own rows (a right-aligned tonal bubble, not the accent).
+const userRow = "flex justify-end";
+const userBubble =
+  "max-w-[84%] px-4 py-3 rounded-[16px_16px_4px_16px] bg-[linear-gradient(180deg,var(--color-ink-200),var(--color-ink-150))] shadow-[inset_0_1px_0_rgba(160,240,200,0.08),inset_0_0_0_1px_var(--color-edge)] text-hi text-[14.5px] leading-[1.5]";
 
 const FALLBACK_MODELS: ModelOption[] = [
   { key: "sol", label: "Sol", tagline: "Flagship — most capable", id: "gpt-5.6-sol" },
@@ -276,9 +281,9 @@ export default function ChatView({ initialId }: { initialId: string | null }) {
     <>
       {/* ── Top bar: brand + the model selector and profile toggle (at the TOP,
           per the brief) ─────────────────────────────────────────────────────── */}
-      <header className={css.topbar}>
+      <header className="flex flex-none items-center gap-[14px] px-[clamp(16px,3vw,24px)] py-3 shadow-[inset_0_-1px_0_var(--color-edge)]">
         <button
-          className={css.menuBtn}
+          className="hidden h-[38px] w-[38px] flex-none items-center justify-center rounded-[10px] border-none bg-ink-100 text-mid shadow-[inset_0_0_0_1px_var(--color-edge)] transition-[background-color,color] duration-[160ms] ease-[ease] hover:bg-ink-150 hover:text-hi [@media(max-width:860px)]:inline-flex"
           type="button"
           onClick={() => shell.setDrawerOpen(!shell.drawerOpen)}
           aria-label="Toggle conversation list"
@@ -286,14 +291,14 @@ export default function ChatView({ initialId }: { initialId: string | null }) {
           <MenuGlyph />
         </button>
 
-        <div className={css.brand}>
-          <span className={css.brandMark}>
+        <div className="inline-flex items-center gap-[9px] text-hi">
+          <span className="inline-flex text-green">
             <ErrandMark size={20} />
           </span>
-          <span className={css.brandName}>Errand</span>
+          <span className="font-display text-[19px] tracking-[0.02em]">Errand</span>
         </div>
 
-        <div className={css.controls}>
+        <div className="ml-auto flex items-center gap-3">
           <ProfileToggle value={profile} onChange={changeProfile} disabled={composerLocked} />
           <ModelSelector
             models={models}
@@ -305,26 +310,32 @@ export default function ChatView({ initialId }: { initialId: string | null }) {
       </header>
 
       {/* ── Thread ────────────────────────────────────────────────────────── */}
-      <div className={css.threadScroll} ref={scrollRef}>
-        <div className={css.col}>
+      <div
+        className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden [scrollbar-color:var(--color-ink-250)_transparent] [scrollbar-width:thin]"
+        ref={scrollRef}
+      >
+        <div className="mx-auto flex w-full max-w-[760px] flex-col gap-3 px-[clamp(16px,4vw,28px)] pt-[26px] pb-[30px]">
           {emptyThread ? (
-            <div className={css.empty}>
-              <span className={css.emptyMark}>
+            <div className="flex min-h-[calc(100dvh-320px)] flex-col items-center justify-center py-6 text-center">
+              <span className="mb-[18px] inline-flex text-green">
                 <ErrandMark size={46} />
               </span>
-              <h1 className={css.emptyTitle}>
-                Tell it the errand. <em>You</em> approve the spend.
+              {/* font-bold restores the UA heading weight the old stylesheet
+                  relied on — Tailwind's preflight resets h1 to inherit. */}
+              <h1 className="mx-0 mt-0 mb-[14px] max-w-[18ch] font-display text-[clamp(28px,5vw,42px)] leading-[1.1] font-bold tracking-[0.01em] text-balance text-hi">
+                Tell it the errand. <em className="italic text-green-soft">You</em> approve
+                the spend.
               </h1>
-              <p className={css.emptyLede}>
+              <p className="mx-0 mt-0 mb-[28px] max-w-[50ch] text-[15px] leading-[1.55] text-mid">
                 Errand shops an approved merchant, builds a cart against your
                 policy, and pins a Prava card session — then waits for your
                 passkey before a cent moves.
               </p>
-              <div className={css.chips}>
+              <div className="flex w-full max-w-[460px] flex-col gap-[10px]">
                 {EXAMPLES[profile].map((ex) => (
                   <button
                     key={ex}
-                    className={css.chip}
+                    className="rounded-[13px] border-none bg-ink-100 px-4 py-[13px] text-left text-[13.5px] leading-[1.4] text-body shadow-[inset_0_0_0_1px_var(--color-edge)] transition-[background-color,color] duration-[180ms] ease-[ease] hover:bg-ink-150 hover:text-hi"
                     type="button"
                     onClick={() => setIntent(ex)}
                   >
@@ -342,14 +353,14 @@ export default function ChatView({ initialId }: { initialId: string | null }) {
               interim={voice.interim}
             />
           ) : (
-            <div className={t.thread}>
+            <div className="flex w-full flex-col gap-[22px]">
               {/* History: rows loaded from the server, then rows committed from
                   turns taken in this session. */}
               {chat.messages.map((m) => {
                 if (m.role === "user") {
                   return (
-                    <div key={m.id} className={t.userRow}>
-                      <div className={t.userBubble}>{m.content}</div>
+                    <div key={m.id} className={userRow}>
+                      <div className={userBubble}>{m.content}</div>
                     </div>
                   );
                 }
@@ -374,8 +385,8 @@ export default function ChatView({ initialId }: { initialId: string | null }) {
 
               {/* Live streaming turn (before it is committed) */}
               {chat.liveUser !== null && (
-                <div className={t.userRow}>
-                  <div className={t.userBubble}>{chat.liveUser}</div>
+                <div className={userRow}>
+                  <div className={userBubble}>{chat.liveUser}</div>
                 </div>
               )}
               {chat.liveRun.audit.length > 0 && (
@@ -393,7 +404,10 @@ export default function ChatView({ initialId }: { initialId: string | null }) {
               )}
 
               {chat.error && (
-                <div className={css.errorRow} role="alert">
+                <div
+                  className="rounded-card bg-ink-100 px-4 py-3 text-[13px] leading-[1.5] text-danger shadow-[inset_0_0_0_1px_rgba(255,122,107,0.22)]"
+                  role="alert"
+                >
                   {chat.error}
                 </div>
               )}
@@ -402,21 +416,24 @@ export default function ChatView({ initialId }: { initialId: string | null }) {
 
           {/* Voice hiccup / connection-lost banner */}
           {mode === "voice" && (voice.error || voice.state.connection === "lost") && (
-            <div className={css.lostBanner} role="status">
-              <span className={css.lostMark}>
+            <div
+              className="mt-4 flex items-center gap-[14px] rounded-card bg-[linear-gradient(180deg,var(--color-ink-150),var(--color-ink-100))] px-4 py-[14px] shadow-[inset_0_1px_0_rgba(232,180,95,0.14),inset_0_0_0_1px_var(--color-edge-strong)]"
+              role="status"
+            >
+              <span className="inline-flex flex-none items-center justify-center text-brass">
                 <LinkBreakGlyph />
               </span>
-              <div className={css.lostBody}>
-                <div className={css.lostTitle}>
+              <div className="min-w-0 flex-1">
+                <div className="text-[13.5px] [font-weight:640] text-hi">
                   {voice.error ? "Voice hiccup" : "Voice connection ended"}
                 </div>
-                <div className={css.lostText}>
+                <div className="mt-[2px] text-[12.5px] leading-[1.45] text-mid">
                   {voice.error ??
                     "The voice session closed. Everything said so far is preserved above."}
                 </div>
               </div>
               <button
-                className={css.lostRetry}
+                className="flex-none rounded-[10px] border-none bg-brass px-4 py-[9px] text-[13px] [font-weight:640] text-[#1c1405] shadow-[inset_0_1px_0_rgba(255,255,255,0.28)] transition-[background-color] duration-[180ms] ease-[ease] hover:bg-[#f0c579]"
                 onClick={() => void voice.start(model, profile)}
                 type="button"
               >
@@ -430,8 +447,8 @@ export default function ChatView({ initialId }: { initialId: string | null }) {
       </div>
 
       {/* ── Composer dock ─────────────────────────────────────────────────── */}
-      <footer className={css.dock}>
-        <div className={css.col}>
+      <footer className="flex-none bg-[linear-gradient(180deg,rgba(7,11,9,0),var(--color-ink-000)_40%)] px-0 pt-3 pb-4 shadow-[inset_0_1px_0_var(--color-edge)]">
+        <div className="mx-auto w-full max-w-[760px] px-[clamp(16px,4vw,28px)]">
           <Composer
             value={intent}
             onChange={setIntent}
@@ -445,7 +462,7 @@ export default function ChatView({ initialId }: { initialId: string | null }) {
             hint={composerHint}
             error={null}
           />
-          <div className={css.dockNote}>
+          <div className="mt-[10px] text-center text-[11.5px] tracking-[0.01em] text-low">
             {chatMidFlight(chat.liveRun, chat.streaming)
               ? "Working — you'll be asked to approve before anything is charged."
               : "Nothing is charged until you approve with a passkey."}
@@ -505,10 +522,13 @@ function phaseLabel(phase: RunPhase | string): string {
 // token / first tool card of a live turn — never hides real content.
 function TypingBubble() {
   return (
-    <div className={css.typing} aria-label="Assistant is responding">
-      <span className={css.typingDot} />
-      <span className={css.typingDot} />
-      <span className={css.typingDot} />
+    <div
+      className="inline-flex w-fit items-center gap-[6px] rounded-panel bg-[linear-gradient(180deg,var(--color-ink-150),var(--color-ink-100))] px-[18px] py-[14px] shadow-[inset_0_1px_0_rgba(160,240,200,0.06),inset_0_0_0_1px_var(--color-edge)]"
+      aria-label="Assistant is responding"
+    >
+      <span className="h-[6px] w-[6px] rounded-full bg-green-soft opacity-50 animate-[typingPulse_1.2s_ease-in-out_infinite]" />
+      <span className="h-[6px] w-[6px] rounded-full bg-green-soft opacity-50 animate-[typingPulse_1.2s_ease-in-out_infinite] [animation-delay:0.15s]" />
+      <span className="h-[6px] w-[6px] rounded-full bg-green-soft opacity-50 animate-[typingPulse_1.2s_ease-in-out_infinite] [animation-delay:0.3s]" />
     </div>
   );
 }

@@ -50,8 +50,14 @@ export default function ApprovalCard({
 
   return (
     <motion.div
-      initial={reduce ? false : { opacity: 0, y: 6 }}
-      animate={{ opacity: 1, y: 0 }}
+      // Entrance animates POSITION ONLY, never opacity. If the animation never
+      // runs — a hydration hiccup, a backgrounded tab, a throttled engine, a
+      // screenshot pass — an element that started at opacity 0 is simply gone,
+      // and here that would mean a tool card, a status line, or the approval
+      // control that gates real spend rendering as an empty void. Resting at
+      // full opacity means the worst case is a card that appears without sliding.
+      initial={reduce ? false : { y: 6 }}
+      animate={{ y: 0 }}
       transition={{ duration: 0.19, ease: [0.22, 0.8, 0.28, 1] }}
     >
       <ApprovalPanel

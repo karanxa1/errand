@@ -1,0 +1,15 @@
+/* Keyframes for the chat view. Utilities cannot express @keyframes, so the one
+   animation the thread uses lives here and is driven from the component with an
+   arbitrary animation utility. Nothing else belongs in this file. */
+
+@keyframes typingPulse {
+  0%,
+  100% {
+    opacity: 0.35;
+    transform: translateY(0);
+  }
+  50% {
+    opacity: 1;
+    transform: translateY(-2px);
+  }
+}

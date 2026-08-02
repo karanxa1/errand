@@ -1,0 +1,14 @@
+/* Keyframes for the control components. @keyframes cannot be expressed as
+   utilities, so they live here and are driven from the components with
+   arbitrary `animate-[...]` utilities. Nothing else belongs in this file. */
+
+@keyframes micring {
+  0% {
+    transform: scale(0.9);
+    opacity: 0.5;
+  }
+  100% {
+    transform: scale(1.35);
+    opacity: 0;
+  }
+}

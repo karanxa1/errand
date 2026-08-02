@@ -1,0 +1,19 @@
+/* Keyframes only. Everything else in the stage panels is a Tailwind utility;
+   @keyframes cannot be expressed as one, so the two the panels need live here
+   and are driven by arbitrary `animate-[...]` utilities on the elements. */
+
+@keyframes errand-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes errand-pulse {
+  0%,
+  100% {
+    opacity: 0.35;
+  }
+  50% {
+    opacity: 1;
+  }
+}

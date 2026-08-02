@@ -1,7 +1,14 @@
 "use client";
 
 import { useEffect, useRef, useState, type ReactNode } from "react";
-import styles from "./Composer.module.css";
+import "./controls.anim.css";
+
+// The dispatch arrow slides up-right when its button is hovered (and not
+// disabled). Shared by the labelled send, the round send and the auth submit.
+const ARROW =
+  "transition-transform duration-200 ease-[ease] " +
+  "[button:hover:not(:disabled)_&]:translate-x-0.5 " +
+  "[button:hover:not(:disabled)_&]:-translate-y-0.5";
 
 export default function Composer({
   value,
@@ -53,12 +60,18 @@ export default function Composer({
   const canSend = !disabled;
 
   return (
-    <div className={styles.composer}>
-      <div className={`${styles.row} ${focus ? styles.rowFocus : ""}`}>
-        <div className={styles.field}>
+    <div className="w-full">
+      <div
+        className={`flex items-end gap-3 bg-ink-100 rounded-panel py-3 pr-3 pl-[18px] transition-shadow duration-200 ease-[ease] ${
+          focus
+            ? "shadow-[inset_0_0_0_1px_var(--color-edge-strong),0_0_0_3px_var(--color-green-glow)]"
+            : "shadow-[inset_0_0_0_1px_var(--color-edge)]"
+        }`}
+      >
+        <div className="flex-1 flex flex-col gap-0.5 min-w-0">
           <textarea
             ref={taRef}
-            className={styles.textarea}
+            className="w-full resize-none border-0 bg-transparent text-hi font-body text-[16px] leading-[1.45] py-1.5 max-h-40 placeholder:text-low focus:outline-none"
             rows={1}
             placeholder="Speak your errand, or type it — “Restock the office pantry, under $200.”"
             value={value}
@@ -73,17 +86,19 @@ export default function Composer({
               }
             }}
           />
-          <span className={`${styles.hint} ${error ? styles.err : ""}`}>
+          <span
+            className={`text-[11px] min-h-[14px] ${error ? "text-danger" : "text-low"}`}
+          >
             {error || hint || ""}
           </span>
         </div>
 
-        <div className={styles.actions}>
+        <div className="flex items-center gap-2.5 flex-none">
           {micSupported &&
             (micSlot ? (
               <button
                 type="button"
-                className={styles.micSlot}
+                className="flex-none w-[46px] h-[46px] border-0 bg-transparent p-0 rounded-full inline-flex items-center justify-center leading-[0] disabled:cursor-default"
                 onClick={onToggleMic}
                 disabled={micDisabled}
                 aria-pressed={listening}
@@ -93,9 +108,15 @@ export default function Composer({
                 {micSlot}
               </button>
             ) : (
+              /* Mic — a soft round control; when live it pulses via a
+                 self-colored ring, no blurred halo. */
               <button
                 type="button"
-                className={`${styles.mic} ${listening ? styles.micLive : ""}`}
+                className={`relative w-[46px] h-[46px] rounded-full border-0 inline-flex items-center justify-center transition-[background-color,color] duration-200 ease-[ease] [&:hover:not(:disabled)]:bg-ink-250 [&:hover:not(:disabled)]:text-hi disabled:opacity-50 disabled:cursor-default ${
+                  listening
+                    ? "bg-green text-on-accent shadow-[inset_0_0_0_1px_rgba(255,255,255,0.2),0_0_0_4px_var(--color-green-glow)] after:content-[''] after:absolute after:-inset-1.5 after:rounded-full after:border-[1.5px] after:border-green after:opacity-50 after:animate-[micring_1.6s_ease-out_infinite]"
+                    : "bg-ink-200 text-body shadow-[inset_0_0_0_1px_var(--color-edge)]"
+                }`}
                 onClick={onToggleMic}
                 disabled={micDisabled}
                 aria-pressed={listening}
@@ -106,15 +127,18 @@ export default function Composer({
               </button>
             ))}
           {sendLabel ? (
+            /* Send — a solid, grounded action. Custom up-right dispatch arrow
+               (not the stock horizontal one). No lift-on-hover; a clean tonal +
+               icon shift. */
             <button
               type="button"
-              className={styles.send}
+              className="h-[46px] pl-5 pr-[18px] rounded-full border-0 bg-green text-on-accent [font-weight:650] text-sm inline-flex items-center gap-[9px] shadow-[inset_0_1px_0_rgba(255,255,255,0.22)] transition-[background-color] duration-[180ms] ease-[ease] [&:hover:not(:disabled)]:bg-green-soft disabled:bg-ink-200 disabled:text-low disabled:shadow-[inset_0_0_0_1px_var(--color-edge)] disabled:cursor-default"
               onClick={() => canSend && onSubmit()}
               disabled={!canSend}
             >
               {sendLabel}
               <svg
-                className={styles.sendArrow}
+                className={ARROW}
                 width="16"
                 height="16"
                 viewBox="0 0 16 16"
@@ -131,16 +155,17 @@ export default function Composer({
               </svg>
             </button>
           ) : (
+            /* Compact circular send — the in-thread action. */
             <button
               type="button"
-              className={styles.sendRound}
+              className="flex-none w-[46px] h-[46px] rounded-full border-0 bg-green text-on-accent inline-flex items-center justify-center shadow-[inset_0_1px_0_rgba(255,255,255,0.22)] transition-[background-color] duration-[180ms] ease-[ease] [&:hover:not(:disabled)]:bg-green-soft disabled:bg-ink-200 disabled:text-low disabled:shadow-[inset_0_0_0_1px_var(--color-edge)] disabled:cursor-default"
               onClick={() => canSend && onSubmit()}
               disabled={!canSend}
               aria-label="Run errand"
               title="Run errand"
             >
               <svg
-                className={styles.sendArrow}
+                className={ARROW}
                 width="17"
                 height="17"
                 viewBox="0 0 16 16"

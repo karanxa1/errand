@@ -127,6 +127,29 @@ async def create_user(session, *, email: str | None = None):
     return user
 
 
+def known_bug(reason: str):
+    """Mark a test as pinning a bug that is present RIGHT NOW.
+
+    The test describes the behaviour the code should have; it fails today and is
+    expected to. `strict=True` means the day someone fixes the bug the suite goes
+    red on an unexpected PASS, which is the prompt to delete this marker rather
+    than let the coverage quietly rot.
+
+    pytest is not a project dependency, so the marker degrades to bookkeeping
+    that `run_standalone` below understands when it is absent.
+    """
+
+    def decorate(fn):
+        fn.__known_bug__ = reason
+        try:
+            import pytest
+        except ImportError:  # pragma: no cover - standalone mode
+            return fn
+        return pytest.mark.xfail(reason=reason, strict=True)(fn)
+
+    return decorate
+
+
 def run_standalone(namespace: dict) -> int:
     """Run every test_* callable in `namespace`; return the failure count.
 
@@ -137,12 +160,20 @@ def run_standalone(namespace: dict) -> int:
     for name, fn in sorted(namespace.items()):
         if not name.startswith("test_") or not callable(fn):
             continue
+        bug = getattr(fn, "__known_bug__", None)
         try:
             fn()
         except AssertionError as exc:
-            failures += 1
-            print(f"FAIL {name}: {exc}")
+            if bug:
+                print(f"xfail {name}: {bug}")
+            else:
+                failures += 1
+                print(f"FAIL {name}: {exc}")
         else:
-            print(f"ok   {name}")
+            if bug:
+                failures += 1
+                print(f"XPASS {name}: bug appears fixed — drop the known_bug marker")
+            else:
+                print(f"ok   {name}")
     print(f"\n{'FAILED' if failures else 'PASSED'} — {failures} failure(s)")
     return failures

@@ -8,7 +8,6 @@
 
 import { useState } from "react";
 import type { Conversation } from "@/lib/useChat";
-import styles from "./Sidebar.module.css";
 
 function relativeTime(iso: string): string {
   const then = new Date(iso).getTime();
@@ -61,19 +60,28 @@ export default function Sidebar({
   };
 
   return (
-    <aside className={styles.sidebar}>
-      <button className={styles.newBtn} type="button" onClick={onNew}>
-        <span className={styles.newMark}>
+    <aside className="flex h-full min-h-0 flex-col gap-3 bg-ink-050 px-3 py-[14px] shadow-[inset_-1px_0_0_var(--color-edge)]">
+      <button
+        className="inline-flex h-[42px] flex-none items-center justify-start gap-[9px] rounded-chip border-none bg-green px-[15px] text-[14px] [font-weight:640] text-on-accent shadow-[inset_0_1px_0_rgba(255,255,255,0.22)] transition-[background-color] duration-[180ms] ease-[ease] hover:bg-green-soft"
+        type="button"
+        onClick={onNew}
+      >
+        <span className="inline-flex">
           <NewGlyph />
         </span>
         New chat
       </button>
 
-      <div className={styles.list} role="list">
+      <div
+        className="flex min-h-0 flex-1 flex-col gap-[3px] overflow-y-auto overflow-x-hidden pr-[2px] [scrollbar-color:var(--color-ink-250)_transparent] [scrollbar-width:thin]"
+        role="list"
+      >
         {loading && conversations.length === 0 ? (
-          <p className={styles.empty}>Loading your chats…</p>
+          <p className="m-0 px-2 py-[10px] text-[12.5px] leading-[1.5] text-low">
+            Loading your chats…
+          </p>
         ) : conversations.length === 0 ? (
-          <p className={styles.empty}>
+          <p className="m-0 px-2 py-[10px] text-[12.5px] leading-[1.5] text-low">
             No conversations yet. Start one to see it here.
           </p>
         ) : (
@@ -84,26 +92,34 @@ export default function Sidebar({
               <div
                 key={c.id}
                 role="listitem"
-                className={`${styles.item} ${active ? styles.itemActive : ""}`}
+                className={`group relative flex items-stretch gap-1 rounded-[10px] transition-[background-color] duration-[160ms] ease-[ease] hover:bg-ink-100 ${
+                  active
+                    ? "bg-ink-150 before:absolute before:top-[9px] before:bottom-[9px] before:left-0 before:w-[3px] before:rounded-[0_3px_3px_0] before:bg-green before:content-['']"
+                    : ""
+                }`}
               >
                 <button
-                  className={styles.itemMain}
+                  className="flex min-w-0 flex-1 flex-col items-start gap-[2px] border-none bg-transparent py-[9px] pr-2 pl-[13px] text-left text-body"
                   type="button"
                   onClick={() => pick(c.id)}
                   aria-current={active ? "true" : undefined}
                 >
-                  <span className={styles.itemTitle}>
+                  <span
+                    className={`max-w-full overflow-hidden text-ellipsis whitespace-nowrap text-[13.5px] leading-[1.3] ${
+                      active ? "text-hi" : "text-body"
+                    }`}
+                  >
                     {c.title?.trim() || "Untitled errand"}
                   </span>
-                  <span className={styles.itemTime}>
+                  <span className="text-[11px] text-low">
                     {relativeTime(c.updated_at || c.created_at)}
                   </span>
                 </button>
 
                 {confirming ? (
-                  <div className={styles.confirm}>
+                  <div className="mr-1 inline-flex flex-none gap-1 self-center">
                     <button
-                      className={styles.confirmYes}
+                      className="rounded-[7px] border-none bg-danger-dim px-[9px] py-[6px] text-[11.5px] font-semibold text-[#ffe6e1] transition-[background-color] duration-[160ms] ease-[ease] hover:bg-[#7e4740]"
                       type="button"
                       onClick={() => {
                         onDelete(c.id);
@@ -114,7 +130,7 @@ export default function Sidebar({
                       Delete
                     </button>
                     <button
-                      className={styles.confirmNo}
+                      className="rounded-[7px] border-none bg-ink-200 px-[9px] py-[6px] text-[11.5px] font-semibold text-mid transition-[background-color,color] duration-[160ms] ease-[ease] hover:bg-ink-250 hover:text-hi"
                       type="button"
                       onClick={() => setConfirmId(null)}
                       aria-label="Keep conversation"
@@ -124,7 +140,7 @@ export default function Sidebar({
                   </div>
                 ) : (
                   <button
-                    className={styles.del}
+                    className="mr-1 inline-flex h-[30px] w-[30px] flex-none items-center justify-center self-center rounded-[8px] border-none bg-transparent text-low opacity-0 transition-[opacity,background-color,color] duration-[160ms] ease-[ease] group-hover:opacity-100 focus-visible:opacity-100 hover:bg-ink-200 hover:text-danger"
                     type="button"
                     onClick={() => setConfirmId(c.id)}
                     aria-label={`Delete "${c.title || "Untitled errand"}"`}
@@ -139,14 +155,24 @@ export default function Sidebar({
         )}
       </div>
 
-      <div className={styles.foot}>
-        <div className={styles.who}>
-          <span className={styles.whoDot} aria-hidden="true" />
-          <span className={styles.whoEmail} title={userEmail}>
+      <div className="flex flex-none items-center gap-[10px] px-[6px] pt-3 pb-1 shadow-[inset_0_1px_0_var(--color-edge)]">
+        <div className="flex min-w-0 flex-1 items-center gap-2">
+          <span
+            className="h-[7px] w-[7px] flex-none rounded-full bg-green"
+            aria-hidden="true"
+          />
+          <span
+            className="min-w-0 overflow-hidden text-ellipsis whitespace-nowrap text-[12.5px] text-mid"
+            title={userEmail}
+          >
             {userEmail}
           </span>
         </div>
-        <button className={styles.logout} type="button" onClick={onLogout}>
+        <button
+          className="flex-none rounded-[8px] border-none bg-transparent px-[9px] py-[6px] text-[12.5px] [font-weight:550] text-low transition-[background-color,color] duration-[160ms] ease-[ease] hover:bg-ink-150 hover:text-hi"
+          type="button"
+          onClick={onLogout}
+        >
           Sign out
         </button>
       </div>
