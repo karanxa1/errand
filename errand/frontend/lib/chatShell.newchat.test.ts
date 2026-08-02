@@ -7,7 +7,11 @@
 // decision — if it regresses, "New chat" silently stops working again.
 
 import { describe, expect, it } from "vitest";
-import { conversationIdFromPath, shouldResetToNewChat } from "./chatShell";
+import {
+  conversationIdFromPath,
+  shouldResetToNewChat,
+  nonceRequestsReset,
+} from "./chatShell";
 
 const ID = "a".repeat(32);
 
@@ -55,5 +59,30 @@ describe("shouldResetToNewChat", () => {
     // this decision is only about the reused /c instance, so a mismatch that is
     // not the new-chat route must not trigger the blank-out.
     expect(shouldResetToNewChat(other, ID)).toBe(false);
+  });
+});
+
+describe("nonceRequestsReset (the reliable, router-independent path)", () => {
+  it("does NOT reset on first render (seen === current)", () => {
+    // Mount: the view seeds seen = current, so a freshly-loaded conversation is
+    // never blanked.
+    expect(nonceRequestsReset(0, 0)).toBe(false);
+    expect(nonceRequestsReset(7, 7)).toBe(false);
+  });
+
+  it("resets exactly when the nonce advances — this is the shipped-broken case", () => {
+    // "New chat" pressed while the reused /c instance holds an id: the router
+    // push is deduped and the pathname never changes, but the nonce moves, so
+    // this fires where the pathname-watch could not.
+    expect(nonceRequestsReset(1, 0)).toBe(true);
+    expect(nonceRequestsReset(8, 7)).toBe(true);
+  });
+
+  it("fires once per press: after handling, seen catches up and it stops", () => {
+    let seen = 0;
+    const pressed = 1;
+    expect(nonceRequestsReset(pressed, seen)).toBe(true);
+    seen = pressed; // the view records it
+    expect(nonceRequestsReset(pressed, seen)).toBe(false);
   });
 });

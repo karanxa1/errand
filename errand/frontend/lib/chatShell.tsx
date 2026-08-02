@@ -26,6 +26,13 @@ export interface ChatShell {
   // without a navigation so it cannot unmount an in-flight stream.
   openConversation: (id: string) => void;
   openNewChat: () => void;
+  // Increments every time "New chat" is pressed. This is the RELIABLE reset
+  // signal: after a first turn claims its id via history.pushState (not a
+  // navigation), router.push("/c") is deduped as a no-op — usePathname never
+  // flips back to /c, so a pathname-watch never fires and the reused ChatView
+  // keeps the old chat until a refresh. A plain counter through context does not
+  // depend on the router at all: it changes, ChatView sees it change, it resets.
+  newChatNonce: number;
   logout: () => void;
 }
 
@@ -83,4 +90,14 @@ export function shouldResetToNewChat(
   boundId: string | null,
 ): boolean {
   return routeId === null && boundId !== null;
+}
+
+// The PRIMARY new-chat reset decision: has the shell's newChatNonce moved since
+// this ChatView last acted on it? Pure so it can be pinned without a router or a
+// rendered component. `seen` is the last value the view handled; on the first
+// render seen === current, so this is false and a freshly-seeded conversation is
+// never wiped. Every press of "New chat" bumps the nonce, so it returns true
+// exactly once per press — independent of the router deduping the /c push.
+export function nonceRequestsReset(current: number, seen: number): boolean {
+  return current !== seen;
 }

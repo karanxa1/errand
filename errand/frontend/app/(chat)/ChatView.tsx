@@ -21,6 +21,7 @@ import {
   newConversationId,
   conversationIdFromPath,
   shouldResetToNewChat,
+  nonceRequestsReset,
 } from "@/lib/chatShell";
 import { useChat, type ConversationDetail } from "@/lib/useChat";
 import { useVoiceAgent } from "@/lib/useVoiceAgent";
@@ -96,17 +97,13 @@ export default function ChatView({
   const activeIdRef = useRef<string | null>(activeId);
   activeIdRef.current = activeId;
 
-  // ── "New chat" while this instance is reused ────────────────────────────────
-  // See shouldResetToNewChat: because a first turn claims its id with
-  // history.pushState (not a navigation), the router keeps this ChatView mounted
-  // and router.push("/c") is a no-op. The route still flips to /c though, and
-  // usePathname sees it — so when the route says new-chat while we still hold an
-  // id, tear our own state down to a blank chat. This is what made "New chat"
-  // require a refresh, and what left the previous run's cart on screen.
-  const pathname = usePathname();
-  const routeId = conversationIdFromPath(pathname);
-  useEffect(() => {
-    if (!shouldResetToNewChat(routeId, activeIdRef.current)) return;
+  // ── Reset this reused instance to a blank new chat ──────────────────────────
+  // A first turn claims its id with history.pushState (NOT a navigation) to keep
+  // the SSE stream alive, so the App Router's rendered route stays /c while the
+  // URL reads /c/<id>. That makes "New chat" (router.push("/c")) a no-op — the
+  // same ChatView is reused with its old activeId, so nothing happens until a
+  // refresh. The fix must not depend on the router.
+  const resetToNewChat = useCallback(() => {
     // Stop a live voice session first — a blank chat must not keep a mic open or
     // keep streaming the old run's audio into a conversation that is now gone.
     if (voiceRef.current.active) voiceRef.current.stop();
@@ -116,7 +113,30 @@ export default function ChatView({
     setMode("chat");
     // activeId → null cascades into useChat (aborts any stream, clears messages)
     // and flips emptyThread back on, so the welcome state paints, not stale cards.
-  }, [routeId]);
+  }, []);
+
+  // PRIMARY signal: the shell bumps newChatNonce every time "New chat" is pressed.
+  // This is plain React state through context, so it fires regardless of whether
+  // the router deduped the push. Skip the very first value (mount) so seeding a
+  // real conversation is never wiped.
+  const newChatNonce = shell.newChatNonce;
+  const seenNonceRef = useRef(newChatNonce);
+  useEffect(() => {
+    if (!nonceRequestsReset(newChatNonce, seenNonceRef.current)) return;
+    seenNonceRef.current = newChatNonce;
+    resetToNewChat();
+  }, [newChatNonce, resetToNewChat]);
+
+  // BELT-AND-BRACES: also reset if the route genuinely flips to new-chat while we
+  // still hold an id (e.g. browser back to /c). Harmless if the nonce already
+  // handled it — the reset is idempotent. Kept because it covers history nav that
+  // the button-driven nonce does not.
+  const pathname = usePathname();
+  const routeId = conversationIdFromPath(pathname);
+  useEffect(() => {
+    if (!shouldResetToNewChat(routeId, activeIdRef.current)) return;
+    resetToNewChat();
+  }, [routeId, resetToNewChat]);
 
   // Sync model/profile from a loaded conversation so the top bar reflects it.
   const onLoaded = useCallback((detail: ConversationDetail) => {

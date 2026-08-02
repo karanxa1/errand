@@ -26,6 +26,10 @@ export default function ChatLayout({ children }: { children: React.ReactNode }) 
   const { user, token, loading: authLoading, logout } = useAuth();
 
   const [drawerOpen, setDrawerOpen] = useState(false);
+  // Bumped by openNewChat. The reused-ChatView reset keys off this, not the
+  // pathname, because router.push("/c") after a pushState is deduped and the
+  // pathname never changes — so a pathname-only signal silently never fires.
+  const [newChatNonce, setNewChatNonce] = useState(0);
   const conversations = useConversations(token);
 
   // Send anyone without a session to the door. Guarding here rather than in each
@@ -49,6 +53,11 @@ export default function ChatLayout({ children }: { children: React.ReactNode }) 
 
   const openNewChat = useCallback(() => {
     setDrawerOpen(false);
+    // Bump the nonce FIRST — this is the signal ChatView actually resets on. The
+    // router.push keeps the URL/history honest (and does remount when coming from
+    // a real /c/<id> route), but it is deduped and does nothing when we are on
+    // the reused /c instance, which is exactly the case that was broken.
+    setNewChatNonce((n) => n + 1);
     router.push("/c");
   }, [router]);
 
@@ -76,9 +85,10 @@ export default function ChatLayout({ children }: { children: React.ReactNode }) 
       setDrawerOpen,
       openConversation,
       openNewChat,
+      newChatNonce,
       logout: signOut,
     }),
-    [conversations, token, user?.email, drawerOpen, openConversation, openNewChat, signOut],
+    [conversations, token, user?.email, drawerOpen, openConversation, openNewChat, newChatNonce, signOut],
   );
 
   if (authLoading || !user) {
