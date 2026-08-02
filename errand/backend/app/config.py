@@ -58,6 +58,28 @@ class Settings(BaseSettings):
     # are not subject to CORS, so the voice relay works cross-origin regardless.)
     allowed_origins: str = ""
 
+    # Database. Local dev defaults to a file-backed SQLite DB (async via
+    # aiosqlite); production sets DATABASE_URL to the Postgres server. Both use
+    # the same SQLAlchemy models, so the app is Postgres-compatible everywhere.
+    # A postgres:// or postgresql:// URL is normalized to the asyncpg driver.
+    database_url: str = "sqlite+aiosqlite:///./errand.db"
+
+    # Auth. JWT signing secret + token lifetime. MUST be overridden in prod via
+    # the JWT_SECRET env var (a long random string); the default is dev-only.
+    jwt_secret: str = "dev-only-insecure-change-me"
+    jwt_alg: str = "HS256"
+    jwt_expire_minutes: int = 60 * 24 * 7  # 7 days
+
+    @property
+    def sqlalchemy_url(self) -> str:
+        """Normalize common Postgres URL forms to the async asyncpg driver."""
+        url = self.database_url
+        if url.startswith("postgres://"):
+            url = "postgresql+asyncpg://" + url[len("postgres://") :]
+        elif url.startswith("postgresql://"):
+            url = "postgresql+asyncpg://" + url[len("postgresql://") :]
+        return url
+
     @property
     def cors_origins(self) -> list[str]:
         defaults = ["http://localhost:3000", "http://127.0.0.1:3000"]

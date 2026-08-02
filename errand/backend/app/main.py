@@ -20,14 +20,28 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from contextlib import asynccontextmanager
+
 from app.brokers import build_brokers
 from app.config import settings
+from app.db import init_db
 from app.orchestrator.guards import ApprovalDecision
 from app.orchestrator.run_errand import run_errand
 from app.orchestrator.stream import EventStream
+from app.routers import auth as auth_router
+from app.routers import chat as chat_router
+from app.routers import conversations as conversations_router
 from app.voice.relay import voice_ws
 
-app = FastAPI(title="Errand Backend")
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # Create tables for SQLite dev; a no-op where Alembic already built them.
+    await init_db()
+    yield
+
+
+app = FastAPI(title="Errand Backend", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -35,6 +49,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(auth_router.router)
+app.include_router(conversations_router.router)
+app.include_router(chat_router.router)
 
 # In-memory approval gates keyed by run id. Each run awaits its Future until the
 # frontend POSTs /approve (after the operator confirms + passkey). The Future
