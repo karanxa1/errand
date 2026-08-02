@@ -249,7 +249,13 @@ export function useVoiceAgent(token?: string | null): VoiceAgentApi {
       }
       default: {
         // approval.request carries the run_id the approve control must target.
-        if (type === "approval.request" && typeof msg.run_id === "string") {
+        // browser.liveview does the same for the live-handoff path: the human's
+        // "Done paying" resolves over the SAME {type:"approve"} control message,
+        // so the resolver needs this run_id even though no approval.request fired.
+        if (
+          (type === "approval.request" || type === "browser.liveview") &&
+          typeof msg.run_id === "string"
+        ) {
           approvalRunIdRef.current = msg.run_id;
         }
         // Everything else — tool.call, tool.result, websearch.result, and all

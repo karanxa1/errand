@@ -43,7 +43,12 @@ import json
 import logging
 import time
 import uuid
+from datetime import datetime, timezone
 from typing import Any
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 import websockets
 from fastapi import WebSocket, WebSocketDisconnect
@@ -56,6 +61,7 @@ from app.config import settings
 from app.contracts import AuditEvent
 from app.orchestrator.guards import ApprovalDecision
 from app.orchestrator.run_errand import run_errand
+from app.orchestrator.shop_decide import make_shop_decide
 from app.voice.tickets import redeem_ticket
 
 DEEPGRAM_AGENT_URL = "wss://agent.deepgram.com/v1/agent/converse"
@@ -263,7 +269,32 @@ def _think_functions() -> list[dict]:
                 "required": ["query"],
             },
         },
-    ]
+    ] + (
+        [
+            {
+                "name": "shop_live",
+                "description": (
+                    "Shop a real store in a live browser and hand it to the user "
+                    "to log in and PAY THEMSELVES on screen. Use when the user "
+                    "wants to buy from a specific real store (especially one "
+                    "needing a login) rather than the policy errand. The agent "
+                    "fills the cart; the user completes payment in the live "
+                    "browser — the agent never enters card details. Tell the user "
+                    "to look at the screen and pay there."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "merchant_url": {"type": "string", "description": "The store URL to shop."},
+                        "intent": {"type": "string", "description": "What to buy, in the user's words."},
+                    },
+                    "required": ["merchant_url", "intent"],
+                },
+            }
+        ]
+        if settings.live_handoff_ready
+        else []
+    )
 
 
 def _settings_message(model_id: str) -> dict:
@@ -703,6 +734,8 @@ class VoiceSession:
         try:
             if name == "run_errand":
                 content = await self._tool_run_errand(args)
+            elif name == "shop_live":
+                content = await self._tool_shop_live(args)
             elif name == "web_search":
                 content = await self._tool_web_search(args)
             else:
@@ -807,6 +840,30 @@ class VoiceSession:
                 timed_out=decision.timed_out,
             )
 
+        # Live browser view over voice, identical to the chat path: throttled JPEG
+        # frames become browser.frame; image-less steps (the wallet path) become
+        # audit lines. The browser reducer is shared, so the voice thread renders
+        # the SAME shop cards + live screenshots as a typed errand.
+        import base64
+
+        last_frame_at = 0.0
+
+        async def on_frame(step: str, detail: str, shot: bytes | None) -> None:
+            nonlocal last_frame_at
+            if not shot:
+                await emit(AuditEvent(at=_now_iso(), step=step, detail=detail, data={}))
+                return
+            now = time.monotonic()
+            if now - last_frame_at < 0.5:
+                return
+            last_frame_at = now
+            await self._to_browser({
+                "type": "browser.frame", "run_id": run_id, "mime": "image/jpeg",
+                "b64": base64.b64encode(shot).decode("ascii"), "caption": detail,
+            })
+
+        shop_decide = make_shop_decide(self._model_id, reasoning_effort="none")
+
         await self._to_browser({"type": "run.started", "run_id": run_id, "model": self._model_id})
         try:
             outcome = await run_errand(
@@ -817,6 +874,8 @@ class VoiceSession:
                 user_email_fallback=self._user_email,
                 emit=emit,
                 approve=approve,
+                shop_decide=shop_decide,
+                on_frame=on_frame,
             )
         except asyncio.CancelledError:
             raise
@@ -836,6 +895,98 @@ class VoiceSession:
         outcome = {**outcome, "run_id": run_id}
         await self._to_browser({"type": "run.done", **outcome})
         return _summarize_outcome(outcome)
+
+    async def _tool_shop_live(self, args: dict) -> str:
+        """Voice twin of the chat shop_live tool: the agent shops a real store in
+        a live browser and the USER pays on screen. Same wire as chat — browser
+        frames + a browser.liveview URL to the shared reducer — and the human's
+        'done paying' arrives on the SAME {type:"approve"} control message the
+        spend gate already uses. The agent narrates 'pay on screen' because a
+        spoken 'yes' cannot complete someone else's checkout form."""
+        merchant_url = (args.get("merchant_url") or "").strip()
+        intent = (args.get("intent") or "").strip()
+        if not merchant_url or not intent:
+            return "I need both a store and what to buy."
+        if not settings.live_handoff_ready:
+            return "The live browser handoff isn't enabled here."
+
+        run_id = uuid.uuid4().hex
+        import base64
+
+        from app.brokers.shopper import CloudflareShopperBroker, ShopperError
+        from app.contracts import PurchaseContext
+
+        async def emit(ev: AuditEvent) -> None:
+            payload = ev.model_dump()
+            payload["type"] = ev.step
+            payload["run_id"] = run_id
+            await self._to_browser(payload)
+            await self._narrate(ev.step)
+
+        last_frame_at = 0.0
+
+        async def on_frame(step: str, detail: str, shot: bytes | None) -> None:
+            nonlocal last_frame_at
+            if not shot:
+                await emit(AuditEvent(at=_now_iso(), step=step, detail=detail, data={}))
+                return
+            now = time.monotonic()
+            if now - last_frame_at < 0.5:
+                return
+            last_frame_at = now
+            await self._to_browser({
+                "type": "browser.frame", "run_id": run_id, "mime": "image/jpeg",
+                "b64": base64.b64encode(shot).decode("ascii"), "caption": detail,
+            })
+
+        async def on_live_view(url: str) -> None:
+            await self._to_browser({"type": "browser.liveview", "run_id": run_id, "url": url})
+            # Point the EAR at the screen — the payment happens there, not by voice.
+            await self._inject(
+                "I've opened the store in the live browser on your screen. "
+                "Please log in if needed and complete the payment there, then tell me when you're done.",
+                behavior="interrupt",
+            )
+
+        async def wait_for_human() -> dict:
+            # The '{type:"approve"}' control message is the 'done paying' signal.
+            fut: asyncio.Future[ApprovalDecision] = asyncio.get_running_loop().create_future()
+            self._approvals[run_id] = fut
+            try:
+                decision = await asyncio.wait_for(fut, timeout=APPROVAL_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                return {"approved": False}
+            finally:
+                self._approvals.pop(run_id, None)
+            return {"approved": decision.approved}
+
+        shop_decide = make_shop_decide(self._model_id, reasoning_effort="none")
+        ctx = PurchaseContext(profile=self._profile, approved_merchants=[], budget_cents=10**9, rules=[])
+
+        await self._to_browser({"type": "run.started", "run_id": run_id, "model": self._model_id})
+        try:
+            shopper = CloudflareShopperBroker()
+            order = await shopper.shop_live_handoff(
+                merchant_url, intent, ctx,
+                decide=shop_decide, wait_for_human=wait_for_human,
+                on_frame=on_frame, on_live_view=on_live_view,
+            )
+        except asyncio.CancelledError:
+            raise
+        except ShopperError as e:
+            await self._to_browser({"type": "run.error", "run_id": run_id, "message": str(e)})
+            return f"The live checkout didn't complete: {e}"
+        except Exception as e:  # noqa: BLE001
+            await self._to_browser({"type": "run.error", "run_id": run_id, "message": str(e)})
+            return f"The live checkout failed: {e}"
+        finally:
+            self._approvals.pop(run_id, None)
+
+        outcome = {"run_id": run_id, "kind": "completed", "order_id": order.order_id}
+        await self._to_browser({"type": "run.done", **outcome})
+        return (
+            f"You finished the checkout in the live browser. {order.confirmation_text}"
+        )
 
 
 def _approval_line(payload: dict) -> str:

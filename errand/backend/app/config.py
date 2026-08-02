@@ -212,6 +212,23 @@ class Settings(BaseSettings):
     use_mock_context: bool = False
     use_mock_payment: bool = False
 
+    # Live browser handoff: the agent shops in a real Cloudflare browser and hands
+    # the LIVE, interactive view to the human to log in / pay themselves (the
+    # agent enters no card on this path). Off by default — it needs Cloudflare
+    # Browser Run creds, and it drives real merchants. See
+    # docs/superpowers/specs/2026-08-03-live-view-handoff-design.md.
+    use_live_handoff: bool = False
+
+    @property
+    def live_handoff_ready(self) -> bool:
+        """True only when live handoff is enabled AND the Cloudflare browser it
+        requires is actually configured — Live View has no local equivalent."""
+        return bool(
+            self.use_live_handoff
+            and self.cloudflare_account_id
+            and self.cloudflare_api_token
+        )
+
     # CORS: comma-separated list of allowed browser origins for the HTTP/SSE
     # API. Local dev defaults are always included; in production set
     # ALLOWED_ORIGINS to the deployed frontend origin(s), e.g.

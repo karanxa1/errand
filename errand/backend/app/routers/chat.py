@@ -55,6 +55,7 @@ from app.db import SessionLocal, get_session
 from app.models import Approval, Conversation, Message, User
 from app.orchestrator.guards import ApprovalDecision, cancellable_sleep
 from app.orchestrator.run_errand import run_errand
+from app.orchestrator.shop_decide import make_shop_decide
 from app.orchestrator.stream import EventStream
 
 router = APIRouter(prefix="/api/conversations", tags=["chat"])
@@ -189,6 +190,32 @@ _TOOLS = [
     },
 ]
 
+# The live-handoff tool is APPENDED only when the feature is configured (Cloudflare
+# creds present + flag on). Off by default, so the model never offers a capability
+# the deployment can't perform. See settings.live_handoff_ready.
+_SHOP_LIVE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "shop_live",
+        "description": (
+            "Shop a real merchant site in a live browser and hand it to the user "
+            "to log in and PAY THEMSELVES. Use when the user wants to buy from a "
+            "specific real store (especially one needing an account/login) rather "
+            "than the policy errand. The agent fills the cart, then the user "
+            "completes payment in the live browser — the agent never enters card "
+            "details. `merchant_url` is the store to shop."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "merchant_url": {"type": "string", "description": "The store URL to shop."},
+                "intent": {"type": "string", "description": "What to buy, verbatim."},
+            },
+            "required": ["merchant_url", "intent"],
+        },
+    },
+}
+
 
 class ChatRequest(BaseModel):
     content: str = Field(min_length=1, max_length=8000)
@@ -222,106 +249,9 @@ def _client() -> AsyncOpenAI:
     return AsyncOpenAI(api_key=settings.openai_api_key)
 
 
-# The single tool the shop sub-agent is given: pick the next cart action. It is a
-# tightly-bounded surface (add/remove/done + a product_id) — NOT free browsing —
-# so the model can shape the cart but cannot navigate anywhere or do anything the
-# storefront driver does not expose.
-_SHOP_TOOL = [
-    {
-        "type": "function",
-        "function": {
-            "name": "cart_action",
-            "description": (
-                "Choose the next action to build the cart toward the user's "
-                "request: add one unit of a product, remove one unit, or finish "
-                "when the cart matches the request and fits the budget."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action": {"type": "string", "enum": ["add", "remove", "done"]},
-                    "product_id": {
-                        "type": "string",
-                        "description": "Required for add/remove; the shelf product id.",
-                    },
-                    "reason": {"type": "string", "description": "One short phrase; optional."},
-                },
-                "required": ["action"],
-            },
-        },
-    },
-]
-
-
-def _make_shop_decide(model_id: str):
-    """Build the `decide` step the agentic shop loop calls each turn.
-
-    Given the intent, the shelf, the current cart, the spend so far and the
-    budget, ask the model for ONE cart_action. The loop enforces policy + budget,
-    so this only has to choose; a malformed or missing tool call becomes a `done`
-    so a confused model ends the loop cleanly rather than hanging it.
-    """
-
-    async def decide(
-        *, intent, catalog, cart, spent_cents, budget_cents, last_refusal=None
-    ) -> dict:
-        shelf = "\n".join(
-            f"  {p['id']}: {p['name']} ({p['brand']}) ${p['price_cents']/100:.2f}"
-            for p in catalog
-        )
-        in_cart = (
-            ", ".join(f"{pid}×{qty}" for pid, qty in cart.items()) if cart else "empty"
-        )
-        refusal = f"\nLast action was refused: {last_refusal}" if last_refusal else ""
-        user = (
-            f"Request: {intent}\n\n"
-            f"Shelf (id: name (brand) price):\n{shelf}\n\n"
-            f"Cart now: {in_cart}\n"
-            f"Spent: ${spent_cents/100:.2f} of ${budget_cents/100:.2f} budget."
-            f"{refusal}\n\n"
-            "Call cart_action for the single best next step. Prefer the products "
-            "the request names and the budget allows; call done when the cart "
-            "satisfies the request or nothing else fits."
-        )
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You build a shopping cart one action at a time by calling "
-                    "cart_action. You may only add or remove products that are on "
-                    "the shelf. Stay within budget. Finish with done as soon as "
-                    "the cart fits the request — do not pad it."
-                ),
-            },
-            {"role": "user", "content": user},
-        ]
-        try:
-            async with _client() as client:
-                completion = await client.chat.completions.create(
-                    model=model_id,
-                    messages=messages,
-                    tools=_SHOP_TOOL,
-                    tool_choice="required",
-                    reasoning_effort=TOOL_REASONING_EFFORT,
-                    max_completion_tokens=256,
-                )
-            choice = completion.choices[0] if completion.choices else None
-            calls = getattr(choice.message, "tool_calls", None) if choice else None
-            if not calls:
-                return {"action": "done"}
-            args = json.loads(calls[0].function.arguments or "{}")
-            action = str(args.get("action") or "done").lower()
-            if action not in ("add", "remove", "done"):
-                return {"action": "done"}
-            return {
-                "action": action,
-                "product_id": str(args.get("product_id") or ""),
-                "reason": str(args.get("reason") or ""),
-            }
-        except Exception:  # noqa: BLE001 — a decision failure ends the loop, never the errand
-            return {"action": "done"}
-
-    return decide
+# The agentic-shop decision step is SHARED by the chat path and the voice relay,
+# so it lives in app.orchestrator.shop_decide (one implementation, both callers)
+# rather than here. Imported at module top.
 
 
 async def _owned(session: AsyncSession, user: User, conversation_id: str) -> Conversation:
@@ -623,7 +553,7 @@ async def chat(
                 {"run_id": run_id, "mime": "image/jpeg", "b64": b64, "caption": detail},
             )
 
-        shop_decide = _make_shop_decide(model_id)
+        shop_decide = make_shop_decide(model_id, reasoning_effort=TOOL_REASONING_EFFORT)
 
         await stream.emit_raw("run.started", {"run_id": run_id, "model": model_id})
         collected.append({"type": "run.started", "run_id": run_id, "model": model_id})
@@ -661,6 +591,103 @@ async def chat(
         collected.append({"type": "run.done", **outcome})
         return _summarize(outcome), collected
 
+    async def do_shop_live(args: dict) -> tuple[str, list[dict]]:
+        """Agent shops a real store in a live browser; the USER pays in it.
+
+        Distinct from run_errand: no Prava card, no policy budget filter minting a
+        card — the human performs the payment in the handed-off live view. The
+        human's 'Done paying'/'Cancel' resolves the SAME approval rendezvous the
+        errand uses (approved = finished, declined = cancelled)."""
+        merchant_url = (args.get("merchant_url") or "").strip()
+        intent = (args.get("intent") or "").strip()
+        if not merchant_url or not intent:
+            return "I need both a store URL and what to buy.", []
+        if not settings.live_handoff_ready:  # defence in depth; the tool is gated already
+            return "Live browser handoff isn't enabled on this deployment.", []
+
+        run_id = uuid.uuid4().hex
+        approval_id = uuid.uuid4().hex
+        collected: list[dict] = []
+        import base64
+
+        from app.brokers.shopper import CloudflareShopperBroker, ShopperError
+
+        async def emit(ev: AuditEvent) -> None:
+            collected.append({**ev.model_dump(), "type": ev.step, "run_id": run_id})
+            await emit_errand(ev, run_id)
+
+        last_frame_at = 0.0
+
+        async def on_frame(step: str, detail: str, shot: bytes | None) -> None:
+            nonlocal last_frame_at
+            if not shot:
+                await emit(AuditEvent(
+                    at=datetime.now(timezone.utc).isoformat(), step=step, detail=detail, data={}
+                ))
+                return
+            now = time.monotonic()
+            if now - last_frame_at < 0.5:
+                return
+            last_frame_at = now
+            await stream.emit_raw(
+                "browser.frame",
+                {"run_id": run_id, "mime": "image/jpeg", "b64": base64.b64encode(shot).decode("ascii"), "caption": detail},
+            )
+
+        async def on_live_view(url: str) -> None:
+            # The interactive URL for the human. The frontend renders it as an
+            # iframe + 'open in new tab' and shows the 'Done paying' control.
+            await stream.emit_raw("browser.liveview", {"run_id": run_id, "url": url})
+            collected.append({"type": "browser.liveview", "run_id": run_id, "url": url})
+
+        async def wait_for_human() -> dict:
+            # Reuse the errand approval gate as the 'done paying / cancel' signal.
+            decision = await approve(
+                run_id, approval_id,
+                {"kind": "live_handoff", "merchant_url": merchant_url},
+            )
+            return {"approved": decision.approved}
+
+        shop_decide = make_shop_decide(model_id, reasoning_effort=TOOL_REASONING_EFFORT)
+        # A real store the agent shops isn't scoped by the Senso policy, so an
+        # unbounded budget + no rules lets the model pick freely; the human pays,
+        # so spend control is the human's payment step, not a policy cap here.
+        from app.contracts import PurchaseContext
+        ctx = PurchaseContext(profile=p, approved_merchants=[], budget_cents=10**9, rules=[])
+
+        await stream.emit_raw("run.started", {"run_id": run_id, "model": model_id})
+        collected.append({"type": "run.started", "run_id": run_id, "model": model_id})
+        try:
+            shopper = CloudflareShopperBroker()
+            order = await shopper.shop_live_handoff(
+                merchant_url, intent, ctx,
+                decide=shop_decide,
+                wait_for_human=wait_for_human,
+                on_frame=on_frame,
+                on_live_view=on_live_view,
+            )
+        except asyncio.CancelledError:
+            raise
+        except ShopperError as e:
+            err = {"run_id": run_id, "message": str(e), "code": getattr(e, "step", "")}
+            await stream.emit_raw("run.error", err)
+            collected.append({"type": "run.error", **err})
+            return f"The live checkout didn't complete: {e}", collected
+        except Exception as e:  # noqa: BLE001
+            err = {"run_id": run_id, "message": str(e)}
+            await stream.emit_raw("run.error", err)
+            collected.append({"type": "run.error", **err})
+            return f"The live checkout failed: {e}", collected
+
+        outcome = {"run_id": run_id, "kind": "completed", "order_id": order.order_id}
+        await stream.emit_raw("run.done", outcome)
+        collected.append({"type": "run.done", **outcome})
+        return (
+            f"You completed the checkout in the live browser. {order.confirmation_text}"
+            if order.order_id == "placed"
+            else f"Order {order.order_id} placed. {order.confirmation_text}"
+        ), collected
+
     async def run() -> None:
         final_text = ""
         tool_events_all: list[dict] = []
@@ -672,13 +699,16 @@ async def chat(
             # `async with` closes the client's httpx connection pool on EVERY exit
             # path (normal, error, cancellation). Previously the client was built
             # per request and never closed, leaking a pool + sockets each turn.
+            # Offer the live-handoff tool only when the deployment can actually
+            # perform it, so the model never promises a capability that isn't wired.
+            active_tools = _TOOLS + ([_SHOP_LIVE_TOOL] if settings.live_handoff_ready else [])
             async with _client() as client:
                 # Tool-calling loop: keep going until the model returns plain text.
                 for _ in range(6):
                     completion = await client.chat.completions.create(
                         model=model_id,
                         messages=oai_messages,
-                        tools=_TOOLS,
+                        tools=active_tools,
                         stream=True,
                         # gpt-5.6 defaults to "medium", and OpenAI documents
                         # medium-with-function-tools on /v1/chat/completions as
@@ -748,6 +778,9 @@ async def chat(
                         try:
                             if name == "run_errand":
                                 result, events = await do_run_errand(cargs)
+                                tool_events_all.extend(events)
+                            elif name == "shop_live":
+                                result, events = await do_shop_live(cargs)
                                 tool_events_all.extend(events)
                             elif name == "web_search":
                                 result = await do_web_search(cargs)

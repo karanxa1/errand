@@ -10,6 +10,7 @@
    Every branch is total: unmapped/new events fall through to a generic card, so
    the thread NEVER crashes and NEVER renders an empty void. */
 
+import { useEffect, useRef, useState } from "react";
 import type {
   ApprovalRequest,
   AuditEntry,
@@ -140,6 +141,14 @@ export default function Thread({
             src={state.browserFrame.src}
             caption={state.browserFrame.caption}
           />
+        )}
+
+        {/* Live browser handoff — the agent has passed the interactive browser
+            back so the human can log in / pay. Shown while the run is still
+            going. A real <iframe> present on mount (never opacity-gated), so a
+            dropped animation can never blank it. */}
+        {state.liveView && running && (
+          <LiveViewCard url={state.liveView.url} onResolve={onResolveApproval} />
         )}
 
         {forming && (
@@ -541,6 +550,117 @@ function BrowserView({ src, caption }: { src: string; caption: string }) {
         alt={caption || "The agent shopping the store"}
         className="block w-full"
       />
+    </figure>
+  );
+}
+
+// How long the interactive live-view frame gets before we call it blocked. An
+// iframe fires no onError when the response is refused or third-party storage is
+// withheld, so silence is the only signal — we surface an "open in a new tab"
+// escape hatch after the wait. (Same discipline as ApprovalPanel's stall timer;
+// written self-contained here rather than shared.)
+const LIVE_VIEW_LOAD_TIMEOUT_MS = 12_000;
+
+/* The live browser handoff: an INTERACTIVE frame of the Cloudflare live-view
+   session (live.browser.run sends frame-ancestors *, so it embeds). The human
+   logs in and pays here; the agent never sees their card. If the frame hasn't
+   loaded in ~12s (blocked storage, a refused embed), a plain "open in a new tab"
+   link takes over so the moment never dead-ends. Tonal card, self-coloured lip —
+   no drawn border, no bloom. */
+function LiveViewCard({
+  url,
+  onResolve,
+}: {
+  url: string;
+  onResolve: (r: { approved: boolean; reason?: string }) => void;
+}) {
+  const [stalled, setStalled] = useState(false);
+  // The human resolves the handoff exactly once — clicking Done or Cancel locks
+  // the control so a double-tap can't fire two signals into the same run.
+  const [resolved, setResolved] = useState(false);
+  const loadTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    loadTimer.current = setTimeout(
+      () => setStalled(true),
+      LIVE_VIEW_LOAD_TIMEOUT_MS,
+    );
+    return () => {
+      if (loadTimer.current) clearTimeout(loadTimer.current);
+      loadTimer.current = null;
+    };
+  }, []);
+
+  return (
+    <figure className="m-0 overflow-hidden rounded-card bg-ink-050 shadow-[inset_0_0_0_1px_var(--color-edge)]">
+      <figcaption className="flex flex-col gap-1 px-[14px] py-[11px] shadow-[inset_0_-1px_0_var(--color-edge)]">
+        <span className="flex items-center gap-2 text-[13.5px] [font-weight:600] text-hi">
+          <span
+            className="h-[7px] w-[7px] flex-none rounded-full bg-green animate-[typingPulse_1.4s_ease-in-out_infinite]"
+            aria-hidden="true"
+          />
+          Finish in the live browser
+        </span>
+        <span className="text-[12px] leading-[1.45] text-mid">
+          Log in and pay here — the agent never sees your card.
+        </span>
+      </figcaption>
+
+      {stalled && (
+        <div className="px-[14px] py-2.5 text-[12px] leading-[1.5] text-body shadow-[inset_0_-1px_0_var(--color-edge)]">
+          The live browser didn&apos;t load here.{" "}
+          <a
+            className="text-green-soft underline underline-offset-2"
+            href={url}
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            Open it in a new tab
+          </a>{" "}
+          instead.
+        </div>
+      )}
+
+      <iframe
+        src={url}
+        title="Live browser handoff"
+        className="block w-full h-[clamp(420px,70vh,760px)] border-none bg-ink-000"
+        onLoad={() => {
+          if (loadTimer.current) clearTimeout(loadTimer.current);
+          loadTimer.current = null;
+          setStalled(false);
+        }}
+        sandbox="allow-scripts allow-forms allow-same-origin allow-popups allow-storage-access-by-user-activation"
+      />
+
+      {/* The human's hand-back: 'Done paying' resolves the run, 'Cancel' aborts
+          it. This is the client half of the handoff contract — without it the run
+          waits out its whole budget. One decisive action + a quiet cancel, not a
+          filled+outline pair. */}
+      <div className="flex items-center gap-3 px-[14px] py-3 shadow-[inset_0_1px_0_var(--color-edge)]">
+        <button
+          type="button"
+          disabled={resolved}
+          onClick={() => {
+            setResolved(true);
+            onResolve({ approved: true });
+          }}
+          className="rounded-xl border-none bg-green px-[18px] py-2.5 text-[13.5px] [font-weight:660] text-on-accent shadow-[inset_0_1px_0_rgba(255,255,255,0.22)] transition-[background-color] duration-[160ms] ease-[ease] enabled:hover:bg-green-soft disabled:bg-ink-200 disabled:text-low"
+        >
+          {resolved ? "Thanks — wrapping up…" : "I've finished paying"}
+        </button>
+        <button
+          type="button"
+          disabled={resolved}
+          onClick={() => {
+            setResolved(true);
+            onResolve({ approved: false });
+          }}
+          className="border-none bg-transparent px-1 py-1.5 text-[12.5px] text-low transition-[color] duration-[160ms] ease-[ease] enabled:hover:text-body disabled:text-low"
+        >
+          Cancel
+        </button>
+      </div>
     </figure>
   );
 }

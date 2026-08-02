@@ -66,6 +66,10 @@ export interface RunState {
   // plus its caption. Only ever the most recent frame — never a list — so the
   // live view is bounded memory no matter how many frames stream in.
   browserFrame: { src: string; caption: string } | null;
+  // The interactive Cloudflare live-view URL when the agent hands the browser
+  // back for the human to log in / pay. Only the latest URL, never a list; a bad
+  // frame never blanks a good one (mirrors browserFrame's discipline).
+  liveView: { url: string } | null;
 }
 
 export const initialRunState: RunState = {
@@ -85,6 +89,7 @@ export const initialRunState: RunState = {
   errorMessage: null,
   audit: [],
   browserFrame: null,
+  liveView: null,
 };
 
 // A resolved/pending web-search card lives as a single audit entry whose payload
@@ -147,6 +152,20 @@ export function applyFrame(state: RunState, frame: RawFrame): RunState {
       ...state,
       connection: state.connection === "open" ? state.connection : "open",
       browserFrame: { src: `data:${mime};base64,${b64}`, caption },
+    };
+  }
+
+  // ── browser.liveview: the agent hands the interactive browser back so the
+  // human can log in / pay on the live.browser.run URL. Store only the latest
+  // URL; never an audit entry (mirror browser.frame's early return) and never
+  // blank a good URL on a missing/empty payload. ─────────────────────────────
+  if (event === "browser.liveview") {
+    const url = typeof data.url === "string" ? data.url : "";
+    if (!url) return state;
+    return {
+      ...state,
+      connection: state.connection === "open" ? state.connection : "open",
+      liveView: { url },
     };
   }
 
@@ -262,6 +281,7 @@ export function applyFrame(state: RunState, frame: RawFrame): RunState {
         context: null,
         cart: null,
         browserFrame: null,
+        liveView: null,
         approval: null,
         approvalResult: null,
         credentialLast4: null,

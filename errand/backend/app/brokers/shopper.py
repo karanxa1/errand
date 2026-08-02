@@ -517,6 +517,179 @@ class CloudflareShopperBroker:
             ),
         )
 
+    async def shop_live_handoff(
+        self,
+        merchant_url: str,
+        intent: str,
+        context: PurchaseContext,
+        *,
+        decide,
+        wait_for_human,
+        on_frame=None,
+        on_live_view=None,
+        handoff_budget_s: float = 480.0,
+    ) -> OrderResult:
+        """Agent shops in ONE real browser, then hands the live view to the human
+        to log in / pay THEMSELVES. The agent never enters a card on this path.
+
+        Flow, all in a single Cloudflare session (Live View does not exist for a
+        local Chromium, so this refuses a local target):
+          1. Agent runs the agentic loop to fill the cart (observe/add/remove).
+          2. `Cloudflare.getLiveView(mode="tab")` → an INTERACTIVE URL; emitted via
+             on_live_view so the UI can iframe/link it.
+          3. `Cloudflare.handoff` opens the human takeover; we await EITHER the
+             `Cloudflare.handoffComplete` event (human clicked Done/Failed in the
+             live view) OR the app's own `wait_for_human` signal (the "Done
+             paying" button in our chat), whichever lands first.
+          4. While waiting, a keep-alive ping fires under Cloudflare's ≤10-min
+             inactivity cap so the session cannot idle out mid-payment.
+          5. Read the confirmation off the SAME page and return it.
+
+        Doc-verified: getLiveView/handoff/handoffComplete, mode="tab", keep_alive
+        ≤600000ms. See docs/superpowers/specs/2026-08-03-live-view-handoff-design.md
+        and https://developers.cloudflare.com/browser-run/features/human-in-the-loop/
+        """
+        mode = self._mode_for(merchant_url)
+        if mode != "cloudflare":
+            # No Cloudflare session ⇒ no Live View to hand off. Say so plainly
+            # rather than silently falling back to a path that enters a card.
+            raise ShopperError(
+                "shop_live",
+                "Live handoff needs the Cloudflare browser; this target resolves "
+                "to the local browser, which has no live view to hand off.",
+                url=merchant_url,
+            )
+
+        async def note(step: str, detail: str) -> None:
+            if on_frame is not None:
+                await on_frame(step, detail, None)
+
+        from app.orchestrator.agentic_shop import Product, run_agentic_shop
+
+        async with self._page(merchant_url) as (page, _mode):
+            await self._goto_ready(page, merchant_url, "[data-product-id]", "shop_live")
+
+            # 1. Fill the cart with the agent, streaming screenshots as it goes.
+            surface = _PlaywrightShopSurface(page, self, merchant_url)
+
+            async def on_step(step: str, detail: str) -> None:
+                if on_frame is None:
+                    return
+                shot: bytes | None = None
+                with contextlib.suppress(Exception):
+                    shot = await asyncio.wait_for(
+                        page.screenshot(type="jpeg", quality=45), timeout=8.0
+                    )
+                await on_frame(step, detail, shot)
+
+            await run_agentic_shop(
+                surface,
+                intent=intent,
+                budget_cents=context.budget_cents,
+                rules=context.rules,
+                decide=decide,
+                on_step=on_step,
+            )
+
+            # 2. Interactive live-view URL for the human.
+            cdp = await page.context.new_cdp_session(page)
+            live = await cdp.send("Cloudflare.getLiveView", {"mode": "tab", "expiresInMs": 600000})
+            live_url = live.get("devtoolsFrontendUrl") if isinstance(live, dict) else None
+            if not live_url:
+                raise ShopperError(
+                    "shop_live", "Cloudflare did not return a live-view URL.", url=merchant_url
+                )
+            if on_live_view is not None:
+                await on_live_view(live_url)
+            await note("handoff.live_view", "Live browser ready — log in and pay here.")
+
+            # 3. Open the structured handoff and wait for whichever "done" lands
+            #    first: Cloudflare's own handoffComplete (Done/Failed in the live
+            #    view) or our app's wait_for_human (the chat "Done paying" button).
+            loop = asyncio.get_event_loop()
+            cf_done: asyncio.Future = loop.create_future()
+
+            def _on_complete(payload: object) -> None:
+                if not cf_done.done():
+                    cf_done.set_result(payload if isinstance(payload, dict) else {})
+
+            cdp.on("Cloudflare.handoffComplete", _on_complete)
+            with contextlib.suppress(Exception):
+                await cdp.send(
+                    "Cloudflare.handoff",
+                    {
+                        "instructions": "Log in if needed and complete the purchase. "
+                        "Click Done when the order is placed.",
+                        "timeout": int(min(handoff_budget_s, 1800) * 1000),
+                    },
+                )
+
+            human_task = asyncio.ensure_future(wait_for_human())
+            cf_task = asyncio.ensure_future(cf_done)
+
+            # Keep-alive: any CDP command resets the ≤10-min inactivity timer, so a
+            # human typing a card (no traffic of ours) can't idle the session out.
+            async def keepalive() -> None:
+                try:
+                    while True:
+                        await asyncio.sleep(30)
+                        with contextlib.suppress(Exception):
+                            await cdp.send("Cloudflare.getHandoffState", {})
+                except asyncio.CancelledError:
+                    return
+
+            ping = asyncio.ensure_future(keepalive())
+            cancelled_human = False
+            try:
+                done, _pending = await asyncio.wait(
+                    {human_task, cf_task},
+                    timeout=handoff_budget_s,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if not done:
+                    raise ShopperError(
+                        "shop_live",
+                        "The checkout window closed before it was finished — "
+                        "nothing was completed. Start again when you're ready.",
+                        url=merchant_url,
+                    )
+                # If OUR button resolved and said cancel, stop honestly.
+                if human_task in done:
+                    verdict = human_task.result()
+                    if isinstance(verdict, dict) and verdict.get("approved") is False:
+                        cancelled_human = True
+            finally:
+                ping.cancel()
+                for t in (human_task, cf_task):
+                    if not t.done():
+                        t.cancel()
+                with contextlib.suppress(Exception):
+                    await cdp.detach()
+
+            if cancelled_human:
+                raise ShopperError(
+                    "shop_live", "You cancelled the checkout; nothing was placed.",
+                    url=merchant_url,
+                )
+
+            # 4. Read the confirmation off the SAME page. The merchant's own
+            #    success page is unknown DOM, so this is best-effort: look for an
+            #    ORD-style id / an order-number pattern in the visible text.
+            confirmation_text = ""
+            with contextlib.suppress(Exception):
+                confirmation_text = (
+                    await asyncio.wait_for(page.inner_text("body"), timeout=8.0)
+                ).strip()
+
+        order_id = ""
+        m = re.search(r"\b(?:ORD-?\d+|order\s*#?\s*[A-Za-z0-9-]{4,})\b", confirmation_text, re.I)
+        if m:
+            order_id = m.group(0)
+        return OrderResult(
+            order_id=order_id or "placed",
+            confirmation_text=confirmation_text[:2000] or "Checkout handed off to you.",
+        )
+
     async def complete_checkout(
         self, checkout: CheckoutState, credential: PaymentCredential
     ) -> OrderResult:

@@ -135,6 +135,30 @@ needs the Prava agent linked (`scripts/prava_link.py`, human-approved in the
 wallet) and a real card — a live purchase is human-gated and cannot be
 auto-tested. Pinned by the agentic tests in `tests/test_prava_wallet.py`.
 
+### Live browser handoff — agent shops, you pay (chat AND voice)
+`shop_live` is a tool the model can call to shop a real store in a live Cloudflare
+browser and hand the **interactive** view to the human to log in / pay
+themselves — the agent enters no card on this path. Backend:
+`CloudflareShopperBroker.shop_live_handoff` opens ONE session, runs the agentic
+loop to fill the cart, calls `Cloudflare.getLiveView(mode="tab")` for an
+interactive `live.browser.run` URL (emitted as a `browser.liveview` SSE frame),
+opens `Cloudflare.handoff`, and waits for EITHER Cloudflare's `handoffComplete`
+OR the app's own "done paying" signal, pinging keep-alive under the ≤10-min idle
+cap. It refuses local targets (no Live View for local Chromium) and is gated by
+`use_live_handoff` + Cloudflare creds (`settings.live_handoff_ready`). Frontend:
+`LiveViewCard` (Thread.tsx) renders the URL as an iframe (`live.browser.run`
+sends `frame-ancestors *`) with an "open in new tab" fallback and a "I've
+finished paying" / "Cancel" control wired to the approval resolver. The human's
+verdict resolves the SAME approval rendezvous the errand uses.
+
+Parity across chat and voice is enforced: the agentic shop decision lives in
+`app/orchestrator/shop_decide.py` (shared by the chat tool loop and the voice
+relay), and the voice hook folds `browser.frame`/`browser.liveview` through the
+same `applyFrame` reducer, so a voice-driven errand shows the same live browser +
+handoff. Not verifiable in CI (needs Cloudflare creds + a human at the payment
+step); pinned by `tests/test_live_handoff.py` (readiness gating + local refusal).
+Design: `docs/superpowers/specs/2026-08-03-live-view-handoff-design.md`.
+
 ### Voice binds the same conversation id as a typed turn
 The voice relay socket carries only `model`/`profile`/`ticket` — no conversation id — so a
 spoken run is ephemeral. To keep "stop voice, then type" in the *same* chat, both the
