@@ -88,6 +88,10 @@ export function useVoiceAgent(): VoiceAgentApi {
   const approvalRunIdRef = useRef<string | null>(null);
   // Guard against a manual stop being reported as a lost connection.
   const stoppingRef = useRef(false);
+  // Monotonic session generation. Every start/stop invalidates callbacks and
+  // permission requests belonging to an older session, so retries can never
+  // resurrect or overlap a stale microphone/WebSocket.
+  const sessionIdRef = useRef(0);
 
   const supported =
     typeof window !== "undefined" &&
@@ -185,6 +189,13 @@ export function useVoiceAgent(): VoiceAgentApi {
         setState((s) =>
           pushAuditEntry(s, new Date().toISOString(), "voice.error", message, { message }),
         );
+        // A Deepgram Error frame ends this session. Closing here prevents a
+        // failed-but-still-open relay from surviving behind the retry button.
+        try {
+          wsRef.current?.close();
+        } catch {
+          /* noop */
+        }
         return;
       }
       default: {
@@ -255,6 +266,7 @@ export function useVoiceAgent(): VoiceAgentApi {
   }, []);
 
   const stop = useCallback(() => {
+    sessionIdRef.current += 1;
     stoppingRef.current = true;
     const ws = wsRef.current;
     if (ws && ws.readyState === WebSocket.OPEN) {
@@ -282,6 +294,23 @@ export function useVoiceAgent(): VoiceAgentApi {
         setError("Voice isn't available in this browser.");
         return;
       }
+
+      // Replace any existing or still-starting session before requesting a new
+      // microphone. This makes Retry idempotent and guarantees one mic, one
+      // AudioContext, and one relay WebSocket at a time.
+      const sessionId = sessionIdRef.current + 1;
+      sessionIdRef.current = sessionId;
+      stoppingRef.current = true;
+      const previousWs = wsRef.current;
+      wsRef.current = null;
+      if (previousWs) {
+        try {
+          previousWs.close();
+        } catch {
+          /* noop */
+        }
+      }
+      teardown();
       setError(null);
       stoppingRef.current = false;
       // Fresh conversation state each session.
@@ -297,11 +326,16 @@ export function useVoiceAgent(): VoiceAgentApi {
           },
         });
       } catch (err) {
+        if (sessionId !== sessionIdRef.current) return;
         setError(
           (err as Error).name === "NotAllowedError"
             ? "Microphone permission denied."
             : `Could not start microphone: ${(err as Error).message}`,
         );
+        return;
+      }
+      if (sessionId !== sessionIdRef.current) {
+        stream.getTracks().forEach((track) => track.stop());
         return;
       }
       streamRef.current = stream;
@@ -325,6 +359,13 @@ export function useVoiceAgent(): VoiceAgentApi {
         await audioCtx.resume();
       } catch {
         /* noop */
+      }
+      if (sessionId !== sessionIdRef.current) {
+        stream.getTracks().forEach((track) => track.stop());
+        if (audioCtx.state !== "closed") void audioCtx.close();
+        if (streamRef.current === stream) streamRef.current = null;
+        if (audioCtxRef.current === audioCtx) audioCtxRef.current = null;
+        return;
       }
 
       const source = audioCtx.createMediaStreamSource(stream);
@@ -380,6 +421,10 @@ export function useVoiceAgent(): VoiceAgentApi {
       wsRef.current = ws;
 
       ws.onopen = () => {
+        if (sessionId !== sessionIdRef.current || wsRef.current !== ws) {
+          ws.close();
+          return;
+        }
         setActive(true);
         setVoicePhase("listening");
         setState((s) => ({ ...s, connection: "open" }));
@@ -391,6 +436,7 @@ export function useVoiceAgent(): VoiceAgentApi {
         rafRef.current = requestAnimationFrame(tick);
       };
       ws.onmessage = (ev) => {
+        if (sessionId !== sessionIdRef.current || wsRef.current !== ws) return;
         if (typeof ev.data === "string") {
           try {
             handleEvent(JSON.parse(ev.data));
@@ -402,11 +448,13 @@ export function useVoiceAgent(): VoiceAgentApi {
         }
       };
       ws.onerror = () => {
+        if (sessionId !== sessionIdRef.current || wsRef.current !== ws) return;
         if (!stoppingRef.current) {
           setError("Voice connection error.");
         }
       };
       ws.onclose = () => {
+        if (sessionId !== sessionIdRef.current || wsRef.current !== ws) return;
         if (!stoppingRef.current) {
           // Dropped mid-session — keep the transcript/cards, flag the drop.
           setState((s) =>

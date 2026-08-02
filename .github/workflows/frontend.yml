@@ -35,6 +35,9 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
+      - name: Test
+        run: bunx vitest run
+
       - name: Build (OpenNext) + Deploy (wrangler)
         env:
           # Public backend URL, baked into the client bundle at build time.
