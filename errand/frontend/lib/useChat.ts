@@ -80,6 +80,9 @@ interface UseChatArgs {
   onTurnComplete?: (conversationId: string) => void;
   // Fired after a conversation's full detail loads (to sync model/profile).
   onLoaded?: (detail: ConversationDetail) => void;
+  // A server-rendered seed for first paint, shown before the browser token
+  // hydrates. Best-effort only; the canonical Bearer fetch still runs.
+  initialDetail?: ConversationDetail | null;
 }
 
 // What a turn needs beyond its text. `conversationId` overrides the hook's
@@ -163,8 +166,10 @@ export function useChat({
   onTitle,
   onTurnComplete,
   onLoaded,
+  initialDetail,
 }: UseChatArgs): ChatApi {
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const matchingSeed = initialDetail?.id === conversationId ? initialDetail : null;
+  const [messages, setMessages] = useState<ChatMessage[]>(matchingSeed?.messages ?? []);
   const [loading, setLoading] = useState(false);
   const [streaming, setStreaming] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -221,7 +226,9 @@ export function useChat({
     clearLive();
 
     if (!conversationId || !token) {
-      setMessages([]);
+      setMessages(
+        initialDetail?.id === conversationId ? (initialDetail.messages ?? []) : [],
+      );
       setLoading(false);
       return;
     }
@@ -252,7 +259,7 @@ export function useChat({
     return () => {
       alive = false;
     };
-  }, [conversationId, token, clearLive]);
+  }, [conversationId, token, clearLive, initialDetail]);
 
   const send = useCallback(
     async (content: string, opts?: SendOptions) => {

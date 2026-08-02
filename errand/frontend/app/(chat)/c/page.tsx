@@ -4,5 +4,5 @@
 import ChatView from "../ChatView";
 
 export default function NewChatPage() {
-  return <ChatView initialId={null} />;
+  return <ChatView initialId={null} initialDetail={null} />;
 }

@@ -58,14 +58,20 @@ const EXAMPLES: Record<ProfileKind, string[]> = {
   ],
 };
 
-export default function ChatView({ initialId }: { initialId: string | null }) {
+export default function ChatView({
+  initialId,
+  initialDetail = null,
+}: {
+  initialId: string | null;
+  initialDetail?: ConversationDetail | null;
+}) {
   const shell = useChatShell();
   const convs = shell.conversations;
   const token = shell.token;
 
   const [models, setModels] = useState<ModelOption[]>(FALLBACK_MODELS);
-  const [model, setModel] = useState("sol");
-  const [profile, setProfile] = useState<ProfileKind>("business");
+  const [model, setModel] = useState(initialDetail?.model ?? "sol");
+  const [profile, setProfile] = useState<ProfileKind>(initialDetail?.profile ?? "business");
   // The conversation this view is bound to. Seeded from the route; a first turn
   // mints one and pushes it into the URL without navigating.
   const [activeId, setActiveId] = useState<string | null>(initialId);
@@ -102,6 +108,7 @@ export default function ChatView({ initialId }: { initialId: string | null }) {
     onTitle,
     onTurnComplete,
     onLoaded,
+    initialDetail,
   });
 
   // Load model options (public). Falls back silently to defaults.
