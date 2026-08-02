@@ -13,6 +13,13 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # errand/.env lives one level up from backend/
 _ENV_PATH = Path(__file__).resolve().parents[2] / ".env"
 
+# The dev-only JWT signing secret. Startup refuses to serve a non-dev
+# environment with this value (see Settings.jwt_secret_problem).
+INSECURE_JWT_SECRET_DEFAULT = "dev-only-insecure-change-me"
+
+# Shortest JWT secret considered non-trivial to brute-force offline.
+MIN_JWT_SECRET_LEN = 32
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=_ENV_PATH, extra="ignore")
@@ -66,9 +73,38 @@ class Settings(BaseSettings):
 
     # Auth. JWT signing secret + token lifetime. MUST be overridden in prod via
     # the JWT_SECRET env var (a long random string); the default is dev-only.
-    jwt_secret: str = "dev-only-insecure-change-me"
+    jwt_secret: str = INSECURE_JWT_SECRET_DEFAULT
     jwt_alg: str = "HS256"
     jwt_expire_minutes: int = 60 * 24 * 7  # 7 days
+
+    # Deployment environment. Anything other than "dev" is treated as a real
+    # deployment and must supply its own JWT_SECRET (see jwt_secret_problem).
+    environment: str = "dev"
+
+    @property
+    def is_dev(self) -> bool:
+        return self.environment.strip().lower() in ("dev", "development", "local", "test")
+
+    @property
+    def jwt_secret_problem(self) -> str | None:
+        """Why the configured JWT secret is unsafe, or None if it's acceptable.
+
+        The signing secret is the ONLY thing standing between an attacker and a
+        forged bearer token for any user id. The dev default is published in this
+        repo, so serving with it means anyone can mint an admin-equivalent token.
+        A too-short secret is brute-forceable offline against any issued token.
+        """
+        if self.jwt_secret == INSECURE_JWT_SECRET_DEFAULT:
+            return (
+                "JWT_SECRET is still the built-in dev default, which is public in "
+                "the source tree — anyone could forge a token for any user."
+            )
+        if len(self.jwt_secret) < MIN_JWT_SECRET_LEN:
+            return (
+                f"JWT_SECRET is only {len(self.jwt_secret)} characters; use at "
+                f"least {MIN_JWT_SECRET_LEN} random characters."
+            )
+        return None
 
     @property
     def sqlalchemy_url(self) -> str:

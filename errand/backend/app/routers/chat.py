@@ -58,8 +58,25 @@ _MODEL_MAP = {"sol": "gpt-5.6-sol", "terra": "gpt-5.6-terra", "luna": "gpt-5.6-l
 _DEFAULT_MODEL = "sol"
 APPROVAL_TIMEOUT_S = 300
 
-# In-memory approval gates for chat-driven errands, keyed by run_id.
-_approvals: dict[str, asyncio.Future[ApprovalDecision]] = {}
+# In-memory approval gates for chat-driven errands, keyed by (conversation_id,
+# run_id). The conversation id is part of the key so resolving a gate is scoped
+# to a conversation the caller provably owns: _owned() authorizes the
+# conversation, and the key then makes it impossible to reach a run belonging to
+# a DIFFERENT conversation (i.e. another user's spend) by supplying its run_id.
+#
+# ⚠️ SCALING CONSTRAINT — THIS REQUIRES EXACTLY ONE PROCESS.
+# Same constraint as app.main._approvals, for the same reason: the Future lives
+# in THIS process's heap, but the SSE stream that awaits it and the
+# POST /{id}/approve that resolves it are separate HTTP requests. If they land on
+# different replicas or different uvicorn workers, /approve finds no Future,
+# returns ok:false, and the errand hangs until APPROVAL_TIMEOUT_S then aborts the
+# spend — the user's approval appears to do nothing. A restart mid-gate likewise
+# loses the Future and the run aborts on timeout, unresumable.
+# The deployment is pinned to min=max=1 replica (and a single worker) precisely
+# to satisfy this, so it is correct as deployed. Horizontal scaling would need a
+# shared rendezvous (Redis pub/sub, Postgres LISTEN/NOTIFY, or a DB approvals
+# table the stream polls) — deliberately NOT done here.
+_approvals: dict[tuple[str, str], asyncio.Future[ApprovalDecision]] = {}
 
 SYSTEM_PROMPT = (
     "You are Errand, a warm, concise assistant that chats naturally and can run "
@@ -143,7 +160,10 @@ async def approve_chat(
     session: AsyncSession = Depends(get_session),
 ) -> dict:
     await _owned(session, user, conversation_id)
-    fut = _approvals.get(req.run_id)
+    # Keyed by (conversation_id, run_id): _owned() proved the caller owns THIS
+    # conversation, so a run_id from someone else's conversation cannot be
+    # resolved here even if the attacker learned it.
+    fut = _approvals.get((conversation_id, req.run_id))
     if fut is None or fut.done():
         return {"ok": False, "reason": "no pending approval for this run"}
     fut.set_result(
@@ -172,6 +192,12 @@ async def chat(
             select(Message).where(Message.conversation_id == convo.id).order_by(Message.created_at)
         )
     )
+    # `prior` is read AFTER the commit above, so it already contains the message
+    # just inserted. On the genuine first turn that is the only user message, so
+    # the count is exactly 1 and `<= 1` is the correct first-turn test (not an
+    # off-by-one). `<=` rather than `==` so a conversation whose history was
+    # trimmed to zero user rows still auto-titles instead of silently never
+    # titling.
     is_first_turn = sum(1 for m in prior if m.role == "user") <= 1
 
     convo_id = convo.id
@@ -189,6 +215,11 @@ async def chat(
 
     stream = EventStream()
 
+    # Cancel token: lets the SSE generator abort an in-flight errand cleanly when
+    # the client disconnects, so the orchestrator stops at its next step boundary
+    # instead of only unwinding on hard task cancellation. Mirrors main.py.
+    cancel = asyncio.Event()
+
     async def emit_errand(ev: AuditEvent, run_id: str) -> None:
         payload = ev.model_dump()
         payload["type"] = ev.step
@@ -197,7 +228,8 @@ async def chat(
 
     async def approve(run_id: str, approval_id: str, payload: dict) -> ApprovalDecision:
         fut: asyncio.Future[ApprovalDecision] = asyncio.get_running_loop().create_future()
-        _approvals[run_id] = fut
+        key = (convo_id, run_id)
+        _approvals[key] = fut
         await stream.emit_raw(
             "approval.request", {"run_id": run_id, "approval_id": approval_id, **payload}
         )
@@ -209,7 +241,9 @@ async def chat(
             )
             return ApprovalDecision(approved=False, approval_id=approval_id, timed_out=True)
         finally:
-            _approvals.pop(run_id, None)
+            # Always drop the gate, including on cancellation (client
+            # disconnect), so the map can't accumulate dead Futures.
+            _approvals.pop(key, None)
         return ApprovalDecision(
             approved=decision.approved,
             approval_id=approval_id,
@@ -263,7 +297,13 @@ async def chat(
                 user_email_fallback=user.email,
                 emit=emit,
                 approve=approve_wrap,
+                cancel=cancel,
             )
+        except asyncio.CancelledError:
+            # Client disconnected / stream torn down. Must propagate so the task
+            # actually dies; swallowing it here would turn a cancelled run into a
+            # "the errand failed" tool result fed back to the model.
+            raise
         except Exception as e:  # noqa: BLE001
             await stream.emit_raw("run.error", {"run_id": run_id, "message": str(e)})
             collected.append({"type": "run.error", "run_id": run_id, "message": str(e)})
@@ -274,87 +314,121 @@ async def chat(
         return _summarize(outcome), collected
 
     async def run() -> None:
-        client = _client()
         final_text = ""
         tool_events_all: list[dict] = []
+        # Text streamed on the most recent pass. If the tool loop exhausts its
+        # iteration cap, this is the prose the user actually SAW, so it is what
+        # must be persisted (see the loop's `else:` branch).
+        last_pass_text = ""
         try:
-            # Tool-calling loop: keep going until the model returns plain text.
-            for _ in range(6):
-                completion = await client.chat.completions.create(
-                    model=model_id,
-                    messages=oai_messages,
-                    tools=_TOOLS,
-                    stream=True,
-                    # gpt-5.6 requires reasoning_effort='none' to use function
-                    # tools via /v1/chat/completions.
-                    reasoning_effort="none",
-                )
-                text_parts: list[str] = []
-                tool_calls: dict[int, dict] = {}
-                async for chunk in completion:
-                    delta = chunk.choices[0].delta if chunk.choices else None
-                    if delta is None:
-                        continue
-                    if delta.content:
-                        text_parts.append(delta.content)
-                        await stream.emit_raw("token", {"text": delta.content})
-                    for tc in delta.tool_calls or []:
-                        slot = tool_calls.setdefault(
-                            tc.index, {"id": "", "name": "", "arguments": ""}
-                        )
-                        if tc.id:
-                            slot["id"] = tc.id
-                        if tc.function and tc.function.name:
-                            slot["name"] = tc.function.name
-                        if tc.function and tc.function.arguments:
-                            slot["arguments"] += tc.function.arguments
+            # `async with` closes the client's httpx connection pool on EVERY exit
+            # path (normal, error, cancellation). Previously the client was built
+            # per request and never closed, leaking a pool + sockets each turn.
+            async with _client() as client:
+                # Tool-calling loop: keep going until the model returns plain text.
+                for _ in range(6):
+                    completion = await client.chat.completions.create(
+                        model=model_id,
+                        messages=oai_messages,
+                        tools=_TOOLS,
+                        stream=True,
+                        # gpt-5.6 requires reasoning_effort='none' to use function
+                        # tools via /v1/chat/completions.
+                        reasoning_effort="none",
+                    )
+                    text_parts: list[str] = []
+                    tool_calls: dict[int, dict] = {}
+                    async for chunk in completion:
+                        delta = chunk.choices[0].delta if chunk.choices else None
+                        if delta is None:
+                            continue
+                        if delta.content:
+                            text_parts.append(delta.content)
+                            await stream.emit_raw("token", {"text": delta.content})
+                        for tc in delta.tool_calls or []:
+                            slot = tool_calls.setdefault(
+                                tc.index, {"id": "", "name": "", "arguments": ""}
+                            )
+                            if tc.id:
+                                slot["id"] = tc.id
+                            if tc.function and tc.function.name:
+                                slot["name"] = tc.function.name
+                            if tc.function and tc.function.arguments:
+                                slot["arguments"] += tc.function.arguments
 
-                if not tool_calls:
-                    final_text = "".join(text_parts).strip()
-                    break
+                    last_pass_text = "".join(text_parts).strip()
 
-                # Record the assistant's tool-call turn, then execute each call.
-                oai_messages.append(
-                    {
-                        "role": "assistant",
-                        "content": "".join(text_parts) or None,
-                        "tool_calls": [
-                            {
-                                "id": c["id"] or f"call_{i}",
-                                "type": "function",
-                                "function": {"name": c["name"], "arguments": c["arguments"] or "{}"},
-                            }
-                            for i, c in sorted(tool_calls.items())
-                        ],
-                    }
-                )
-                for i, c in sorted(tool_calls.items()):
-                    name = c["name"]
-                    try:
-                        cargs = json.loads(c["arguments"] or "{}")
-                    except json.JSONDecodeError:
-                        cargs = {}
-                    await stream.emit_raw("tool.call", {"name": name, "args": cargs})
-                    if name == "run_errand":
-                        result, events = await do_run_errand(cargs)
-                        tool_events_all.extend(events)
-                    elif name == "web_search":
-                        result = await do_web_search(cargs)
-                    else:
-                        result = f"Unknown tool: {name}"
-                    await stream.emit_raw("tool.result", {"name": name, "summary": result})
+                    if not tool_calls:
+                        final_text = last_pass_text
+                        break
+
+                    # Record the assistant's tool-call turn, then execute each call.
                     oai_messages.append(
                         {
-                            "role": "tool",
-                            "tool_call_id": c["id"] or f"call_{i}",
-                            "content": result,
+                            "role": "assistant",
+                            "content": "".join(text_parts) or None,
+                            "tool_calls": [
+                                {
+                                    "id": c["id"] or f"call_{i}",
+                                    "type": "function",
+                                    "function": {
+                                        "name": c["name"],
+                                        "arguments": c["arguments"] or "{}",
+                                    },
+                                }
+                                for i, c in sorted(tool_calls.items())
+                            ],
                         }
                     )
-            else:
-                final_text = final_text or "I've completed the steps above."
+                    for i, c in sorted(tool_calls.items()):
+                        name = c["name"]
+                        try:
+                            cargs = json.loads(c["arguments"] or "{}")
+                        except json.JSONDecodeError:
+                            cargs = {}
+                        await stream.emit_raw("tool.call", {"name": name, "args": cargs})
+                        # A tool failure is reported TO THE MODEL as the tool
+                        # result, not raised: every tool call the model made must
+                        # get a matching tool message or the next request is
+                        # malformed, and one broken tool should not discard the
+                        # whole turn (including any assistant text already
+                        # streamed). do_run_errand handles its own errors;
+                        # do_web_search can raise on a Linkup/network failure.
+                        try:
+                            if name == "run_errand":
+                                result, events = await do_run_errand(cargs)
+                                tool_events_all.extend(events)
+                            elif name == "web_search":
+                                result = await do_web_search(cargs)
+                            else:
+                                result = f"Unknown tool: {name}"
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as tool_err:  # noqa: BLE001
+                            result = f"Tool {name} failed: {tool_err}"
+                        await stream.emit_raw(
+                            "tool.result", {"name": name, "summary": result}
+                        )
+                        oai_messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": c["id"] or f"call_{i}",
+                                "content": result,
+                            }
+                        )
+                else:
+                    # for/else: reached only when the loop was NOT broken out of,
+                    # i.e. all 6 passes returned tool calls and the model never
+                    # settled on plain text. `final_text` is still "" here (it is
+                    # only assigned on the break path), so prefer whatever prose
+                    # the last pass streamed — the user already saw those tokens,
+                    # and persisting the generic fallback instead would make the
+                    # reloaded conversation disagree with the live stream.
+                    final_text = last_pass_text or "I've completed the steps above."
 
             # Persist assistant + tool records in a fresh session (request session
-            # is closed once the response body starts streaming).
+            # is closed once the response body starts streaming). `async with`
+            # closes/rolls back this session on any error too.
             async with SessionLocal() as s:
                 if tool_events_all:
                     s.add(
@@ -382,6 +456,11 @@ async def chat(
                     {"message_id": assistant_msg.id, "content": final_text},
                 )
             await stream.emit_raw("done", {})
+        except asyncio.CancelledError:
+            # The client disconnected and body()'s finally cancelled us. Nothing
+            # is draining the queue, so emitting would be pointless; re-raise so
+            # the task terminates as cancelled rather than looking successful.
+            raise
         except Exception as e:  # noqa: BLE001
             await stream.emit_raw("error", {"message": str(e)})
         finally:
@@ -394,6 +473,20 @@ async def chat(
             async for frame in stream.drain():
                 yield frame
         finally:
+            # Always tear down so the background task can never outlive the
+            # request: signal cooperative cancel, unblock any pending approval
+            # gate for this conversation (otherwise the run sits on its Future
+            # until APPROVAL_TIMEOUT_S even though nobody is listening), then
+            # hard-cancel and await the task so it is fully finished before the
+            # response ends.
+            cancel.set()
+            for (c_id, r_id), pending in list(_approvals.items()):
+                if c_id == convo_id and not pending.done():
+                    pending.set_result(
+                        ApprovalDecision(
+                            approved=False, approval_id=r_id, reason="stream closed"
+                        )
+                    )
             if not task.done():
                 task.cancel()
             try:

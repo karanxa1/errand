@@ -3,15 +3,34 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, field_validator
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth import create_token, get_current_user, hash_password, verify_password
+from app.auth import (
+    MAX_PASSWORD_BYTES,
+    create_token,
+    get_current_user,
+    hash_password,
+    verify_password,
+)
 from app.db import get_session
 from app.models import User
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
+
+
+def _check_password_bytes(v: str) -> str:
+    """bcrypt hard-rejects secrets over 72 BYTES (it raises, it does not
+    truncate). max_length counts CHARACTERS, so a password of 40 non-ASCII
+    characters passes the character bound and then blows up inside bcrypt. Bound
+    the encoded length so an over-long password is a clean 422, never a 500.
+    """
+    if len(v.encode("utf-8")) > MAX_PASSWORD_BYTES:
+        raise ValueError(
+            f"password must be at most {MAX_PASSWORD_BYTES} bytes when UTF-8 encoded"
+        )
+    return v
 
 
 class RegisterRequest(BaseModel):
@@ -19,10 +38,15 @@ class RegisterRequest(BaseModel):
     password: str = Field(min_length=8, max_length=128)
     name: str = Field(default="", max_length=120)
 
+    _check_password = field_validator("password")(_check_password_bytes)
+
 
 class LoginRequest(BaseModel):
     email: EmailStr
-    password: str
+    # Bounded so a huge body can't be pushed through the bcrypt path at all.
+    password: str = Field(max_length=128)
+
+    _check_password = field_validator("password")(_check_password_bytes)
 
 
 class UserOut(BaseModel):

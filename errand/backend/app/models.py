@@ -82,3 +82,14 @@ class Message(Base):
 
 
 Index("ix_messages_conv_created", Message.conversation_id, Message.created_at)
+
+# Hot query: "list this user's conversations, newest activity first"
+# (WHERE user_id = ? ORDER BY updated_at DESC LIMIT ?). The single-column
+# ix_conversations_user_id can satisfy the WHERE but leaves the ORDER BY as a
+# sort over every row the user owns. This composite lets both the filter and the
+# ordering be served straight from the index. It is declared ASC on purpose: for
+# an equality-pinned leading column the engine can walk the index backwards, so
+# ASC serves ORDER BY updated_at DESC just as well as an explicit DESC index
+# while staying a plain (portable, reflectable) column index on both SQLite and
+# Postgres.
+Index("ix_conversations_user_updated", Conversation.user_id, Conversation.updated_at)

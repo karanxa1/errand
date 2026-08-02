@@ -17,6 +17,11 @@ from app.models import User
 
 _bearer = HTTPBearer(auto_error=False)
 
+# bcrypt refuses (raises ValueError on) any secret longer than 72 bytes. Request
+# models bound the password to this so an over-long password is rejected as a
+# validation error instead of surfacing as a 500 from inside hash_password.
+MAX_PASSWORD_BYTES = 72
+
 
 def hash_password(plain: str) -> str:
     return bcrypt.hashpw(plain.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")

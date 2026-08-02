@@ -4,3 +4,6 @@ node_modules/
 reference-repos/
 errand/node_modules/
 errand/.env*
+
+# Local-only context handoff (never commit)
+errand-handoff.md
