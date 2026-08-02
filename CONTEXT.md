@@ -45,17 +45,29 @@ off `main`.
 - `alembic/` — async env bound to `settings.sqlalchemy_url`.
 
 ### Things that are load-bearing and easy to break
-- **The approval gates are in-process dicts.** The SSE stream that awaits a gate and the
-  POST that resolves it are separate requests, so they must hit the same process. The
-  deployment is pinned to **min=max=1 replica, single worker** for exactly this reason.
-  Scaling out needs a shared rendezvous first.
+- **Approval gates are DB-backed** (table `approvals`, polled by the SSE stream; POST
+  `/approve` UPDATEs it). The await and the resolve can now run in different processes.
+  The deployment stays pinned to **min=max=1 replica, single worker** anyway, because the
+  in-flight `run_errand` coroutine state is still in memory and does not survive a
+  restart — this change made the approval *rendezvous* horizontally correct, not the run.
 - **Identity for anything that spends comes from the verified token**, never the request
   body. `ErrandRequest` deliberately does not accept `user_id`/`user_email`.
 - **`ENVIRONMENT=production`** is set on the Container App, so the JWT startup guard
   enforces rather than warns.
-- **`gpt-5.6` + function tools requires `reasoning_effort="none"`.** The default
-  (`medium`) is the unsupported combination. The Deepgram relay carries the same thing
-  under its own name, `think.provider.reasoning_mode`.
+- **`gpt-5.6` (text chat) + function tools requires `reasoning_effort="none"`.** The
+  default (`medium`) is the unsupported combination.
+- **Voice uses Deepgram-MANAGED providers, not the text models.** `app/voice/relay.py`
+  thinks with `anthropic`/`claude-sonnet-5` and speaks with `cartesia`/`sonic-2`, both
+  managed (no endpoint, no extra key). `reasoning_mode` is OpenAI-only and is NOT sent.
+  Consequence: the sol/terra/luna selector drives the TEXT model only; the voice LLM is
+  always claude-sonnet-5. All values are doc-cited in `_settings_message`.
+- **The seeded Senso policy names an unroutable vendor** (`demo-pantry.example.com`).
+  `run_errand.resolve_merchant` swaps only configured unroutable hosts for the demo
+  storefront (`frontend/public/store/`, served on the Worker origin) and emits a
+  `context.merchant_resolved` audit event; Senso stays the source of truth for the name,
+  budget and rules. Policy extraction keeps restrictive rules ahead of the length cap and
+  matches negations generically — a live errand was completing with a banned item before
+  both were fixed.
 
 ---
 
