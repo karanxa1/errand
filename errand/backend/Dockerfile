@@ -23,14 +23,14 @@ WORKDIR /app
 
 # 1. Dependency layer — cached unless the lockfile changes. --no-install-project
 #    installs only third-party deps so app-code edits don't bust this layer.
+#    (No BuildKit cache mounts: `az acr build` uses the classic builder, which
+#    doesn't support --mount=type=cache. Layer caching alone is enough.)
 COPY pyproject.toml uv.lock ./
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-install-project --no-dev
+RUN uv sync --frozen --no-install-project --no-dev
 
 # 2. App code + the project itself.
 COPY app ./app
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev
+RUN uv sync --frozen --no-dev
 
 ENV PATH="/app/.venv/bin:$PATH"
 
