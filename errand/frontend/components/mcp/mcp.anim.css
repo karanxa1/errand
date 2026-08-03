@@ -1,0 +1,13 @@
+/* Keyframes for the MCP panel. @keyframes cannot be expressed as utilities, so
+   they live here and are driven from the component with arbitrary
+   `[animation:...]` utilities. Nothing else belongs in this file.
+
+   One keyframe only, and it is applied to a control that is genuinely working (a
+   connection test in flight) — motion that reports state, not decoration. The
+   global prefers-reduced-motion rule in app/globals.css already collapses it. */
+
+@keyframes mcp-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}

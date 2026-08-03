@@ -1,12 +1,17 @@
 """Real AI chat over SSE.
 
 The assistant (gpt-5.6-{sol|terra|luna} via the OpenAI-compatible endpoint)
-answers normally AND can call two tools:
+answers normally AND can call tools:
 
   - run_errand(intent, profile?)  -> the existing purchasing orchestrator, whose
     AuditEvents are streamed to the browser (same tool cards as before) and
     saved as a role='tool' message so the conversation re-renders later.
   - web_search(query, depth?)     -> Linkup grounded search.
+  - shop_live(...)                -> appended only when live handoff is configured.
+  - mcp__<server>__<tool>(...)    -> any tool from an MCP server THIS user has
+    registered and authorized. Built from the cached catalogue on each server row
+    (one SELECT, no network I/O per turn) and dispatched through
+    app/mcp/registry.call_tool, which re-checks ownership. See app/mcp/.
 
 Wire (client <-> server is streaming-only):
 
@@ -31,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import uuid
 from datetime import datetime, timezone
@@ -52,11 +58,14 @@ from app.brokers.linkup import LinkupSearchBroker
 from app.config import settings
 from app.contracts import AuditEvent
 from app.db import SessionLocal, get_session
+from app.mcp import registry as mcp_registry
 from app.models import Approval, Conversation, Message, User
 from app.orchestrator.guards import ApprovalDecision, cancellable_sleep
 from app.orchestrator.run_errand import run_errand
 from app.orchestrator.shop_decide import make_shop_decide
 from app.orchestrator.stream import EventStream
+
+logger = logging.getLogger("errand.chat")
 
 router = APIRouter(prefix="/api/conversations", tags=["chat"])
 
@@ -386,8 +395,29 @@ async def chat(
     profile = convo.profile if convo.profile in ("business", "personal") else "business"
     model_id = _MODEL_MAP.get(convo.model, _MODEL_MAP[_DEFAULT_MODEL])
 
+    # The user's own MCP servers. Read from the cached catalogue on each server
+    # row, so this is ONE indexed SELECT rather than a connect + initialize +
+    # tools/list per server — the tool list is needed on every turn and cannot
+    # afford network I/O. Only an actual invocation connects (app/mcp/registry.py).
+    # A read failure DEGRADES to the built-in tools rather than failing the turn.
+    # This request raises before the stream even opens, so an unguarded SELECT here
+    # would cost the user run_errand and web_search as well — losing everything to
+    # a problem with an optional feature. The voice relay guards the same call for
+    # the same reason.
+    mcp_catalogue = mcp_registry.McpCatalogue(tools=())
+    if settings.mcp_enabled:
+        try:
+            mcp_catalogue = await mcp_registry.load_catalogue(user.id)
+        except Exception:  # noqa: BLE001
+            logger.warning("Could not load MCP tools for this turn", exc_info=True)
+
     # Build the OpenAI message list from history (tool messages are context too).
-    oai_messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
+    # The MCP note is appended to the system prompt rather than replacing it: the
+    # model otherwise sees a set of oddly-prefixed function names with no idea they
+    # are the user's own integrations, and does not reach for them.
+    oai_messages: list[dict] = [
+        {"role": "system", "content": SYSTEM_PROMPT + mcp_registry.tool_prompt_note(mcp_catalogue)}
+    ]
     for m in prior:
         if m.role == "tool":
             # Represent a past tool run compactly as an assistant note.
@@ -653,7 +683,14 @@ async def chat(
         # unbounded budget + no rules lets the model pick freely; the human pays,
         # so spend control is the human's payment step, not a policy cap here.
         from app.contracts import PurchaseContext
-        ctx = PurchaseContext(profile=p, approved_merchants=[], budget_cents=10**9, rules=[])
+        # `profile` (the conversation's), NOT `p` — that name is local to
+        # do_run_errand, so this raised NameError and shop_live could never run.
+        ctx = PurchaseContext(
+            profile=profile,  # type: ignore[arg-type]
+            approved_merchants=[],
+            budget_cents=10**9,
+            rules=[],
+        )
 
         await stream.emit_raw("run.started", {"run_id": run_id, "model": model_id})
         collected.append({"type": "run.started", "run_id": run_id, "model": model_id})
@@ -701,7 +738,11 @@ async def chat(
             # per request and never closed, leaking a pool + sockets each turn.
             # Offer the live-handoff tool only when the deployment can actually
             # perform it, so the model never promises a capability that isn't wired.
-            active_tools = _TOOLS + ([_SHOP_LIVE_TOOL] if settings.live_handoff_ready else [])
+            active_tools = (
+                _TOOLS
+                + ([_SHOP_LIVE_TOOL] if settings.live_handoff_ready else [])
+                + mcp_catalogue.openai_tools()
+            )
             async with _client() as client:
                 # Tool-calling loop: keep going until the model returns plain text.
                 for _ in range(6):
@@ -784,6 +825,15 @@ async def chat(
                                 tool_events_all.extend(events)
                             elif name == "web_search":
                                 result = await do_web_search(cargs)
+                            elif mcp_catalogue.by_id(name) is not None:
+                                # A tool from one of the user's own MCP servers.
+                                # registry.call_tool re-derives the catalogue for
+                                # THIS user and refuses anything not in it, so a
+                                # replayed or hallucinated id cannot reach another
+                                # user's server even though we already matched here.
+                                result = await mcp_registry.call_tool(
+                                    user.id, name, cargs
+                                )
                             else:
                                 result = f"Unknown tool: {name}"
                         except asyncio.CancelledError:

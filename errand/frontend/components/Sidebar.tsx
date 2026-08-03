@@ -39,6 +39,8 @@ export default function Sidebar({
   onDelete,
   onLogout,
   onCloseMobile,
+  onOpenTools,
+  toolServerCount = 0,
 }: {
   conversations: Conversation[];
   activeId: string | null;
@@ -50,6 +52,10 @@ export default function Sidebar({
   onLogout: () => void;
   // Optional: dismiss the drawer after a selection on narrow screens.
   onCloseMobile?: () => void;
+  // Omitted when MCP is switched off on the deployment, which is what removes the
+  // entry point entirely rather than leaving a control that opens an empty sheet.
+  onOpenTools?: () => void;
+  toolServerCount?: number;
 }) {
   // Which row is showing its delete confirm (two-step, no modal).
   const [confirmId, setConfirmId] = useState<string | null>(null);
@@ -155,6 +161,25 @@ export default function Sidebar({
         )}
       </div>
 
+      {onOpenTools && (
+        <button
+          className="flex flex-none items-center gap-[9px] rounded-[10px] border-none bg-transparent px-[13px] py-[9px] text-left text-[12.5px] [font-weight:540] text-mid transition-[background-color,color] duration-[160ms] ease-[ease] hover:bg-ink-100 hover:text-hi"
+          type="button"
+          onClick={() => {
+            onOpenTools();
+            onCloseMobile?.();
+          }}
+        >
+          <span className="inline-flex flex-none text-low">
+            <ToolServerGlyph />
+          </span>
+          Tool servers
+          {toolServerCount > 0 && (
+            <span className="ml-auto text-[11px] text-low">{toolServerCount}</span>
+          )}
+        </button>
+      )}
+
       <div className="flex flex-none items-center gap-[10px] px-[6px] pt-3 pb-1 shadow-[inset_0_1px_0_var(--color-edge)]">
         <div className="flex min-w-0 flex-1 items-center gap-2">
           <span
@@ -185,6 +210,23 @@ function NewGlyph() {
   return (
     <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
       <path d="M8 3v10M3 8h10" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+// A tool-server mark in the same stroke language: a socket with a filled body.
+// Matches components/mcp/McpMarks.tsx ServerMark, one size down.
+function ToolServerGlyph() {
+  return (
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <path
+        d="M5 9.5h14M5 9.5v6a1.5 1.5 0 0 0 1.5 1.5h11a1.5 1.5 0 0 0 1.5-1.5v-6"
+        stroke="currentColor"
+        strokeWidth="1.7"
+        strokeLinecap="round"
+      />
+      <path d="M9 9.5V6M15 9.5V6" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" />
+      <circle cx="12" cy="13.5" r="1.9" fill="currentColor" />
     </svg>
   );
 }

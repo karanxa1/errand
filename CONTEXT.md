@@ -159,6 +159,91 @@ handoff. Not verifiable in CI (needs Cloudflare creds + a human at the payment
 step); pinned by `tests/test_live_handoff.py` (readiness gating + local refusal).
 Design: `docs/superpowers/specs/2026-08-03-live-view-handoff-design.md`.
 
+### Custom MCP servers — the user's own tools, on both surfaces
+A user registers an MCP server and its tools become callable by the agent in chat
+AND on a call. Feature lives in `errand/backend/app/mcp/` (`config` validation +
+SSRF guard + stdio gate, `crypto` encryption at rest, `tool_id` namespacing,
+`storage` DB-backed TokenStorage, `pending` the OAuth rendezvous, `client`
+transports, `registry` the per-user catalogue), routed by `app/routers/mcp.py`
+(9 routes), tables `mcp_servers` + `mcp_oauth_sessions`. Frontend:
+`lib/useMcpServers.ts` + `components/mcp/McpPanel.tsx`, opened from the rail.
+
+**The hot path does no network I/O.** Each server row caches its tool catalogue in
+`tools_json`; chat and voice read that (one indexed SELECT) and only an actual
+tool INVOCATION opens a connection. Adding servers therefore costs no per-turn
+latency. Taken from better-chatbot's `toolInfo` column, which exists for the same
+reason. `POST /servers/{id}/refresh` is the only writer.
+
+**Three auth modes.** `none` (open, and a 401 lazily promotes it to `oauth`),
+`headers` (a fixed API key / bearer, encrypted at rest), `oauth` (OAuth 2.1 +
+PKCE + dynamic registration; tokens persisted so consent survives a restart, and
+an expired access token refreshes without a human).
+
+⚠️ **The OAuth rendezvous is IN-PROCESS, and that is forced.** The MCP Python SDK
+generates `state` and the PKCE verifier inside a local stack frame and validates
+them there, with no storage hook — so better-chatbot's "adopt state from
+Postgres" trick cannot port. `POST /authorize` starts the connect as a background
+task, `redirect_handler` publishes the URL, and the flow PARKS in
+`callback_handler` until `GET /oauth/callback` resolves it (indexed by the SDK's
+own `state`, learned off the authorization URL). Same single-worker constraint as
+the in-flight `run_errand` and `app/voice/tickets.py` — it adds no NEW limit, but
+a future move to multiple workers has to solve all three. Delivery is single-use:
+the SDK can re-enter the grant and would replay a spent code.
+
+⚠️ **stdio is OFF by default** (`MCP_ALLOW_STDIO`). A stdio server is a command
+this backend spawns, so on a multi-user deployment it is shell access to the
+container holding every provider key. better-chatbot allows it and disables it
+only on Vercel; the polarity is deliberately inverted here.
+
+⚠️ **User-supplied URLs are SSRF-guarded ON EVERY REQUEST**, not just at
+registration. `validate_remote_url` (https only, every resolved address publicly
+routable) runs at registration AND inside `_GuardedTransport`, which wraps the
+httpx2 transport — because the client follows redirects, so a genuinely public
+registered host can answer `302 Location: http://169.254.169.254/...` and land on
+Azure IMDS having passed every registration check. The transport also covers OAuth
+discovery, dynamic registration and the token exchange, which reach hosts nobody
+validated. A resolver failure is FATAL here, the opposite of
+`app/prava/validate`'s fail-open reachability check.
+
+⚠️ **Credential encryption is keyed off `JWT_SECRET` unless `MCP_ENCRYPTION_KEY`
+is set**, so rotating `JWT_SECRET` orphans stored credentials (recoverable by
+re-authorizing, not silent). Set `MCP_ENCRYPTION_KEY` in any deployment that
+rotates.
+
+**`MCP_OAUTH_REDIRECT_BASE` must be the backend's public origin** before OAuth
+works in a deployment — it defaults to localhost, and the value must match
+byte-for-byte across the authorization request and the token exchange. This fails
+LOUDLY now rather than at the last step: `Settings.mcp_oauth_redirect_problem` warns
+at startup (alongside the JWT guard) and `/api/config` reports `mcp.canSignIn`, so
+the panel disables the Sign-in option with the reason instead of offering a control
+that can only end in a rejected redirect.
+
+⚠️ **`VoiceSession` carries TWO ids and they are not interchangeable.** `_user_id`
+is the SPEND PSEUDONYM (`u_<12 hex>`, matching app.main's derivation so a voice
+errand and a typed one attribute spend to the same identity); `_owner_id` is the
+real `User.id`. Every ownership query — the MCP catalogue, `call_tool` — must use
+`_owner_id`. The first version passed the pseudonym, which matches no row, so voice
+silently had an empty MCP catalogue while looking healthy. Pinned by
+`test_a_voice_session_looks_up_mcp_servers_by_the_real_user_id`.
+
+⚠️ **The SSE fallback covers opening the transport, never the caller's body.**
+`open_session` and `_with_sse_fallback` are generator context managers, so a caller
+exception is thrown back in AT the yield; without the `yielded` guard the handler
+treated it as a dead transport, opened a second connection and yielded again
+(`RuntimeError: generator didn't stop after athrow()`, or a silently replaced
+exception type). `asyncio.CancelledError` is re-raised first, so a client disconnect
+is never swallowed into a retry. A tool result is capped at
+`MAX_RESULT_CHARS` with an explicit truncation marker, because it goes straight into
+the next model request.
+
+Tool ids are `mcp__<server>__<tool>`; `__` is refused in server names, which is
+what keeps the split exact while letting single underscores through
+(`find_customer` stays `find_customer`). Ownership is re-checked on every
+resolution, and a row belonging to someone else is 404 rather than 403. Verified
+end to end against a real MCP server and a real OAuth authorization server
+(`tests/test_mcp_live.py`). Dependency rationale, including why `httpx2` now sits
+alongside `httpx`: `errand/docs/decisions/mcp-sdk-dependency.md`.
+
 ### Voice binds the same conversation id as a typed turn
 The voice relay socket carries only `model`/`profile`/`ticket` — no conversation id — so a
 spoken run is ephemeral. To keep "stop voice, then type" in the *same* chat, both the

@@ -1,9 +1,12 @@
-"""ORM models: User, Conversation, Message.
+"""ORM models: User, Conversation, Message, Approval, McpServer, McpOAuthSession.
 
 A user owns many conversations; a conversation owns many ordered messages. A
 message is either a normal chat turn (role user/assistant) or a structured
 record of a tool run (role 'tool') whose `events` column holds the errand audit
 timeline as JSON so a saved conversation can re-render the tool cards.
+
+A user also owns many MCP servers (their own custom tool providers), each of
+which may own OAuth sessions holding the credentials for that server.
 """
 
 from __future__ import annotations
@@ -36,6 +39,9 @@ class User(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
     conversations: Mapped[list["Conversation"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
+    mcp_servers: Mapped[list["McpServer"]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
     )
 
@@ -114,6 +120,128 @@ class Approval(Base):
     )
 
     __table_args__ = (UniqueConstraint("scope", "run_id", name="uq_approvals_scope_run"),)
+
+
+class McpServer(Base):
+    """One user-registered MCP server: a custom tool provider for their agent.
+
+    OWNERSHIP IS THE AUTHORIZATION, and it is per-user rather than global. Every
+    read and write goes through a helper that filters on `user_id`, and a row
+    belonging to someone else is reported as 404 rather than 403 — the same rule
+    the conversation routes follow, for the same reason: a caller must not be
+    able to probe which server ids exist. This matters more here than for a
+    conversation, because a server row carries credentials and because its tools
+    are handed to an LLM that can also spend money.
+
+    `config` is the transport description, shape-discriminated the way
+    better-chatbot does it (a `url` key means remote, a `command` key means
+    stdio) rather than by a separate type column, so a config is self-describing
+    and cannot disagree with its own label. See app/mcp/config.py.
+
+    `auth_mode` is which of the three credential styles this server uses:
+      'none'    — an open server, nothing to send.
+      'headers' — static secrets (a bearer token, an API key) that we send on
+                  every request. Held in `secret_headers`, ENCRYPTED AT REST.
+      'oauth'   — OAuth 2.1 + PKCE. Credentials live in McpOAuthSession, also
+                  encrypted; this column only records the intent.
+
+    `tools_json` is the tool catalogue as last seen, cached deliberately: the
+    chat and voice paths need the tool LIST on every single turn, and paying a
+    connect + initialize + tools/list round trip per turn (per server) would put
+    seconds of network on the critical path before the model even starts. So the
+    hot path reads this column and only an actual tool INVOCATION opens a
+    connection. The cache is refreshed whenever we do connect. Cribbed from
+    better-chatbot's `toolInfo` column, which exists for the same reason.
+
+    `enabled` is the user's on/off switch: a disabled server keeps its row and
+    its credentials but contributes no tools, so turning a noisy or broken
+    provider off never means re-authorizing it later.
+    """
+
+    __tablename__ = "mcp_servers"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    # Display name, and the human half of every namespaced tool id.
+    name: Mapped[str] = mapped_column(String(64))
+    config: Mapped[dict] = mapped_column(JSON)
+    # 'none' | 'headers' | 'oauth'
+    auth_mode: Mapped[str] = mapped_column(String(16), default="none")
+    # Encrypted blob (app/mcp/crypto.py), never the raw header map. Null when
+    # auth_mode != 'headers'.
+    secret_headers: Mapped[str | None] = mapped_column(Text, nullable=True)
+    enabled: Mapped[bool] = mapped_column(default=True)
+    # Last observed catalogue: [{name, description, input_schema}, ...]
+    tools_json: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    tools_updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # 'unknown' | 'connected' | 'authorizing' | 'error' — what the last connect
+    # attempt concluded, so the UI can show real state without reconnecting.
+    last_status: Mapped[str] = mapped_column(String(16), default="unknown")
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now
+    )
+
+    user: Mapped["User"] = relationship(back_populates="mcp_servers")
+    oauth_sessions: Mapped[list["McpOAuthSession"]] = relationship(
+        back_populates="server", cascade="all, delete-orphan"
+    )
+
+    # A name is the human half of a namespaced tool id, so two servers sharing
+    # one name under the same user would produce colliding tool ids and the model
+    # would have no way to say which it meant. Unique PER USER, not globally:
+    # two different people may both call their server "github".
+    __table_args__ = (
+        UniqueConstraint("user_id", "name", name="uq_mcp_servers_user_name"),
+    )
+
+
+class McpOAuthSession(Base):
+    """OAuth credentials for one MCP server, so consent survives a restart.
+
+    The MCP Python SDK asks for a `TokenStorage` with exactly two pairs of
+    getters/setters — the token set, and the dynamically-registered client
+    record. Both are persisted here (app/mcp/storage.py is the adapter), because
+    the alternative, an in-memory store, would silently re-run the whole consent
+    flow on every deploy: the user would be asked to reauthorize a server they
+    already authorized, and the server would accumulate a fresh dynamic client
+    registration each time.
+
+    BOTH COLUMNS ARE ENCRYPTED AT REST (app/mcp/crypto.py). `tokens` holds a live
+    access token — and often a refresh token, which is a long-lived credential to
+    a third-party account. `client_info` can hold an issued `client_secret`.
+    Neither is something to keep as readable JSON in a shared database.
+
+    `state` is the OAuth CSRF value for one in-flight attempt and is UNIQUE: it
+    is how the callback finds the attempt it belongs to, so two attempts must
+    never be able to share one. Note the SDK generates `state` inside a local
+    stack frame and validates it there too, so the row is a record of the attempt
+    rather than the thing the SDK reads back — the resume itself happens in
+    process (app/mcp/pending.py explains why).
+    """
+
+    __tablename__ = "mcp_oauth_sessions"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    server_id: Mapped[str] = mapped_column(
+        ForeignKey("mcp_servers.id", ondelete="CASCADE"), index=True
+    )
+    server_url: Mapped[str] = mapped_column(Text, default="")
+    # Encrypted JSON, never plaintext. See the class docstring.
+    client_info: Mapped[str | None] = mapped_column(Text, nullable=True)
+    tokens: Mapped[str | None] = mapped_column(Text, nullable=True)
+    state: Mapped[str | None] = mapped_column(String(128), nullable=True, unique=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now
+    )
+
+    server: Mapped["McpServer"] = relationship(back_populates="oauth_sessions")
 
 
 Index("ix_messages_conv_created", Message.conversation_id, Message.created_at)

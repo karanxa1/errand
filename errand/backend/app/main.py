@@ -3,9 +3,10 @@
 Owns all secrets + integrations. Exposes:
   GET  /health
   GET  /api/models                 model selector options (Sol/Terra/Luna)
-  GET  /api/config                 client-safe config (Prava publishable key)
+  GET  /api/config                 client-safe config + feature readiness
   POST /api/errand/stream          SSE: run the errand, stream every step
   POST /api/errand/{id}/approve    resolve the human-in-the-loop approval gate
+  /api/mcp/*                       the user's own MCP servers (app/routers/mcp.py)
 
 The frontend (Next.js) calls these; secrets never reach the browser.
 """
@@ -31,6 +32,7 @@ from app.auth import get_current_user
 from app.brokers import build_brokers
 from app.config import settings
 from app.db import SessionLocal, get_session, init_db
+from app.mcp import crypto as mcp_crypto
 from app.models import Approval, User
 from app.orchestrator.guards import ApprovalDecision, cancellable_sleep
 from app.orchestrator.run_errand import run_errand
@@ -38,6 +40,7 @@ from app.orchestrator.stream import EventStream
 from app.routers import auth as auth_router
 from app.routers import chat as chat_router
 from app.routers import conversations as conversations_router
+from app.routers import mcp as mcp_router
 from app.routers import voice as voice_router
 from app.voice.relay import voice_ws
 
@@ -60,6 +63,13 @@ async def lifespan(_app: FastAPI):
                 f"Refusing to start with an insecure JWT secret: {problem} "
                 "Set the JWT_SECRET env var to a long random string."
             )
+    # MCP OAuth needs a publicly reachable redirect base. Warned rather than fatal:
+    # everything else works without it, and refusing to boot over one optional
+    # feature would be worse than that feature being unavailable. See
+    # Settings.mcp_oauth_redirect_problem for why this is easy to miss otherwise.
+    mcp_problem = settings.mcp_oauth_redirect_problem
+    if mcp_problem is not None:
+        logger.warning("MCP OAuth is not usable: %s", mcp_problem)
     # Create tables for SQLite dev; a no-op where Alembic already built them.
     await init_db()
     yield
@@ -78,6 +88,7 @@ app.include_router(auth_router.router)
 app.include_router(conversations_router.router)
 app.include_router(chat_router.router)
 app.include_router(voice_router.router)
+app.include_router(mcp_router.router)
 
 # Approval gates are DB-backed (table `approvals`, see app/models.py). The SSE
 # stream INSERTs a `pending` row scoped to (owner user id, run id), emits
@@ -148,12 +159,28 @@ async def models() -> dict:
 
 @app.get("/api/config")
 async def config() -> dict:
-    # Client-safe values only. `liveHandoff` is a plain readiness boolean (never a
-    # secret) so the client — and an operator hitting this endpoint — can confirm
-    # the live-browser-handoff path is actually enabled + configured at runtime.
+    # Client-safe values only. `liveHandoff` and the `mcp` block are plain
+    # readiness booleans (never secrets) so the client — and an operator hitting
+    # this endpoint — can confirm what is actually enabled + configured at runtime.
     return {
         "pravaPublishableKey": settings.prava_publishable_key,
         "liveHandoff": settings.live_handoff_ready,
+        "mcp": {
+            "enabled": settings.mcp_enabled,
+            # Whether the UI should offer the "local command" transport at all. Off
+            # in any normal deployment; see Settings.mcp_allow_stdio for why.
+            "allowStdio": settings.mcp_allow_stdio,
+            "maxServers": settings.mcp_max_servers_per_user,
+            # False means credentials cannot be stored, so the UI must not offer
+            # header or OAuth auth — better to say so than to accept a secret we
+            # can never read back.
+            "canStoreCredentials": mcp_crypto.encryption_available(),
+            # False when MCP_OAUTH_REDIRECT_BASE is not a reachable public origin, so
+            # the UI can say WHY sign-in is unavailable instead of offering a button
+            # that walks the user into a rejected redirect. Never the value itself —
+            # only the verdict.
+            "canSignIn": settings.mcp_oauth_redirect_problem is None,
+        },
     }
 
 
