@@ -334,7 +334,17 @@ def test_create_session_keeps_the_ids_prava_returns() -> None:
     body = sent[0]["json"]
     assert body["total_amount"] == "63.00"
     assert body["external_order_ref"] == "errand-run-1"
-    assert body["purchase_context"][0]["product_details"][0]["quantity"] == 2
+    # The visible line must price at the TOTAL, not at a unit.
+    #
+    # This assertion used to require `quantity == 2`, which encoded the bug: Prava's
+    # iframe renders only product_details[0] and shows its unit_price as the money
+    # figure, so a $63.00 charge displayed "$21.00 · Qty: 2" on the very page where
+    # the human approves it. See app/brokers/prava._product_details and
+    # tests/test_prava_line_items.py.
+    detail = body["purchase_context"][0]["product_details"][0]
+    assert detail["quantity"] == 1
+    assert detail["unit_price"] == body["total_amount"] == "63.00"
+    assert "Beans" in detail["description"]
 
 
 def test_create_session_omits_an_unusable_callback_url() -> None:

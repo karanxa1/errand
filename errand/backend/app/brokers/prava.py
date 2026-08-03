@@ -30,6 +30,7 @@ from app.prava.validate import (
     validate_customer_email,
 )
 from app.contracts import (
+    CartItem,
     CreateSessionInput,
     CreateSessionResult,
     PaymentCredential,
@@ -123,6 +124,60 @@ class PravaPaymentBroker:
             "Content-Type": "application/json",
         }
 
+    @staticmethod
+    def _product_details(items: list[CartItem], total_cents: int) -> list[dict[str, Any]]:
+        """`product_details` whose VISIBLE line always equals the approved total.
+
+        ⚠️ PRAVA'S PAYMENT IFRAME RENDERS ONLY `product_details[0]`. Verified
+        against sandbox rather than assumed: a session created with two line items
+        (Oat milk 1L $3.90 + Dark roast beans 1kg $28.00, `total_amount` $31.90)
+        renders exactly one row — "Oat milk 1L … $3.90" — and the second is not in
+        the page at all, hidden or otherwise.
+
+        The charge was never wrong: the card is minted against `total_amount`, so
+        $31.90 is what gets authorized. But the human approves on THAT PAGE, and it
+        showed them $3.90 while our own summary above it said $31.90. A payment
+        surface that displays a number smaller than the one it charges is the worst
+        possible place to be "technically correct", and it reads as a pricing bug to
+        anyone watching.
+
+        So a cart whose first line does not already equal the total is sent as ONE
+        consolidated line, priced at the exact total and naming what is in it. The
+        itemisation still reaches the model, the approval gate and our audit trail —
+        the only thing that changes is what Prava is asked to display, which is now
+        the number the user is actually authorizing.
+
+        This also fixes a case that has nothing to do with multiple items: the wallet
+        quote includes shipping and tax, so even a single-item cart can have a total
+        above its line price. Anchoring on `total_cents` covers both.
+        """
+        as_money = f"{total_cents / 100:.2f}"
+
+        # The one shape that is already honest: a single unit whose price IS the
+        # total. Keep the real product name — it is strictly more informative.
+        if len(items) == 1 and items[0].qty == 1 and items[0].price_cents == total_cents:
+            return [
+                {
+                    "description": items[0].name,
+                    "unit_price": as_money,
+                    "quantity": 1,
+                }
+            ]
+
+        names = [it.name for it in items if it.name]
+        listed = ", ".join(names)
+        count = sum(it.qty for it in items) or len(items)
+        label = f"{count} items" if count != 1 else "1 item"
+        description = f"{label} — {listed}" if listed else label
+        return [
+            {
+                # Prava caps descriptions; keep the count even if the names are cut.
+                "description": description[:255],
+                "unit_price": as_money,
+                "quantity": 1,
+            }
+        ]
+
     async def create_session(self, data: CreateSessionInput) -> CreateSessionResult:
         # Both of these are forwarded to the card network, and both fail LATER
         # and elsewhere when they are wrong: a bad merchant url is a generic 400
@@ -159,14 +214,12 @@ class PravaPaymentBroker:
             "purchase_context": [
                 {
                     "merchant_details": merchant_details,
-                    "product_details": [
-                        {
-                            "description": it.name,
-                            "unit_price": f"{it.price_cents / 100:.2f}",
-                            "quantity": it.qty,
-                        }
-                        for it in data.items
-                    ],
+                    # Consolidated when it has to be, so the line the human SEES on
+                    # the card page is the amount they are approving. See
+                    # _product_details — the iframe only ever renders the first entry.
+                    "product_details": self._product_details(
+                        data.items, data.total_cents
+                    ),
                     "effective_until_minutes": 15,
                 }
             ],
