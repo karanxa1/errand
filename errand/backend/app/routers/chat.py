@@ -683,7 +683,14 @@ async def chat(
         # unbounded budget + no rules lets the model pick freely; the human pays,
         # so spend control is the human's payment step, not a policy cap here.
         from app.contracts import PurchaseContext
-        ctx = PurchaseContext(profile=p, approved_merchants=[], budget_cents=10**9, rules=[])
+        # `profile` (the conversation's), NOT `p` — that name is local to
+        # do_run_errand, so this raised NameError and shop_live could never run.
+        ctx = PurchaseContext(
+            profile=profile,  # type: ignore[arg-type]
+            approved_merchants=[],
+            budget_cents=10**9,
+            rules=[],
+        )
 
         await stream.emit_raw("run.started", {"run_id": run_id, "model": model_id})
         collected.append({"type": "run.started", "run_id": run_id, "model": model_id})
