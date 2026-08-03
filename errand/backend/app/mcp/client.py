@@ -166,6 +166,113 @@ def _is_unauthorized(exc: BaseException) -> bool:
     )
 
 
+def is_transient(exc: BaseException) -> bool:
+    """Whether retrying this exact request could plausibly succeed.
+
+    THE CASE THIS EXISTS FOR is a cold start. A large share of real MCP servers run
+    on platforms that suspend when idle — Cloudflare Workers, Vercel functions, Fly
+    machines, Cloud Run — so the FIRST connect after a quiet period can time out or
+    be reset while the instance boots, and the second succeeds immediately. Without
+    a retry the user reads that as "this server does not work", tries again by hand,
+    and it works: the behaviour that makes an integration feel unreliable even
+    though nothing is broken.
+
+    WHAT MUST NOT BE RETRIED, and why each one is an ANSWER rather than a hiccup:
+      * 401/403 — the server is telling us to authenticate. Retrying collects a
+        second 401 and delays the Authorize button the user actually needs.
+      * McpAuthRequired — same, already classified.
+      * McpConfigError / an SSRF refusal — a deliberate decision by our own guard.
+        Retrying a blocked destination is pointless and, if a DNS record is
+        flapping between a public and a private address, actively dangerous: it is
+        a second roll of the dice on a check that already said no.
+      * 4xx other than 408/429 — deterministic. A 404 on the MCP path will 404
+        again.
+      * CancelledError — the caller is gone.
+    """
+    if isinstance(exc, asyncio.CancelledError | McpAuthRequired | McpConfigError):
+        return False
+    if _is_unauthorized(exc):
+        return False
+
+    leaf = _unwrap(exc)
+    if isinstance(leaf, asyncio.CancelledError | McpAuthRequired | McpConfigError):
+        return False
+
+    # Our own guard refusing a destination. The message is generated in
+    # _GuardedTransport and names the refusal explicitly.
+    if isinstance(leaf, McpConnectionError) and "Refused a request to" in str(leaf):
+        return False
+
+    if isinstance(
+        leaf,
+        httpx2.ConnectError
+        | httpx2.ConnectTimeout
+        | httpx2.ReadTimeout
+        | httpx2.WriteTimeout
+        | httpx2.PoolTimeout
+        | httpx2.RemoteProtocolError
+        | httpx2.ReadError
+        | httpx2.WriteError,
+    ):
+        return True
+    if isinstance(leaf, httpx2.HTTPStatusError):
+        return leaf.response.status_code in (408, 429, 500, 502, 503, 504)
+
+    status = getattr(leaf, "status", None) or getattr(leaf, "status_code", None)
+    if isinstance(status, int):
+        return status in (408, 429, 500, 502, 503, 504)
+
+    # Fall back to the message. Broad on purpose for the same reason
+    # `_is_unauthorized` is: a missed transient failure costs a working tool call,
+    # and the retry is bounded and idempotent-ish (a connect + one tool call).
+    text = str(leaf).lower()
+    return any(
+        marker in text
+        for marker in (
+            "timed out",
+            "timeout",
+            "connection reset",
+            "connection refused",
+            "connection closed",
+            "server disconnected",
+            "temporarily unavailable",
+            "bad gateway",
+            "service unavailable",
+            "gateway timeout",
+            "eof occurred",
+            "handshake",
+        )
+    )
+
+
+def is_tool_missing(exc: BaseException) -> bool:
+    """Whether the server says the tool we named does not exist.
+
+    Means our cached `tools_json` is STALE: the server renamed or removed a tool
+    since we last listed it. Distinguishable from a transport failure because the
+    call reached the server and it answered. Used by registry.call_tool to refresh
+    the cache so the phantom tool stops being offered on the next turn, rather than
+    failing identically forever.
+    """
+    leaf = _unwrap(exc)
+    text = str(leaf).lower()
+    if "tool" not in text:
+        return False
+    return any(
+        marker in text
+        for marker in (
+            "unknown tool",
+            "tool not found",
+            "no such tool",
+            "not found",
+            "unknown_tool",
+            "invalid tool",
+            "does not exist",
+            "method not found",
+        )
+    )
+
+
 class _GuardedTransport(httpx2.AsyncBaseTransport):
     """Re-checks the SSRF guard on EVERY request, not just at registration.
 

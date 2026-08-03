@@ -46,7 +46,7 @@ import time
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, BadRequestError
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError
@@ -224,6 +224,45 @@ _SHOP_LIVE_TOOL = {
         },
     },
 }
+
+
+# Recognizes a 400 that is about a TOOL DEFINITION rather than about the
+# conversation. Matched on the message because the OpenAI SDK does not type these
+# separately — every schema rejection is a plain BadRequestError.
+_TOOL_SCHEMA_400 = re.compile(
+    r"invalid schema for function|invalid 'tools|"
+    r"'tools\[\d+\]|function .* parameters|invalid function parameters",
+    re.IGNORECASE,
+)
+
+# Pulls the offending function name out of the error, so the ladder can drop ONE
+# tool instead of every MCP tool. OpenAI names it:
+#   "Invalid schema for function 'mcp__acme__do_thing': ..."
+_TOOL_SCHEMA_400_NAME = re.compile(r"function '([^']+)'", re.IGNORECASE)
+
+# How many times a single model request may be re-issued with a reduced tool set.
+# Three is enough for the ladder to walk: drop one named tool, drop another, then
+# drop every MCP tool. Bounded so a persistent rejection cannot spin.
+MAX_TOOL_HEAL_ATTEMPTS = 3
+
+
+def _is_tool_schema_400(exc: BadRequestError) -> bool:
+    """Whether this 400 is the tool definitions' fault, not the conversation's.
+
+    Deliberately narrow. A 400 about messages, token limits or an unsupported
+    parameter must NOT trigger the heal: retrying those with fewer tools fails
+    identically and burns the user's turn twice.
+    """
+    return bool(_TOOL_SCHEMA_400.search(str(exc)))
+
+
+def _blamed_tool(exc: BadRequestError, known: set[str]) -> str | None:
+    """The MCP tool the error names, if it names one we actually sent."""
+    match = _TOOL_SCHEMA_400_NAME.search(str(exc))
+    if match is None:
+        return None
+    name = match.group(1)
+    return name if name in known else None
 
 
 class ChatRequest(BaseModel):
@@ -726,6 +765,12 @@ async def chat(
         ), collected
 
     async def run() -> None:
+        # The heal ladder below REBINDS this, and without `nonlocal` that
+        # assignment would make it a local of `run()` — so the first READ, on the
+        # very first pass, raises UnboundLocalError and every turn dies with
+        # "cannot access local variable 'mcp_catalogue'". Not just MCP turns: this
+        # runs for every user, whether they have a server or not.
+        nonlocal mcp_catalogue
         final_text = ""
         tool_events_all: list[dict] = []
         # Text streamed on the most recent pass. If the tool loop exhausts its
@@ -738,26 +783,84 @@ async def chat(
             # per request and never closed, leaking a pool + sockets each turn.
             # Offer the live-handoff tool only when the deployment can actually
             # perform it, so the model never promises a capability that isn't wired.
-            active_tools = (
-                _TOOLS
-                + ([_SHOP_LIVE_TOOL] if settings.live_handoff_ready else [])
-                + mcp_catalogue.openai_tools()
+            builtin_tools = _TOOLS + (
+                [_SHOP_LIVE_TOOL] if settings.live_handoff_ready else []
             )
             async with _client() as client:
                 # Tool-calling loop: keep going until the model returns plain text.
                 for _ in range(6):
-                    completion = await client.chat.completions.create(
-                        model=model_id,
-                        messages=oai_messages,
-                        tools=active_tools,
-                        stream=True,
-                        # gpt-5.6 defaults to "medium", and OpenAI documents
-                        # medium-with-function-tools on /v1/chat/completions as
-                        # unsupported for this family — it is an HTTP 400, not a
-                        # degraded answer. See TOOL_REASONING_EFFORT.
-                        reasoning_effort=TOOL_REASONING_EFFORT,
-                        max_completion_tokens=MAX_COMPLETION_TOKENS,
-                    )
+                    # ONE BAD TOOL DEFINITION MUST NOT COST THE TURN.
+                    #
+                    # `tools` is rebuilt per pass from the live catalogue because the
+                    # heal below can shrink it, and the shrink has to persist across
+                    # passes. A tool-schema 400 is rejected BEFORE the stream opens,
+                    # so nothing has been sent to the user yet and re-issuing is
+                    # safe — and it stays safe on later passes too, because `tools`
+                    # is not conversation state: dropping a function does not
+                    # invalidate the messages already in `oai_messages`, including
+                    # tool results from a function we are no longer declaring.
+                    #
+                    # The ladder walks from least to most destructive: drop the ONE
+                    # function the error names, then the next, then every MCP tool.
+                    # Losing one integration's broken tool is much better than losing
+                    # the user's whole tool set, and losing the tool set is still
+                    # better than losing the answer. app/mcp/schema.py is what makes
+                    # this path rare; this is what makes it survivable when a future
+                    # validation rule appears that the normaliser does not know about.
+                    completion = None
+                    for heal in range(MAX_TOOL_HEAL_ATTEMPTS + 1):
+                        mcp_tools = mcp_catalogue.openai_tools()
+                        try:
+                            completion = await client.chat.completions.create(
+                                model=model_id,
+                                messages=oai_messages,
+                                tools=builtin_tools + mcp_tools,
+                                stream=True,
+                                # gpt-5.6 defaults to "medium", and OpenAI documents
+                                # medium-with-function-tools on
+                                # /v1/chat/completions as unsupported for this
+                                # family — it is an HTTP 400, not a degraded answer.
+                                # See TOOL_REASONING_EFFORT.
+                                reasoning_effort=TOOL_REASONING_EFFORT,
+                                max_completion_tokens=MAX_COMPLETION_TOKENS,
+                            )
+                            break
+                        except BadRequestError as exc:
+                            # Not about the tools, or nothing left to drop: this is
+                            # a real failure and belongs to the outer handler.
+                            if not mcp_tools or not _is_tool_schema_400(exc):
+                                raise
+                            if heal >= MAX_TOOL_HEAL_ATTEMPTS:
+                                raise
+                            known = {t.tool_id for t in mcp_catalogue.tools}
+                            blamed = _blamed_tool(exc, known)
+                            if blamed is not None:
+                                logger.warning(
+                                    "Dropping MCP tool %s for this turn: the model "
+                                    "API rejected its definition (%s)",
+                                    blamed,
+                                    exc,
+                                )
+                                mcp_catalogue = mcp_catalogue.without_tool(blamed)
+                            else:
+                                logger.warning(
+                                    "Dropping all %d MCP tools for this turn: the "
+                                    "model API rejected the tool list and did not "
+                                    "name a function (%s)",
+                                    len(mcp_tools),
+                                    exc,
+                                )
+                                mcp_catalogue = mcp_registry.McpCatalogue(tools=())
+                            # The system prompt named servers whose tools may now be
+                            # gone. Correct it in place so the model is not told
+                            # about capability it no longer has.
+                            oai_messages[0] = {
+                                "role": "system",
+                                "content": SYSTEM_PROMPT
+                                + mcp_registry.tool_prompt_note(mcp_catalogue),
+                            }
+                    if completion is None:  # pragma: no cover — the loop raises
+                        raise RuntimeError("tool heal ladder exited without a result")
                     text_parts: list[str] = []
                     tool_calls: dict[int, dict] = {}
                     async for chunk in completion:

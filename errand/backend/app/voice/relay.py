@@ -318,8 +318,32 @@ def _settings_message(
     prompt = SYSTEM_PROMPT
     functions = _think_functions()
     if mcp_catalogue is not None and mcp_catalogue.tools:
-        prompt += mcp_registry.tool_prompt_note(mcp_catalogue)
-        functions = functions + mcp_catalogue.deepgram_functions()
+        # THE STAKES ARE HIGHER HERE THAN ON THE CHAT PATH. Deepgram accepts the
+        # function list only in this Settings message, so a definition it rejects
+        # fails the whole SESSION — the user's call drops — and there is no
+        # mid-session retry to fall back on. The chat path can re-issue a request
+        # minus one tool (see app/routers/chat.py); this cannot.
+        #
+        # So the rendering is guarded and degrades to the built-in functions alone.
+        # A voice call that can still run errands is worth far more than one that
+        # dies because a third-party server published an odd schema.
+        # app/mcp/schema.normalise_tool_schema is what makes that unlikely; this is
+        # what keeps it from being fatal.
+        try:
+            rendered = mcp_catalogue.deepgram_functions()
+            # Proven serializable BEFORE it becomes part of the Settings message:
+            # `_to_deepgram_json` would otherwise raise mid-handshake, which reads
+            # as a connection failure rather than a bad tool definition.
+            json.dumps(rendered)
+        except Exception:  # noqa: BLE001 — a bad tool must not cost the call
+            logger.warning(
+                "Could not render MCP tools for the voice session; continuing with "
+                "the built-in tools only.",
+                exc_info=True,
+            )
+        else:
+            prompt += mcp_registry.tool_prompt_note(mcp_catalogue)
+            functions = functions + rendered
     return {
         "type": "Settings",
         "audio": {

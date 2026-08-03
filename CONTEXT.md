@@ -244,6 +244,51 @@ end to end against a real MCP server and a real OAuth authorization server
 (`tests/test_mcp_live.py`). Dependency rationale, including why `httpx2` now sits
 alongside `httpx`: `errand/docs/decisions/mcp-sdk-dependency.md`.
 
+⚠️ **A third-party tool schema is NORMALISED before it reaches a model API, and
+only its ROOT is rewritten** (`app/mcp/schema.py`). JSON Schema permits much more
+than a tool parameter slot does, and the mismatch is a 400 on the WHOLE request —
+so one odd tool from one server took down every tool in the turn, including the
+built-in ones. Measured against the live endpoint rather than inferred: the root
+must be exactly `{"type": "object"}` (the LIST form `["object","null"]` is rejected
+even though it contains `object`), and `anyOf`/`oneOf`/`allOf`/`enum`/`const`/`not`
+are illegal there. Every one of those is legal one level DOWN, so nested schemas are
+forwarded untouched — rewriting them would change the tool's contract with its own
+server. A root composition is merged rather than truncated to one branch: `allOf`
+unions `required`, `anyOf`/`oneOf` INTERSECT it, because a key required by only one
+branch is not required in general. `normalise_tool_schema` is total and never
+raises. Pinned by `tests/test_mcp_schema.py` (schemas that are cyclic, 40 levels
+deep, or not JSON Schema at all).
+
+⚠️ **Healing is layered, and each layer's failure mode is deliberately different.**
+  * **Per-tool quarantine** at catalogue build: one unusable cached entry drops
+    itself, not the user's whole tool set.
+  * **The chat heal ladder** (`app/routers/chat.py`): a tool-shaped 400 re-issues the
+    request minus the ONE function the error names, then the next, then all MCP
+    tools, capped by `MAX_TOOL_HEAL_ATTEMPTS`. Safe on any pass because `tools` is
+    not conversation state — dropping a function does not invalidate messages
+    already sent, including results from a function no longer declared. A 400 about
+    the conversation (context length, bad messages) is deliberately NOT healed:
+    retrying it with fewer tools fails identically and burns the turn twice.
+  * **Voice degrades instead of laddering**, because Deepgram accepts functions only
+    in the opening Settings message — a rejection there kills the CALL and there is
+    no mid-session retry. So the render is guarded and proven JSON-serializable
+    before it is sent; on failure the call proceeds with built-in tools only.
+  * **Transient retry** (`client.is_transient`, `registry.CALL_ATTEMPTS`): one retry
+    for the cold-start case, since most real MCP servers run on platforms that
+    suspend when idle. An ANSWER is never retried — a 401 (the user needs the
+    Authorize button), an SSRF refusal (a decision our own guard already made, and
+    on a flapping DNS record a retry is a second roll of the dice), or a
+    deterministic 4xx.
+  * **Stale-cache self-heal**: a tool the server no longer has triggers a re-list, so
+    the phantom stops being offered instead of failing identically for ever.
+
+⚠️ **`run()` in the chat router declares `nonlocal mcp_catalogue`.** The heal ladder
+rebinds it, and without that declaration the assignment makes it a local of the
+closure — so the first READ raises `UnboundLocalError` and EVERY turn dies with
+"cannot access local variable 'mcp_catalogue'", whether the user has an MCP server
+or not. Caught by `tests/test_chat_tool_heal.py` before release; do not remove it
+when touching that loop.
+
 ### Voice binds the same conversation id as a typed turn
 The voice relay socket carries only `model`/`profile`/`ticket` — no conversation id — so a
 spoken run is ephemeral. To keep "stop voice, then type" in the *same* chat, both the
