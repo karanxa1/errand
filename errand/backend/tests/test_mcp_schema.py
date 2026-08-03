@@ -21,7 +21,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import conftest  # noqa: E402
 
-from app.mcp.schema import EMPTY_SCHEMA, normalise_tool_schema  # noqa: E402
+from app.mcp.schema import (  # noqa: E402
+    EMPTY_SCHEMA,
+    describe_constraints,
+    normalise_tool_schema,
+)
 
 
 def _root_is_valid(schema: dict) -> bool:
@@ -341,6 +345,109 @@ def test_unknown_keywords_are_left_alone() -> None:
     )
     assert out["properties"]["a"]["format"] == "uri"
     assert out["additionalProperties"] is False
+
+
+# ── the constraint note (what merging necessarily erases) ────────────────────
+
+
+def test_a_oneof_root_is_described_in_prose() -> None:
+    """Merging gives the model both fields but erases that they are exclusive.
+
+    Without the note the model is free to send both or neither, and the server
+    rejects a call that looked well-formed. Wording follows the format observed on
+    the live higgsfield tool, which is what surfaced this bug.
+    """
+    schema = {
+        "oneOf": [
+            {"type": "object", "properties": {"video_input_id": {"type": "string"}},
+             "required": ["video_input_id"]},
+            {"type": "object", "properties": {"youtube_url": {"type": "string"}},
+             "required": ["youtube_url"]},
+        ]
+    }
+    note = describe_constraints(schema)
+    assert note == (
+        "Input constraint: Provide parameters for exactly one of: "
+        "(video_input_id) or (youtube_url)."
+    ), note
+
+
+def test_anyof_says_at_least_one_not_exactly_one() -> None:
+    """`anyOf` permits more than one branch; claiming otherwise would forbid a
+    call the server accepts."""
+    schema = {
+        "anyOf": [
+            {"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]},
+            {"type": "object", "properties": {"b": {"type": "string"}}, "required": ["b"]},
+        ]
+    }
+    assert describe_constraints(schema) == (
+        "Input constraint: Provide parameters for at least one of: (a) or (b)."
+    )
+
+
+def test_a_branch_is_named_by_its_required_keys() -> None:
+    """Shared optional extras make every branch look identical, so the REQUIRED
+    keys — the ones that identify the shape — are what get named."""
+    schema = {
+        "oneOf": [
+            {"type": "object",
+             "properties": {"id": {"type": "string"}, "prompt": {"type": "string"}},
+             "required": ["id"]},
+            {"type": "object",
+             "properties": {"url": {"type": "string"}, "prompt": {"type": "string"}},
+             "required": ["url"]},
+        ]
+    }
+    assert describe_constraints(schema) == (
+        "Input constraint: Provide parameters for exactly one of: (id) or (url)."
+    )
+
+
+def test_nothing_worth_saying_produces_no_note() -> None:
+    """Silence beats a sentence that adds nothing — it is tokens on every turn."""
+    for schema in (
+        {"type": "object", "properties": {"a": {"type": "string"}}},
+        {"oneOf": [{"type": "object", "properties": {"a": {}}}]},
+        {"anyOf": [{"type": "string"}, {"type": "number"}]},
+        {"allOf": [
+            {"type": "object", "properties": {"a": {}}, "required": ["a"]},
+            {"type": "object", "properties": {"b": {}}, "required": ["b"]},
+        ]},
+        None,
+        "not a schema",
+    ):
+        assert describe_constraints(schema) == "", schema
+
+
+def test_identical_branches_say_nothing() -> None:
+    """Two branches that name the same keys carry no information."""
+    schema = {
+        "oneOf": [
+            {"type": "object", "properties": {"a": {}}, "required": ["a"]},
+            {"type": "object", "properties": {"a": {}}, "required": ["a"]},
+        ]
+    }
+    assert describe_constraints(schema) == ""
+
+
+def test_a_huge_union_is_not_spelled_out() -> None:
+    """Naming twenty branches is a paragraph of tokens on every request."""
+    schema = {
+        "oneOf": [
+            {"type": "object", "properties": {f"k{i}": {}}, "required": [f"k{i}"]}
+            for i in range(20)
+        ]
+    }
+    assert describe_constraints(schema) == ""
+
+
+def test_describe_never_raises() -> None:
+    class Exploding(dict):
+        def get(self, *a, **kw):  # noqa: ANN002, ANN003, ANN201
+            raise RuntimeError("boom")
+
+    assert describe_constraints(Exploding()) == ""
 
 
 if __name__ == "__main__":

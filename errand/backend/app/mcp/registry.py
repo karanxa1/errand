@@ -29,7 +29,7 @@ from sqlalchemy import select
 
 from app.db import SessionLocal
 from app.mcp import client as mcp_client
-from app.mcp.schema import normalise_tool_schema
+from app.mcp.schema import describe_constraints, normalise_tool_schema
 from app.mcp.tool_id import make_tool_id
 from app.models import McpServer
 
@@ -225,6 +225,17 @@ async def load_catalogue(user_id: str) -> McpCatalogue:
                 description = str(entry.get("description") or "").strip()
                 if len(description) > MAX_DESCRIPTION_LEN:
                     description = description[: MAX_DESCRIPTION_LEN - 1] + "…"
+                # A root `oneOf`/`anyOf` is merged into one object schema, which
+                # necessarily erases the relationship between the branches: two
+                # mutually exclusive fields end up looking like two optional ones.
+                # The constraint moves into the description, where the model reads
+                # it — otherwise it sends both or neither and the server rejects a
+                # call that looked well-formed. Prepended, and OUTSIDE the length
+                # cap, because it is the part that decides whether the call is
+                # valid at all. See app/mcp/schema.describe_constraints.
+                note = describe_constraints(entry.get("input_schema"))
+                if note:
+                    description = f"{note}\n\n{description}".strip()
                 tools.append(
                     McpTool(
                         tool_id=make_tool_id(server.name, name),

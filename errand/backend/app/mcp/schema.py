@@ -71,6 +71,9 @@ _MAX_DEPTH = 10
 
 EMPTY_SCHEMA: dict[str, Any] = {"type": "object", "properties": {}}
 
+# How many branch names to name in a constraint note before giving up on prose.
+_MAX_NAMED_BRANCHES = 6
+
 
 def normalise_tool_schema(schema: Any) -> dict[str, Any]:
     """Return a schema the tool parameter slot will accept. Never raises.
@@ -143,6 +146,69 @@ def _normalise_root(schema: Any) -> dict[str, Any]:
         # An empty `required: []` is legal but noise on every request.
         root.pop("required")
     return root
+
+
+def describe_constraints(schema: Any) -> str:
+    """A sentence naming a root constraint the flattened schema cannot express.
+
+    WHY THIS IS NEEDED, and it is not cosmetic. Merging a root `oneOf` into one
+    object gives the model every callable argument, but it ERASES the relationship
+    between them: two mutually exclusive fields come out looking like two ordinary
+    optional ones. The model is then free to send both, or neither, and the server
+    rejects the call — a failure that reads as "this tool is broken" when the
+    schema was merely flattened.
+
+    Reference clients solve it the same way. The live higgsfield
+    `video_analysis_create`, which is what surfaced this whole bug, arrives from
+    Claude's own MCP harness with a plain object schema and a description opening:
+
+        "Input constraint: Provide parameters for exactly one of:
+         (video_input_id) or (youtube_url)."
+
+    So the constraint moves from the schema, where it cannot survive, into the
+    description, where the model will actually read it. The wording here follows
+    that observed format rather than inventing a new one.
+
+    Returns "" when there is nothing to say, so callers can concatenate blindly.
+    """
+    try:
+        return _describe(schema)
+    except Exception:  # noqa: BLE001 — a note is never worth failing a turn for
+        logger.warning("Could not describe an MCP tool's schema constraints", exc_info=True)
+        return ""
+
+
+def _describe(schema: Any) -> str:
+    if not isinstance(schema, dict):
+        return ""
+
+    for key, phrase in (("oneOf", "exactly one of"), ("anyOf", "at least one of")):
+        branches = schema.get(key)
+        if not isinstance(branches, list) or len(branches) < 2:
+            continue
+        groups: list[str] = []
+        for branch in branches:
+            if not isinstance(branch, dict):
+                continue
+            props = branch.get("properties")
+            if not isinstance(props, dict) or not props:
+                continue
+            # Prefer the branch's REQUIRED keys: those are what identify the shape.
+            # A branch's optional extras are shared noise and naming them makes the
+            # groups look identical.
+            required = [
+                r for r in (branch.get("required") or []) if isinstance(r, str) and r in props
+            ]
+            names = required or [n for n in props if isinstance(n, str)]
+            if names:
+                groups.append(f"({', '.join(names)})")
+        # Distinct, order-preserving. Identical branches say nothing.
+        unique = list(dict.fromkeys(groups))
+        if len(unique) < 2 or len(unique) > _MAX_NAMED_BRANCHES:
+            continue
+        return f"Input constraint: Provide parameters for {phrase}: {' or '.join(unique)}."
+
+    return ""
 
 
 def _flatten_composition(root: dict[str, Any]) -> dict[str, Any]:

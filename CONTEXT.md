@@ -259,6 +259,17 @@ branch is not required in general. `normalise_tool_schema` is total and never
 raises. Pinned by `tests/test_mcp_schema.py` (schemas that are cyclic, 40 levels
 deep, or not JSON Schema at all).
 
+Merging necessarily ERASES the relationship between branches — two mutually
+exclusive fields come out looking like two ordinary optional ones — so
+`describe_constraints` moves that constraint into the tool DESCRIPTION, where the
+model will read it, and `load_catalogue` prepends it outside the length cap.
+Without it the model sends both fields or neither and the server rejects a call
+that looked well-formed. The wording matches what a reference client emits: the
+live higgsfield `video_analysis_create` arrives from Claude's own MCP harness as a
+plain object schema whose description opens "Input constraint: Provide parameters
+for exactly one of: (video_input_id) or (youtube_url)." — verified byte-identical
+to our output for that schema.
+
 ⚠️ **Healing is layered, and each layer's failure mode is deliberately different.**
   * **Per-tool quarantine** at catalogue build: one unusable cached entry drops
     itself, not the user's whole tool set.
