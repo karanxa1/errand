@@ -33,6 +33,10 @@ export interface McpCapabilities {
   allowStdio: boolean;
   maxServers: number;
   canStoreCredentials: boolean;
+  // False when the backend has no publicly reachable OAuth redirect base, so a
+  // sign-in would end at a redirect the authorization server refuses. Offering the
+  // option anyway would be a control that can only fail.
+  canSignIn: boolean;
 }
 
 // One tonal step per state. Not a saturated swatch each: connected is the accent,
@@ -399,11 +403,18 @@ function ServerRow({
             {confirming ? (
               <span className="inline-flex items-center gap-2">
                 <button
-                  className="rounded-[9px] border-none bg-danger-dim px-[11px] py-[7px] text-[12px] [font-weight:600] text-[#ffe6e1] transition-[background-color] duration-[160ms] ease-[ease] hover:bg-[#7e4740]"
-                  onClick={() => {
-                    void api.remove(server.id);
-                    onNotice(`Removed ${server.name}.`);
-                  }}
+                  className="rounded-[9px] border-none bg-danger-dim px-[11px] py-[7px] text-[12px] [font-weight:600] text-[#ffe6e1] transition-[background-color] duration-[160ms] ease-[ease] hover:bg-[#7e4740] disabled:cursor-default disabled:opacity-60"
+                  onClick={() =>
+                    // Announce the OUTCOME, not the intent. The delete is optimistic
+                    // and rolls back on failure, so a flat "Removed X" could sit on
+                    // screen right next to the restored row.
+                    act("remove", async () => {
+                      const result = await api.remove(server.id);
+                      if (result.ok) onNotice(`Removed ${server.name}.`);
+                      return result;
+                    })
+                  }
+                  disabled={working !== null}
                   type="button"
                 >
                   Remove
@@ -554,7 +565,12 @@ function AddServerForm({
             ] as Array<[McpAuthMode, string]>
           ).map(([mode, label]) => {
             const active = authMode === mode;
-            const blocked = credentialsBlocked && mode !== "none";
+            // Sign-in also needs a reachable OAuth redirect base on the backend;
+            // without one the flow ends at a redirect the authorization server
+            // refuses, so the option is disabled rather than offered and broken.
+            const blocked =
+              (credentialsBlocked && mode !== "none") ||
+              (mode === "oauth" && !capabilities.canSignIn);
             return (
               <button
                 key={mode}
@@ -582,6 +598,14 @@ function AddServerForm({
                 ? "Opens the server's own sign-in in a new window. Nothing is typed here."
                 : "For a server that wants a fixed API key or bearer token."}
         </p>
+        {!credentialsBlocked && !capabilities.canSignIn && (
+          // Describes the disabled SEGMENT, not the selected mode — so it does not
+          // contradict the hint above when the user has picked None or Token.
+          <p className="mt-[5px] mb-0 text-[11.5px] leading-[1.5] text-brass">
+            Sign in is unavailable: the backend needs its public callback URL set
+            (MCP_OAUTH_REDIRECT_BASE). Open servers and token auth work.
+          </p>
+        )}
       </fieldset>
 
       {authMode === "headers" && (

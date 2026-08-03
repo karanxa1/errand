@@ -225,12 +225,23 @@ def fail_by_state(oauth_state: str, message: str) -> PendingAuth | None:
 
 
 def fail(attempt_id: str, message: str) -> PendingAuth | None:
-    """Wake a parked flow with an error (the IdP returned `error=access_denied`)."""
+    """Wake a parked flow with an error (the IdP returned `error=access_denied`).
+
+    BOTH events are set, not just `code_ready`. A failure can happen BEFORE an
+    authorization URL exists — discovery refused, dynamic registration rejected,
+    the host unreachable — and at that moment `POST /authorize` is blocked in
+    `wait_for_url`. Waking only the code waiter left that request hanging for the
+    full 45-second URL timeout and then reporting a generic "did not return an
+    authorization URL in time" instead of the real reason.
+    """
     attempt = get(attempt_id)
     if attempt is None or attempt.code_ready.is_set():
         return None
     attempt.error = message
     attempt.code_ready.set()
+    # wait_for_url checks `attempt.error` immediately after waking, so this
+    # surfaces the true failure rather than a timeout.
+    attempt.url_ready.set()
     return attempt
 
 

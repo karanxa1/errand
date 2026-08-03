@@ -48,6 +48,7 @@ rather than the protocol being hand-rolled.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from contextlib import asynccontextmanager
@@ -64,7 +65,12 @@ from pydantic import AnyUrl
 
 from app.config import settings
 from app.mcp import pending, storage
-from app.mcp.config import is_stdio, transport_of
+from app.mcp.config import (
+    McpConfigError,
+    is_stdio,
+    transport_of,
+    validate_remote_url,
+)
 from app.mcp.crypto import decrypt_json
 
 logger = logging.getLogger("errand.mcp.client")
@@ -160,6 +166,46 @@ def _is_unauthorized(exc: BaseException) -> bool:
     )
 
 
+class _GuardedTransport(httpx2.AsyncBaseTransport):
+    """Re-checks the SSRF guard on EVERY request, not just at registration.
+
+    ⚠️ WHY A TRANSPORT AND NOT A ONE-TIME CHECK.
+    `app.mcp.config.validate_remote_url` runs when a server is REGISTERED. That is
+    not sufficient on its own, because the client follows redirects: a registered,
+    genuinely public `https://evil.example/mcp` can answer `302 Location:
+    http://169.254.169.254/metadata/instance` and the request lands on Azure IMDS
+    having passed every registration-time check. The same hole applies to the OAuth
+    flow, which follows `WWW-Authenticate` and discovery documents to hosts nobody
+    validated — an authorization server pointed at a private address is equally bad.
+
+    A transport wrapper is the airtight seam: it is the last thing before the
+    socket, and every request goes through it — the initial POST, each redirect hop,
+    metadata discovery, dynamic registration and the token exchange. A `request`
+    event hook would also fire per-redirect, but a transport cannot be bypassed.
+
+    The check is skipped entirely when `mcp_allow_insecure_http` is on, which is the
+    local-development escape hatch and is what its own validation does too.
+    """
+
+    def __init__(self, inner: httpx2.AsyncBaseTransport) -> None:
+        self._inner = inner
+
+    async def handle_async_request(self, request: httpx2.Request) -> httpx2.Response:
+        if not settings.mcp_allow_insecure_http:
+            try:
+                validate_remote_url(str(request.url))
+            except McpConfigError as exc:
+                # Raised, not returned as a response: this must not look like a
+                # server error the retry logic might paper over.
+                raise McpConnectionError(
+                    f"Refused a request to {request.url.host!r}: {exc}"
+                ) from exc
+        return await self._inner.handle_async_request(request)
+
+    async def aclose(self) -> None:
+        await self._inner.aclose()
+
+
 def static_headers(server) -> dict[str, str]:
     """The decrypted static headers for an `auth_mode='headers'` server."""
     if server.auth_mode != "headers":
@@ -217,6 +263,38 @@ def _oauth_provider(server, attempt: pending.PendingAuth | None):
     )
 
 
+def _guarded_client_factory(
+    headers: dict[str, str] | None = None,
+    timeout: httpx2.Timeout | None = None,
+    auth: httpx2.Auth | None = None,
+) -> httpx2.AsyncClient:
+    """`McpHttpClientFactory` that installs the SSRF guard.
+
+    `sse_client` builds its own httpx client and only exposes this factory seam, so
+    this is how the guard reaches the SSE path. Signature must match the SDK's
+    protocol exactly (headers/timeout/auth, all optional).
+    https://py.sdk.modelcontextprotocol.io/v2/client/transports/
+    """
+    return httpx2.AsyncClient(
+        headers=headers,
+        auth=auth,
+        follow_redirects=True,
+        timeout=timeout or httpx2.Timeout(CONNECT_TIMEOUT_S, read=READ_TIMEOUT_S),
+        transport=_GuardedTransport(httpx2.AsyncHTTPTransport()),
+    )
+
+
+def _guarded_client(
+    *, headers: dict[str, str] | None, auth: Any | None
+) -> httpx2.AsyncClient:
+    """The httpx client for the streamable-HTTP path, SSRF-guarded."""
+    return _guarded_client_factory(
+        headers=headers or None,
+        timeout=httpx2.Timeout(CONNECT_TIMEOUT_S, read=READ_TIMEOUT_S),
+        auth=auth,
+    )
+
+
 @asynccontextmanager
 async def _remote_session(
     server, *, auth: Any | None, force_sse: bool = False
@@ -231,24 +309,22 @@ async def _remote_session(
     kind = "sse" if force_sse else transport_of(server.config)
 
     if kind == "sse":
-        # sse_client still takes headers/timeout/auth directly (see module notes).
+        # sse_client still takes headers/timeout/auth directly (see module notes),
+        # and builds its own client — so the SSRF guard is injected through its
+        # `httpx_client_factory` seam rather than by handing it a client.
         async with sse_client(
             url,
             headers=headers or None,
             timeout=CONNECT_TIMEOUT_S,
             sse_read_timeout=READ_TIMEOUT_S,
             auth=auth,
+            httpx_client_factory=_guarded_client_factory,
         ) as transport:
             async with Client(transport) as client:
                 yield client
         return
 
-    async with httpx2.AsyncClient(
-        headers=headers or None,
-        auth=auth,
-        follow_redirects=True,
-        timeout=httpx2.Timeout(CONNECT_TIMEOUT_S, read=READ_TIMEOUT_S),
-    ) as http_client:
+    async with _guarded_client(headers=headers, auth=auth) as http_client:
         transport = streamable_http_client(url, http_client=http_client)
         async with Client(transport) as client:
             yield client
@@ -312,13 +388,24 @@ async def open_session(
         return
 
     # auth_mode == 'none': attempt open access, then discover OAuth from a 401.
+    #
+    # Same `yielded` guard as _with_sse_fallback, for the same reason: without it a
+    # caller-body error that happened to look like a 401 (an MCP server whose tool
+    # result mentions "unauthorized", say) would trigger the OAuth retry and a
+    # second yield.
+    yielded = False
     try:
         async with _with_sse_fallback(server, None) as client:
+            yielded = True
             yield client
         return
+    except asyncio.CancelledError:
+        raise
     except (McpAuthRequired, McpConnectionError):
         raise
     except BaseException as exc:  # noqa: BLE001 — includes anyio ExceptionGroup
+        if yielded:
+            raise
         if not _is_unauthorized(exc):
             raise McpConnectionError(describe_error(exc)) from exc
 
@@ -350,11 +437,29 @@ async def _with_sse_fallback(server, auth: Any | None) -> AsyncIterator[Client]:
             yield client
         return
 
+    # ⚠️ THE FALLBACK MUST ONLY COVER OPENING THE TRANSPORT, NEVER THE CALLER'S BODY.
+    # This is a generator-based context manager, so an exception raised inside the
+    # caller's `async with` block is thrown back in AT the `yield`. Without this
+    # flag the handler below caught it, treated a caller-side failure as "streamable
+    # HTTP is broken", opened a second connection and yielded again — which either
+    # raises `RuntimeError: generator didn't stop after athrow()` or, as measured,
+    # replaces the caller's exception TYPE with McpConnectionError. Both hide the
+    # real error. `yielded` records that the body already ran, and a failure after
+    # that point is re-raised untouched.
+    yielded = False
     try:
         async with _remote_session(server, auth=auth) as client:
+            yielded = True
             yield client
         return
-    except BaseException as exc:  # noqa: BLE001
+    except asyncio.CancelledError:
+        # A client disconnect. Must propagate — swallowing it into an SSE retry
+        # would keep work alive after the request that wanted it is gone, and the
+        # blanket `except BaseException` below used to do exactly that.
+        raise
+    except BaseException as exc:  # noqa: BLE001 — includes anyio ExceptionGroup
+        if yielded:
+            raise
         if _is_unauthorized(exc) or isinstance(exc, McpAuthRequired):
             raise
         leaf = _unwrap(exc)
@@ -367,10 +472,16 @@ async def _with_sse_fallback(server, auth: Any | None) -> AsyncIterator[Client]:
         )
         first_error = exc
 
+    yielded = False
     try:
         async with _remote_session(server, auth=auth, force_sse=True) as client:
+            yielded = True
             yield client
+    except asyncio.CancelledError:
+        raise
     except BaseException as exc:  # noqa: BLE001
+        if yielded:
+            raise
         if _is_unauthorized(exc) or isinstance(_unwrap(exc), McpAuthRequired):
             raise
         # Report the STREAMABLE HTTP failure, not the SSE one: streamable HTTP is
@@ -399,6 +510,33 @@ def tool_catalogue(tools: Any) -> list[dict]:
             }
         )
     return catalogue
+
+
+# Ceiling on a single tool result, in characters.
+#
+# WHY THIS HAS TO EXIST. The value comes from a third-party server and goes straight
+# into the NEXT request of the tool loop — appended to `oai_messages` for chat, or
+# handed to Deepgram as a FunctionCallResponse for voice. A tool that legitimately
+# returns a file, a large query result or a long log would blow the request past the
+# model's context limit and fail the whole turn, and on voice it would be read back
+# as speech. So it is truncated with an explicit marker: the model is told the result
+# was cut rather than being handed a silently partial one, which is the difference
+# between "ask for less" and a confidently wrong answer.
+#
+# ~24k characters is roughly 6k tokens — generous for a tool result, and small next
+# to MAX_COMPLETION_TOKENS plus the conversation it shares the window with.
+MAX_RESULT_CHARS = 24_000
+
+
+def _bounded(text: str) -> str:
+    if len(text) <= MAX_RESULT_CHARS:
+        return text
+    kept = text[:MAX_RESULT_CHARS]
+    dropped = len(text) - len(kept)
+    return (
+        f"{kept}\n\n[truncated: {dropped:,} more characters were returned and "
+        f"omitted. Ask for a narrower result if you need the rest.]"
+    )
 
 
 def render_result(result: Any) -> str:
@@ -438,7 +576,9 @@ def render_result(result: Any) -> str:
                 mime = getattr(block, "mimeType", None) or getattr(block, "mime_type", "")
                 parts.append(f"[{kind} returned{f' ({mime})' if mime else ''}]")
 
-    body = "\n".join(p for p in parts if p).strip() or "(the tool returned no output)"
+    body = _bounded(
+        "\n".join(p for p in parts if p).strip() or "(the tool returned no output)"
+    )
     if getattr(result, "is_error", False):
         return f"The tool reported an error: {body}"
     return body

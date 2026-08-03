@@ -7,6 +7,7 @@ publishable key (client-safe) and a short-lived Deepgram token (minted here).
 from __future__ import annotations
 
 from pathlib import Path
+from urllib.parse import urlparse
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -325,6 +326,41 @@ class Settings(BaseSettings):
             return (
                 f"JWT_SECRET is only {len(self.jwt_secret)} characters; use at "
                 f"least {MIN_JWT_SECRET_LEN} random characters."
+            )
+        return None
+
+    @property
+    def mcp_oauth_redirect_problem(self) -> str | None:
+        """Why MCP OAuth cannot work here, or None if it can.
+
+        The failure this catches is quiet and late: MCP is enabled by default, so the
+        UI offers Authorize, and the flow gets all the way to building a real
+        authorization URL before the authorization server rejects
+        `redirect_uri=http://localhost:8787/...` — or worse, accepts it and sends the
+        user's browser to their OWN machine. Either way the error names nothing to do
+        with configuration.
+
+        Reported at startup instead, next to jwt_secret_problem, so an operator sees
+        it before a user does. A WARNING rather than a hard stop: everything else in
+        the app works fine without it, and refusing to boot over an optional feature
+        would be worse than the feature being unavailable.
+        """
+        if not self.mcp_enabled:
+            return None
+        base = self.mcp_oauth_redirect_base.strip().rstrip("/")
+        if self.is_dev:
+            return None
+        host = urlparse(base).hostname or ""
+        if host in ("localhost", "127.0.0.1", "::1", "") or not base.startswith(
+            "https://"
+        ):
+            return (
+                f"MCP_OAUTH_REDIRECT_BASE is {base!r}, which no authorization server "
+                f"can redirect a browser back to. Set it to this backend's public "
+                f"https origin (the OAuth callback is <base>/api/mcp/oauth/callback, "
+                f"and the value must match byte-for-byte between the authorization "
+                f"request and the token exchange). Until then, MCP servers work but "
+                f"OAuth-protected ones cannot be authorized."
             )
         return None
 

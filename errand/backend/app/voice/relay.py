@@ -384,13 +384,24 @@ class VoiceSession:
         profile: str,
         user_id: str,
         user_email: str,
+        owner_id: str,
     ) -> None:
         self._browser = browser
         self._model_id = _MODEL_MAP.get(model_key, _MODEL_MAP[_DEFAULT_MODEL])
         self._profile = profile if profile in ("business", "personal") else "business"
         # Who is spending. Taken from the redeemed ticket, never from the query
         # string, so a caller cannot attribute a purchase to someone else.
+        #
+        # ⚠️ TWO IDS, ON PURPOSE, AND THEY ARE NOT INTERCHANGEABLE.
+        # `_user_id` is the SPEND PSEUDONYM — `u_<first 12 hex of the real id>` —
+        # derived identically in app.main's errand_stream so a voice-driven errand
+        # and a typed one attribute spend to the same identity. It is NOT a
+        # database key and matches no row.
+        # `_owner_id` is the real `User.id`, and is what any OWNERSHIP query must
+        # use. Passing the pseudonym to `mcp_registry.load_catalogue` returned an
+        # empty catalogue on every call — voice silently had no MCP tools.
         self._user_id = user_id
+        self._owner_id = owner_id
         self._user_email = user_email
         self._dg: websockets.WebSocketClientProtocol | None = None  # type: ignore[name-defined]
         # Starlette/FastAPI WS sends are not concurrency-safe; serialize them.
@@ -522,9 +533,15 @@ class VoiceSession:
             mcp_catalogue = None
             if settings.mcp_enabled:
                 try:
-                    mcp_catalogue = await mcp_registry.load_catalogue(self._user_id)
+                    # `_owner_id`, NOT `_user_id`. The latter is the SPEND
+                    # PSEUDONYM (`u_<12 hex>`), which matches no McpServer row —
+                    # using it here silently produced an empty catalogue on every
+                    # call, so voice had no MCP tools at all while looking fine.
+                    mcp_catalogue = await mcp_registry.load_catalogue(self._owner_id)
                 except Exception as exc:  # noqa: BLE001
-                    log.warning("Could not load MCP tools for voice session: %s", exc)
+                    logger.warning(
+                        "Could not load MCP tools for voice session: %s", exc
+                    )
             self._mcp_catalogue = mcp_catalogue
 
             await self._to_deepgram_json(
@@ -781,7 +798,10 @@ class VoiceSession:
                 # from the redeemed ticket, never the wire, so this cannot be
                 # steered at someone else's servers; registry.call_tool re-checks
                 # ownership regardless.
-                content = await mcp_registry.call_tool(self._user_id, name, args)
+                # `_owner_id` again — call_tool re-derives the catalogue for this
+                # user and refuses anything not in it, so the pseudonym here would
+                # make every MCP tool call fail as "unknown tool".
+                content = await mcp_registry.call_tool(self._owner_id, name, args)
             else:
                 content = f"Unknown tool: {name}"
         except asyncio.CancelledError:
@@ -1102,6 +1122,9 @@ async def voice_ws(websocket: WebSocket) -> None:
         # and a typed one attribute spend to the same identity.
         user_id=f"u_{ticket.user_id[:12]}",
         user_email=ticket.user_email,
+        # The real User.id, kept alongside the pseudonym because ownership queries
+        # (the MCP catalogue) need a key that actually matches a row.
+        owner_id=ticket.user_id,
     )
     try:
         await session.run()

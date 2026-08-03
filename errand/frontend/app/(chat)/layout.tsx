@@ -57,6 +57,7 @@ export default function ChatLayout({ children }: { children: React.ReactNode }) 
             allowStdio?: boolean;
             maxServers?: number;
             canStoreCredentials?: boolean;
+            canSignIn?: boolean;
           };
         };
         if (!alive || !body.mcp?.enabled) return;
@@ -64,6 +65,7 @@ export default function ChatLayout({ children }: { children: React.ReactNode }) 
           allowStdio: Boolean(body.mcp.allowStdio),
           maxServers: body.mcp.maxServers ?? 12,
           canStoreCredentials: Boolean(body.mcp.canStoreCredentials),
+          canSignIn: Boolean(body.mcp.canSignIn),
         });
       } catch {
         /* readiness unknown — the entry point stays hidden */

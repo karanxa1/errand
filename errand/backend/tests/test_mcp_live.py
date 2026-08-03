@@ -350,6 +350,202 @@ def test_a_tool_call_holds_no_database_connection_while_it_runs() -> None:
         settings.mcp_allow_insecure_http = original
 
 
+def test_a_voice_session_looks_up_mcp_servers_by_the_real_user_id() -> None:
+    """The bug the original tests missed, pinned.
+
+    VoiceSession carries TWO ids: `_user_id` is the spend pseudonym
+    (`u_<12 hex>`, so a voice errand and a typed one attribute spend to the same
+    identity) and `_owner_id` is the real `User.id`. Only the latter matches an
+    `McpServer.user_id`.
+
+    The first version passed the pseudonym to `load_catalogue`, so every voice call
+    got an EMPTY catalogue while looking entirely healthy — no error, no log, just no
+    MCP tools. The original test suite missed it because it exercised
+    `_settings_message` with a hand-built catalogue, verifying the RENDERING and never
+    the LOOKUP. This test goes through the real session attribute instead.
+    """
+    ensure_schema()
+
+    async def scenario() -> None:
+        from app.mcp import registry
+        from app.models import McpServer
+        from app.voice.relay import VoiceSession, _settings_message
+        from conftest import create_user
+
+        async with session_scope() as session:
+            user = await create_user(session)
+            server = McpServer(
+                user_id=user.id,
+                name="VoiceTools",
+                config={"url": "https://example.com/mcp", "transport": "http"},
+                auth_mode="none",
+                enabled=True,
+                last_status="connected",
+                tools_json=[
+                    {
+                        "name": "lookup",
+                        "description": "Look something up.",
+                        "input_schema": {"type": "object", "properties": {}},
+                    }
+                ],
+            )
+            session.add(server)
+            await session.commit()
+            real_id = user.id
+
+        pseudonym = f"u_{real_id[:12]}"
+        assert pseudonym != real_id, "the two ids must actually differ"
+
+        # What the relay constructs for a real socket.
+        voice = VoiceSession(
+            None,  # type: ignore[arg-type] — no socket needed for this assertion
+            "sol",
+            "business",
+            pseudonym,
+            "buyer@example.com",
+            real_id,
+        )
+
+        # The pseudonym finds nothing — which is precisely the silent failure.
+        assert (await registry.load_catalogue(voice._user_id)).tools == ()
+        # The owner id finds the server.
+        found = await registry.load_catalogue(voice._owner_id)
+        assert [t.tool_name for t in found.tools] == ["lookup"], found.tools
+
+        # And it reaches Deepgram's function list, which is what the model sees.
+        message = _settings_message("gpt-5.6-sol", found)
+        names = [f["name"] for f in message["agent"]["think"]["functions"]]
+        assert "mcp__VoiceTools__lookup" in names, names
+
+    run_async(scenario())
+
+
+def test_the_ssrf_guard_runs_on_every_request_not_just_registration() -> None:
+    """A redirect must not be able to walk us onto a private address.
+
+    Registration-time validation is not sufficient on its own: the client follows
+    redirects, so a genuinely public registered host can answer
+    `302 Location: http://169.254.169.254/...` and the request lands on Azure IMDS
+    having passed every check made when the server was added. The same applies to
+    OAuth discovery and token requests, which reach hosts nobody validated.
+
+    So the guard is a transport wrapper and this exercises it directly, at the seam
+    a redirect actually passes through.
+    """
+    ensure_schema()
+    import httpx2
+
+    from app.config import settings as app_settings
+    from app.mcp.client import McpConnectionError, _GuardedTransport
+
+    class _Unreached(httpx2.AsyncBaseTransport):
+        """Fails loudly if the guard ever lets a request past."""
+
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def handle_async_request(self, request):  # noqa: ANN001
+            self.calls.append(str(request.url))
+            raise AssertionError(f"guard allowed {request.url}")
+
+    original = app_settings.mcp_allow_insecure_http
+    app_settings.mcp_allow_insecure_http = False
+    try:
+
+        async def scenario() -> None:
+            inner = _Unreached()
+            guard = _GuardedTransport(inner)
+
+            # Every one of these is a plausible redirect or discovery target.
+            for target in (
+                "https://169.254.169.254/metadata/instance",  # Azure IMDS
+                "https://127.0.0.1/mcp",
+                "https://10.0.0.5/mcp",
+                "https://[::1]/mcp",
+                "http://example.com/mcp",  # scheme downgrade
+            ):
+                try:
+                    await guard.handle_async_request(
+                        httpx2.Request("GET", target)
+                    )
+                except McpConnectionError:
+                    pass  # refused, as required
+                else:
+                    raise AssertionError(f"{target} was not refused")
+
+            assert inner.calls == [], f"guard let these through: {inner.calls}"
+
+        run_async(scenario())
+    finally:
+        app_settings.mcp_allow_insecure_http = original
+
+
+def test_a_caller_body_error_is_not_turned_into_a_transport_retry() -> None:
+    """The SSE fallback must cover opening the transport, never the caller's body.
+
+    `open_session` is a generator-based context manager, so an exception raised in
+    the caller's `async with` block is thrown back in AT the yield. Without a guard
+    the handler caught it, decided streamable HTTP was broken, opened a SECOND
+    connection and yielded again — which either raises `RuntimeError: generator
+    didn't stop after athrow()` or, as measured before the fix, silently replaced the
+    caller's exception type with McpConnectionError.
+
+    Measured: before the fix this test saw `McpConnectionError`; after it, the
+    caller's own exception survives. (The SDK wraps it in an anyio ExceptionGroup of
+    its own accord — verified against a bare `Client` with none of our code in the
+    path — so the assertion looks for the leaf.)
+    """
+    ensure_schema()
+    port = _free_port()
+    original = settings.mcp_allow_insecure_http
+    settings.mcp_allow_insecure_http = True
+    try:
+        with _ServerThread(_mcp_app(), port):
+
+            class Sentinel(Exception):
+                """Raised by the caller. This is what must survive."""
+
+            async def scenario() -> None:
+                from app.mcp.client import McpConnectionError, open_session
+                from app.models import McpServer
+                from conftest import create_user
+
+                async with session_scope() as session:
+                    user = await create_user(session)
+                    server = await _register(
+                        session, user.id, f"http://127.0.0.1:{port}/mcp", "BodyErr"
+                    )
+                    server_id = server.id
+
+                async with session_scope() as session:
+                    row = await session.get(McpServer, server_id)
+
+                    def leaf_of(exc: BaseException) -> BaseException:
+                        while (
+                            isinstance(exc, BaseExceptionGroup) and exc.exceptions
+                        ):
+                            exc = exc.exceptions[0]
+                        return exc
+
+                    try:
+                        async with open_session(row) as client:
+                            await client.list_tools()  # the connection is fine
+                            raise Sentinel("caller body failed")
+                    except BaseException as exc:  # noqa: BLE001
+                        leaf = leaf_of(exc)
+                        assert isinstance(leaf, Sentinel), (
+                            f"the caller's exception was replaced by "
+                            f"{type(leaf).__name__}: {leaf}"
+                        )
+                        assert not isinstance(leaf, McpConnectionError)
+                    else:
+                        raise AssertionError("the caller's exception vanished")
+
+            run_async(scenario())
+    finally:
+        settings.mcp_allow_insecure_http = original
+
+
 def test_the_oauth_rendezvous_parks_and_resumes() -> None:
     """The core of the OAuth design, pinned end to end.
 

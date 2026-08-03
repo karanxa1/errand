@@ -536,6 +536,80 @@ def test_config_advertises_mcp_readiness() -> None:
             assert mcp["allowStdio"] is False
             assert mcp["canStoreCredentials"] is True
             assert isinstance(mcp["maxServers"], int)
+            # Whether OAuth is usable at all. False would mean the UI must not offer
+            # Sign in, because the redirect would be refused by the authorization
+            # server. True in dev, where localhost is a legitimate callback.
+            assert mcp["canSignIn"] is True
+
+
+def test_a_name_that_sanitizes_onto_an_existing_one_is_refused() -> None:
+    """Two valid names can produce ONE tool-id namespace.
+
+    `Acme CRM` and `Acme-CRM` both pass validation and both sanitize to `Acme-CRM`,
+    so their tools get identical ids and `load_catalogue` silently drops the loser —
+    a configured server that quietly has no tools. Refused at the door instead, where
+    it can be explained, rather than papered over downstream with a digest suffix
+    that would make every id uglier to guard against a rare case.
+    """
+    ensure_schema()
+    if not _resolver_available():
+        print("  (skipped: no resolver)")
+        return
+
+    async def scenario() -> None:
+        async with api_client() as client:
+            _, headers = await register_user(client)
+            assert (await _create(client, headers, name="Acme CRM")).status_code == 201
+
+            clash = await _create(client, headers, name="Acme-CRM")
+            assert clash.status_code == 409, clash.text
+            assert "too close" in clash.json()["detail"].lower()
+
+            # A genuinely distinct name is fine.
+            assert (await _create(client, headers, name="Acme Billing")).status_code == 201
+
+            # An underscore is NOT a collision: `_` is legal in a tool id, so
+            # `Acme_CRM` stays distinct from `Acme-CRM`. Only characters that both
+            # sanitize to `-` collide — a space, or a dot.
+            assert (await _create(client, headers, name="Acme_CRM")).status_code == 201
+
+            # And a RENAME cannot walk into the clash either.
+            listed = (await client.get("/api/mcp/servers", headers=headers)).json()
+            billing = next(s for s in listed if s["name"] == "Acme Billing")
+            renamed = await client.patch(
+                f"/api/mcp/servers/{billing['id']}",
+                json={"name": "Acme.CRM"},  # dot -> '-', so it collides
+                headers=headers,
+            )
+            assert renamed.status_code == 409, renamed.text
+
+    run_async(scenario())
+
+
+def test_a_malformed_transport_is_a_400_not_a_500() -> None:
+    """`config` is arbitrary JSON, so every field has to survive a wrong type.
+
+    A non-string `transport` reached `.strip()` and raised AttributeError, which is
+    not McpConfigError and so escaped the route's handler as a 500.
+    """
+    ensure_schema()
+
+    async def scenario() -> None:
+        async with api_client() as client:
+            _, headers = await register_user(client)
+            for bad in (5, True, [], {}, None):
+                res = await client.post(
+                    "/api/mcp/servers",
+                    json={
+                        "name": "Odd",
+                        "config": {"url": "https://example.com/mcp", "transport": bad},
+                        "auth_mode": "none",
+                    },
+                    headers=headers,
+                )
+                assert res.status_code != 500, f"transport={bad!r} -> 500: {res.text}"
+
+    run_async(scenario())
 
     run_async(scenario())
 

@@ -93,7 +93,13 @@ def transport_of(config: dict[str, Any]) -> TransportKind:
     """
     if is_stdio(config):
         return "stdio"
-    kind = (config.get("transport") or "http").strip().lower()
+    # `config` is dict[str, Any] straight off the request body, so `transport` can be
+    # any JSON type. A non-string used to reach .strip() and raise AttributeError,
+    # which escapes validate_config — only McpConfigError is caught by the routes —
+    # and surfaced as a 500 instead of a 400. Anything that is not a string reads as
+    # the default.
+    raw = config.get("transport")
+    kind = raw.strip().lower() if isinstance(raw, str) else "http"
     return "sse" if kind == "sse" else "http"
 
 

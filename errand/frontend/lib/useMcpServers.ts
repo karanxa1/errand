@@ -80,7 +80,10 @@ export interface McpApi {
       config?: McpDraft["url"] extends never ? never : Record<string, unknown>;
     },
   ) => Promise<{ ok: boolean; error?: string }>;
-  remove: (id: string) => Promise<void>;
+  // Reports its outcome rather than returning void: the optimistic delete is rolled
+  // back on failure, and a caller that announced "Removed X" unconditionally would
+  // leave that message on screen next to the restored row.
+  remove: (id: string) => Promise<{ ok: boolean; error?: string }>;
   test: (id: string) => Promise<{ ok: boolean; error?: string }>;
   authorize: (id: string) => Promise<{ ok: boolean; error?: string }>;
   disconnect: (id: string) => Promise<{ ok: boolean; error?: string }>;
@@ -93,6 +96,16 @@ const AUTH_POLL_MS = 1500;
 // Give up after this. Matches the backend's AUTH_TIMEOUT_S (300s) so the UI never
 // claims an attempt is still live after the server has abandoned it.
 const AUTH_POLL_TIMEOUT_MS = 300_000;
+
+// How long to keep polling after the popup closes before calling it cancelled.
+//
+// A closed popup is ambiguous: it is what cancelling looks like AND what success
+// looks like, because the callback page closes itself once it has handed over the
+// code. Everything expensive — the token exchange, the MCP connect, tools/list —
+// runs server-side after that. This window has to cover all of it, so it is sized
+// against the connect budget (CONNECT_TIMEOUT_S is 30s server-side) rather than
+// against how fast a person clicks.
+const POPUP_CLOSED_GRACE_MS = 45_000;
 
 async function readError(res: Response, fallback: string): Promise<string> {
   try {
@@ -235,7 +248,7 @@ export function useMcpServers(token: string | null): McpApi {
       // useConversations.remove, and for the same reason. The row is read from the
       // ref, not from inside the updater, so it is definitely available later.
       const index = listRef.current.findIndex((s) => s.id === id);
-      if (index === -1) return;
+      if (index === -1) return { ok: true };
       const row = listRef.current[index];
 
       setServers((list) => list.filter((s) => s.id !== id));
@@ -259,9 +272,14 @@ export function useMcpServers(token: string | null): McpApi {
         // Anything else that failed means the row still exists and must come back,
         // or the panel would show a server as removed while the agent can still
         // call its tools.
-        if (!res.ok && res.status !== 204 && res.status !== 404) restore();
+        if (!res.ok && res.status !== 204 && res.status !== 404) {
+          restore();
+          return { ok: false, error: await readError(res, "Could not remove that server.") };
+        }
+        return { ok: true };
       } catch {
         restore();
+        return { ok: false, error: "Could not reach the backend." };
       }
     },
     [authHeaders],
@@ -346,6 +364,9 @@ export function useMcpServers(token: string | null): McpApi {
       return new Promise<{ ok: boolean; error?: string }>((resolve) => {
         let settled = false;
         const startedAt = Date.now();
+        // When the popup was first observed closed, so the grace period below can be
+        // measured from it rather than from the start of the flow.
+        let closedAt: number | null = null;
 
         const finish = (result: { ok: boolean; error?: string }) => {
           if (settled) return;
@@ -396,13 +417,22 @@ export function useMcpServers(token: string | null): McpApi {
             finish({ ok: false, error: "Authorization timed out." });
             return;
           }
-          // A closed popup usually means the user gave up. Poll once more before
-          // saying so, because closing it immediately AFTER consenting is normal —
-          // the callback page closes itself.
+          // A closed popup MIGHT mean the user gave up — but it is also exactly what
+          // a SUCCESSFUL authorization looks like, because the callback page closes
+          // itself ~1.2s after delivering the code. The token exchange, the MCP
+          // connect and tool discovery all happen server-side AFTER that, so the
+          // very next poll legitimately still reads `pending`.
+          //
+          // Settling on the first pending poll after a close therefore reported a
+          // normal, slightly slow success as "cancelled" and left the row stuck in
+          // authorizing. So a close only starts a grace period: keep polling, and
+          // only give up if it stays pending through it.
           if (popup && popup.closed) {
-            void poll().then(() => {
-              if (!settled) finish({ ok: false, error: "Authorization was cancelled." });
-            });
+            if (closedAt === null) closedAt = Date.now();
+            void poll();
+            if (Date.now() - closedAt > POPUP_CLOSED_GRACE_MS) {
+              finish({ ok: false, error: "Authorization was cancelled." });
+            }
             return;
           }
           void poll();

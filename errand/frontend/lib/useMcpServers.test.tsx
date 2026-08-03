@@ -225,6 +225,52 @@ describe("authorize", () => {
     expect(result.current.authorizing.srv1).toBe(false);
   }, 20000);
 
+  it("does not call a slow-but-successful authorization cancelled", async () => {
+    // The bug this pins: the callback page closes ITSELF once it has handed over the
+    // code, but the token exchange, the MCP connect and tool discovery all run
+    // server-side afterwards. So "popup closed" arrives while the attempt is still
+    // legitimately `pending`. Settling on that first pending poll reported a normal
+    // success as cancelled and left the row stuck in authorizing.
+    let polls = 0;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/api/mcp/servers")) return jsonResponse([SERVER]);
+      if (url.endsWith("/authorize")) {
+        return jsonResponse({
+          attempt_id: "att1",
+          authorization_url: "https://idp.example/authorize",
+        });
+      }
+      if (url.includes("/authorize/att1")) {
+        polls += 1;
+        // Pending for the first few polls after the close, then connected — the
+        // shape of a real exchange that takes a moment.
+        return jsonResponse(
+          polls < 3
+            ? { state: "pending", error: null, server: SERVER }
+            : { state: "connected", error: null, server: CONNECTED },
+        );
+      }
+      return jsonResponse({}, 404);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result } = renderHook(() => useMcpServers("tok"));
+    await waitFor(() => expect(result.current.servers).toHaveLength(1));
+
+    // Closed immediately, as the callback page leaves it.
+    if (popup) popup.closed = true;
+
+    let outcome: { ok: boolean; error?: string } | undefined;
+    await act(async () => {
+      outcome = await result.current.authorize("srv1");
+    });
+
+    expect(outcome).toEqual({ ok: true });
+    expect(polls).toBeGreaterThanOrEqual(3);
+    expect(result.current.servers[0].status).toBe("connected");
+  }, 30000);
+
   it("reports the backend's message when authorization cannot start", async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
@@ -290,6 +336,41 @@ describe("mutations", () => {
     expect(body.config).toEqual({ url: "https://example.com/mcp", transport: "http" });
     expect(body.headers).toEqual({ Authorization: "Bearer secret" });
     expect(JSON.stringify(body.config)).not.toContain("secret");
+  });
+
+  it("reports whether a removal actually happened", async () => {
+    // The caller announces the outcome, so `remove` has to report one. Returning
+    // void meant the panel said "Removed X" even when the row was restored.
+    let failNext = true;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/api/mcp/servers")) return jsonResponse([CONNECTED]);
+      if (init?.method === "DELETE") {
+        if (failNext) {
+          failNext = false;
+          return jsonResponse({ detail: "Could not remove that server." }, 500);
+        }
+        return { ok: true, status: 204 } as Response;
+      }
+      return jsonResponse({}, 404);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { result } = renderHook(() => useMcpServers("tok"));
+    await waitFor(() => expect(result.current.servers).toHaveLength(1));
+
+    await act(async () => {
+      const outcome = await result.current.remove("srv1");
+      expect(outcome.ok).toBe(false);
+      expect(outcome.error).toBeTruthy();
+    });
+    // Restored, and the caller knows not to claim success.
+    expect(result.current.servers.map((s) => s.id)).toEqual(["srv1"]);
+
+    await act(async () => {
+      expect(await result.current.remove("srv1")).toEqual({ ok: true });
+    });
+    expect(result.current.servers).toEqual([]);
   });
 
   it("restores a removed server when the delete fails", async () => {

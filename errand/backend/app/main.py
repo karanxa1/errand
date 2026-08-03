@@ -63,6 +63,13 @@ async def lifespan(_app: FastAPI):
                 f"Refusing to start with an insecure JWT secret: {problem} "
                 "Set the JWT_SECRET env var to a long random string."
             )
+    # MCP OAuth needs a publicly reachable redirect base. Warned rather than fatal:
+    # everything else works without it, and refusing to boot over one optional
+    # feature would be worse than that feature being unavailable. See
+    # Settings.mcp_oauth_redirect_problem for why this is easy to miss otherwise.
+    mcp_problem = settings.mcp_oauth_redirect_problem
+    if mcp_problem is not None:
+        logger.warning("MCP OAuth is not usable: %s", mcp_problem)
     # Create tables for SQLite dev; a no-op where Alembic already built them.
     await init_db()
     yield
@@ -168,6 +175,11 @@ async def config() -> dict:
             # header or OAuth auth — better to say so than to accept a secret we
             # can never read back.
             "canStoreCredentials": mcp_crypto.encryption_available(),
+            # False when MCP_OAUTH_REDIRECT_BASE is not a reachable public origin, so
+            # the UI can say WHY sign-in is unavailable instead of offering a button
+            # that walks the user into a rejected redirect. Never the value itself —
+            # only the verdict.
+            "canSignIn": settings.mcp_oauth_redirect_problem is None,
         },
     }
 

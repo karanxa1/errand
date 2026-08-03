@@ -19,6 +19,7 @@ const CAPS: McpCapabilities = {
   allowStdio: false,
   maxServers: 12,
   canStoreCredentials: true,
+  canSignIn: true,
 };
 
 function server(overrides: Partial<McpServer> = {}): McpServer {
@@ -54,7 +55,7 @@ function api(overrides: Partial<McpApi> = {}): McpApi {
     refresh: vi.fn(async () => {}),
     create: vi.fn(async () => ({ ok: true, server: server() }) as never),
     update: vi.fn(async () => ({ ok: true })),
-    remove: vi.fn(async () => {}),
+    remove: vi.fn(async () => ({ ok: true })),
     test: vi.fn(async () => ({ ok: true })),
     authorize: vi.fn(async () => ({ ok: true })),
     disconnect: vi.fn(async () => ({ ok: true })),
@@ -177,6 +178,30 @@ describe("McpPanel", () => {
     expect(signIn.disabled).toBe(true);
     expect(token.disabled).toBe(true);
     expect(screen.getByText(/cannot store credentials/i)).toBeTruthy();
+  });
+
+  it("disables Sign in when the backend has no public callback URL", () => {
+    // Offering it would walk the user into a redirect the authorization server
+    // refuses, with an error that names nothing to do with configuration. Token and
+    // open servers still work, so only that one segment is disabled — and the note
+    // describes the SEGMENT, not whichever mode happens to be selected.
+    render(
+      <McpPanel
+        api={api()}
+        capabilities={{ ...CAPS, canSignIn: false }}
+        onClose={() => {}}
+      />,
+    );
+    act(() => {
+      fireEvent.click(screen.getByRole("button", { name: /add a server/i }));
+    });
+
+    expect((screen.getByRole("button", { name: "Sign in" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "Token" }) as HTMLButtonElement).disabled).toBe(false);
+    expect((screen.getByRole("button", { name: "None" }) as HTMLButtonElement).disabled).toBe(false);
+    expect(screen.getByText(/MCP_OAUTH_REDIRECT_BASE/)).toBeTruthy();
+    // The selected mode is still None, so its own hint must not be replaced.
+    expect(screen.getByText(/for an open server/i)).toBeTruthy();
   });
 
   it("offers all three auth modes when credentials can be stored", () => {

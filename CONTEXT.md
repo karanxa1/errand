@@ -195,11 +195,15 @@ this backend spawns, so on a multi-user deployment it is shell access to the
 container holding every provider key. better-chatbot allows it and disables it
 only on Vercel; the polarity is deliberately inverted here.
 
-⚠️ **User-supplied URLs are SSRF-guarded** (`app/mcp/config.validate_remote_url`):
-https only, and every address the host resolves to must be publicly routable —
-otherwise a registered server reaches Azure IMDS or anything else in the VNet. A
-resolver failure is FATAL here, the opposite of `app/prava/validate`'s
-fail-open reachability check.
+⚠️ **User-supplied URLs are SSRF-guarded ON EVERY REQUEST**, not just at
+registration. `validate_remote_url` (https only, every resolved address publicly
+routable) runs at registration AND inside `_GuardedTransport`, which wraps the
+httpx2 transport — because the client follows redirects, so a genuinely public
+registered host can answer `302 Location: http://169.254.169.254/...` and land on
+Azure IMDS having passed every registration check. The transport also covers OAuth
+discovery, dynamic registration and the token exchange, which reach hosts nobody
+validated. A resolver failure is FATAL here, the opposite of
+`app/prava/validate`'s fail-open reachability check.
 
 ⚠️ **Credential encryption is keyed off `JWT_SECRET` unless `MCP_ENCRYPTION_KEY`
 is set**, so rotating `JWT_SECRET` orphans stored credentials (recoverable by
@@ -208,7 +212,29 @@ rotates.
 
 **`MCP_OAUTH_REDIRECT_BASE` must be the backend's public origin** before OAuth
 works in a deployment — it defaults to localhost, and the value must match
-byte-for-byte across the authorization request and the token exchange.
+byte-for-byte across the authorization request and the token exchange. This fails
+LOUDLY now rather than at the last step: `Settings.mcp_oauth_redirect_problem` warns
+at startup (alongside the JWT guard) and `/api/config` reports `mcp.canSignIn`, so
+the panel disables the Sign-in option with the reason instead of offering a control
+that can only end in a rejected redirect.
+
+⚠️ **`VoiceSession` carries TWO ids and they are not interchangeable.** `_user_id`
+is the SPEND PSEUDONYM (`u_<12 hex>`, matching app.main's derivation so a voice
+errand and a typed one attribute spend to the same identity); `_owner_id` is the
+real `User.id`. Every ownership query — the MCP catalogue, `call_tool` — must use
+`_owner_id`. The first version passed the pseudonym, which matches no row, so voice
+silently had an empty MCP catalogue while looking healthy. Pinned by
+`test_a_voice_session_looks_up_mcp_servers_by_the_real_user_id`.
+
+⚠️ **The SSE fallback covers opening the transport, never the caller's body.**
+`open_session` and `_with_sse_fallback` are generator context managers, so a caller
+exception is thrown back in AT the yield; without the `yielded` guard the handler
+treated it as a dead transport, opened a second connection and yielded again
+(`RuntimeError: generator didn't stop after athrow()`, or a silently replaced
+exception type). `asyncio.CancelledError` is re-raised first, so a client disconnect
+is never swallowed into a retry. A tool result is capped at
+`MAX_RESULT_CHARS` with an explicit truncation marker, because it goes straight into
+the next model request.
 
 Tool ids are `mcp__<server>__<tool>`; `__` is refused in server names, which is
 what keeps the split exact while letting single underscores through

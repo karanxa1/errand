@@ -63,7 +63,10 @@ class _StubDeepgram:
 
 def _session() -> tuple[VoiceSession, _StubBrowser, _StubDeepgram]:
     browser = _StubBrowser()
-    session = VoiceSession(browser, "sol", "business", "u_1", "u@test")  # type: ignore[arg-type]
+    # `u_1` is the spend pseudonym and `owner-1` the real User.id — VoiceSession
+    # keeps both, because ownership queries (the MCP catalogue) need a key that
+    # matches a row while spend attribution needs the pseudonym.
+    session = VoiceSession(browser, "sol", "business", "u_1", "u@test", "owner-1")  # type: ignore[arg-type]
     dg = _StubDeepgram()
     session._dg = dg  # type: ignore[assignment]
     return session, browser, dg

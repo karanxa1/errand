@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import html
+import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -127,6 +128,20 @@ class AuthorizeStatus(BaseModel):
     state: Literal["pending", "connected", "error", "expired"]
     error: str | None = None
     server: ServerOut | None = None
+
+
+def _sanitized_clash(name: str, existing: list[str]) -> str | None:
+    """An existing name that would produce the same tool-id namespace, or None.
+
+    Compared through `make_tool_id` with a fixed probe tool, so this asks exactly the
+    question that matters — "would the agent see the same function names?" — rather
+    than re-implementing the sanitizer and risking drift from it.
+    """
+    probe = make_tool_id(name, "probe")
+    for other in existing:
+        if other != name and make_tool_id(other, "probe") == probe:
+            return other
+    return None
 
 
 @dataclass
@@ -260,6 +275,29 @@ async def create_server(
             detail="A local (stdio) server cannot use OAuth.",
         )
 
+    # The UNIQUE (user_id, name) constraint is not sufficient on its own, because
+    # tool ids are built from the SANITIZED name: "Acme CRM" and "Acme-CRM" are two
+    # distinct, both-valid names that sanitize to the same thing, so their tool ids
+    # collide and load_catalogue silently drops the loser — a configured server
+    # quietly having no tools. Rejected here instead, where it can be explained,
+    # rather than fixed downstream with a digest suffix that would make every id
+    # uglier to protect against a rare case.
+    existing_names = list(
+        await session.scalars(
+            select(McpServer.name).where(McpServer.user_id == user.id)
+        )
+    )
+    clash = _sanitized_clash(name, existing_names)
+    if clash is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"{name!r} is too close to your existing server {clash!r} — they "
+                f"produce the same tool names for the agent. Pick a more distinct "
+                f"name."
+            ),
+        )
+
     count = await session.scalar(
         select(func.count())
         .select_from(McpServer)
@@ -365,7 +403,29 @@ async def update_server(
 
     try:
         if req.name is not None:
-            server.name = validate_name(req.name)
+            new_name = validate_name(req.name)
+            if new_name != server.name:
+                # Same sanitized-collision check as creation: a RENAME can walk into
+                # the clash just as easily as a fresh registration.
+                others = [
+                    row
+                    for row in await session.scalars(
+                        select(McpServer.name).where(
+                            McpServer.user_id == user.id, McpServer.id != server.id
+                        )
+                    )
+                ]
+                clash = _sanitized_clash(new_name, others)
+                if clash is not None:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail=(
+                            f"{new_name!r} is too close to your existing server "
+                            f"{clash!r} — they produce the same tool names for the "
+                            f"agent. Pick a more distinct name."
+                        ),
+                    )
+            server.name = new_name
         if req.config is not None:
             new_config = validate_config(req.config)
             url_changed = (server.config or {}).get("url") != new_config.get("url")
@@ -674,18 +734,52 @@ _MSG_SUCCESS = "MCP_OAUTH_SUCCESS"
 _MSG_ERROR = "MCP_OAUTH_ERROR"
 
 
+def _script_json(value: Any) -> str:
+    """JSON safe to embed inside an inline <script> element.
+
+    `json.dumps` is not sufficient by itself. It escapes quotes and backslashes, but
+    `<`, `>` and `/` pass through untouched — and an HTML parser ends a <script>
+    element at the first literal `</script`, whatever the JavaScript string quoting
+    around it is. So third-party text containing `</script><img src=x onerror=…>`
+    breaks out of the script and injects markup.
+
+    The three characters are escaped as `\\uXXXX`, which JavaScript reads back as
+    the original character inside a string literal while the HTML parser never sees
+    a tag boundary. This is the standard fix and the same one React's
+    __html-safe JSON and Rails' json_escape apply.
+    """
+    return (
+        json.dumps(value)
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("/", "\\u002f")
+        # U+2028/U+2029 are literal line terminators in JS string literals (though
+        # not in JSON), so an unescaped one is a syntax error in the emitted script.
+        .replace(" ", "\\u2028")
+        .replace(" ", "\\u2029")
+    )
+
+
 def _callback_page(*, ok: bool, heading: str, message: str, code: int) -> HTMLResponse:
     """The popup's last page: tell the opener, then close.
 
-    `message` is escaped because it can carry `error_description` straight from
-    the authorization server — third-party text interpolated into a document, i.e.
-    exactly the shape that is XSS if it is trusted. It is inserted into the DOM
-    with textContent rather than markup, and the postMessage payload is built as
-    JSON rather than string-concatenated, so neither path can inject script.
-    """
-    import json as _json
+    `message` can carry `error_description` straight from the authorization server —
+    third-party text interpolated into a document, i.e. exactly the shape that is
+    XSS if it is trusted. Two separate escapes are needed and they are not
+    interchangeable:
 
-    payload = _json.dumps(
+      * in MARKUP (the <title>), html.escape.
+      * inside the <script>, `_script_json`. JSON encoding alone is NOT enough:
+        json.dumps escapes quotes and backslashes but leaves `<` and `/` alone, so
+        an error_description containing a literal `</script>` ends the script
+        ELEMENT during HTML parsing, before any JavaScript runs — and then
+        `<img src=x onerror=...>` after it is live markup. Assigning via textContent
+        does not help, because the break happens before that line executes.
+
+    An earlier version of this docstring claimed building the payload as JSON was
+    sufficient. It was not; that is what `_script_json` exists to fix.
+    """
+    payload = _script_json(
         {"type": _MSG_SUCCESS if ok else _MSG_ERROR, "ok": ok, "message": message}
     )
     redirect = settings.mcp_oauth_success_redirect.strip() if ok else ""
@@ -716,7 +810,7 @@ def _callback_page(*, ok: bool, heading: str, message: str, code: int) -> HTMLRe
   var payload = {payload};
   document.getElementById("detail").textContent = payload.message;
   try {{ if (window.opener) window.opener.postMessage(payload, "*"); }} catch (e) {{}}
-  {"setTimeout(function(){{ location.replace(" + _json.dumps(redirect) + "); }}, 900);" if redirect else "setTimeout(function(){ window.close(); }, 1200);"}
+  {"setTimeout(function(){{ location.replace(" + _script_json(redirect) + "); }}, 900);" if redirect else "setTimeout(function(){ window.close(); }, 1200);"}
 </script>
 </body>
 </html>"""

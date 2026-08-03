@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import uuid
 from datetime import datetime, timezone
@@ -63,6 +64,8 @@ from app.orchestrator.guards import ApprovalDecision, cancellable_sleep
 from app.orchestrator.run_errand import run_errand
 from app.orchestrator.shop_decide import make_shop_decide
 from app.orchestrator.stream import EventStream
+
+logger = logging.getLogger("errand.chat")
 
 router = APIRouter(prefix="/api/conversations", tags=["chat"])
 
@@ -396,11 +399,17 @@ async def chat(
     # row, so this is ONE indexed SELECT rather than a connect + initialize +
     # tools/list per server — the tool list is needed on every turn and cannot
     # afford network I/O. Only an actual invocation connects (app/mcp/registry.py).
-    mcp_catalogue = (
-        await mcp_registry.load_catalogue(user.id)
-        if settings.mcp_enabled
-        else mcp_registry.McpCatalogue(tools=())
-    )
+    # A read failure DEGRADES to the built-in tools rather than failing the turn.
+    # This request raises before the stream even opens, so an unguarded SELECT here
+    # would cost the user run_errand and web_search as well — losing everything to
+    # a problem with an optional feature. The voice relay guards the same call for
+    # the same reason.
+    mcp_catalogue = mcp_registry.McpCatalogue(tools=())
+    if settings.mcp_enabled:
+        try:
+            mcp_catalogue = await mcp_registry.load_catalogue(user.id)
+        except Exception:  # noqa: BLE001
+            logger.warning("Could not load MCP tools for this turn", exc_info=True)
 
     # Build the OpenAI message list from history (tool messages are context too).
     # The MCP note is appended to the system prompt rather than replacing it: the
